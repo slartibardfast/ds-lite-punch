@@ -64,21 +64,34 @@ pub fn ensure_ruleset() -> io::Result<()> {
         "add", "chain", "ip", "dslp", "postrouting",
         "{ type nat hook postrouting priority -150 ; policy accept ; }",
     ]);
-    // one fixed rule, guarded by a comment so re-installs don't duplicate
-    if !has_rule()? {
+    // one fixed rule per protocol, guarded so re-installs don't duplicate
+    if !has_rule(false)? {
         run(&[
             "add", "rule", "ip", "dslp", "postrouting",
             "oifname", "\"eth1\"", "meta", "l4proto", "udp",
             "snat", "to", "ip", "saddr", ".", "udp", "sport", "map", "@snat_map",
-        ])
-    } else {
-        Ok(())
+        ])?;
     }
+    if !has_rule(true)? {
+        run(&[
+            "add", "rule", "ip", "dslp", "postrouting",
+            "oifname", "\"eth1\"", "meta", "l4proto", "tcp",
+            "snat", "to", "ip", "saddr", ".", "tcp", "sport", "map", "@snat_map",
+        ])?;
+    }
+    Ok(())
 }
 
-fn has_rule() -> io::Result<bool> {
-    let out = Command::new("nft").args(["list", "chain", "ip", "dslp", "postrouting"]).output()?;
-    Ok(String::from_utf8_lossy(&out.stdout).contains("map @snat_map"))
+fn has_rule(tcp: bool) -> io::Result<bool> {
+    let out = Command::new("nft")
+        .args(["list", "chain", "ip", "dslp", "postrouting"])
+        .output()?;
+    let needle = if tcp {
+        "tcp sport map @snat_map"
+    } else {
+        "udp sport map @snat_map"
+    };
+    Ok(String::from_utf8_lossy(&out.stdout).contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -215,20 +228,28 @@ pub fn del_pin(client: Ipv4Addr, client_port: u16) -> io::Result<()> {
 }
 
 /// Per-slot wan input-accept so the relay socket receives on the hub-LAN
-/// interface. Unique comment per slot (`dslitepunch-<R>`); replace-not-dup.
-pub fn add_input_accept(r: u16) -> io::Result<()> {
-    let comment = format!("dslitepunch-{}", r);
+/// interface. Protocol-specific (`udp`/`tcp` dport); unique comment per
+/// slot and proto (`dslitepunch-<R>` / `dslitepunch-<R>-tcp`);
+/// replace-not-dup. The TCP arm is mandatory for the splice: fw4's input
+/// chain drops forwarded TCP NEW silently (the C3 finding).
+pub fn add_input_accept(r: u16, tcp: bool) -> io::Result<()> {
+    let comment = format!("dslitepunch-{}{}", r, if tcp { "-tcp" } else { "" });
     // delete any stale rule with this comment first (idempotent add)
-    let _ = del_input_accept(r);
+    let _ = del_input_accept(r, tcp);
+    let kw = if tcp { "tcp" } else { "udp" };
     run(&[
         "insert", "rule", "inet", "fw4", "input",
-        "iifname", "\"eth1\"", "udp", "dport", &r.to_string(),
+        "iifname", "\"eth1\"", kw, "dport", &r.to_string(),
         "accept", "comment", &format!("\"{}\"", comment),
     ])
 }
 
-pub fn del_input_accept(r: u16) -> io::Result<()> {
-    let comment = format!("\"dslitepunch-{}\"", r);
+pub fn del_input_accept(r: u16, tcp: bool) -> io::Result<()> {
+    let comment = format!(
+        "\"dslitepunch-{}{}\"",
+        r,
+        if tcp { "-tcp" } else { "" }
+    );
     let out = Command::new("nft")
         .args(["-a", "list", "chain", "inet", "fw4", "input"])
         .output()?;
@@ -245,12 +266,9 @@ pub fn del_input_accept(r: u16) -> io::Result<()> {
             }
         }
     }
-    if deleted {
-        Ok(())
-    } else {
-        // not present is fine (idempotent delete)
-        Ok(())
-    }
+    let _ = deleted;
+    // not present is fine (idempotent delete)
+    Ok(())
 }
 
 /// Remove the whole ruleset (shutdown / clean restore). Best-effort.

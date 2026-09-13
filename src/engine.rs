@@ -111,10 +111,10 @@ impl PinOps for NftPins {
         let _ = nft::del_pin(host, host_port);
     }
     fn accept(&self, r: u16) -> std::io::Result<()> {
-        nft::add_input_accept(r)
+        nft::add_input_accept(r, false)
     }
     fn unaccept(&self, r: u16) {
-        let _ = nft::del_input_accept(r);
+        let _ = nft::del_input_accept(r, false);
     }
 }
 

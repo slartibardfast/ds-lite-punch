@@ -579,7 +579,7 @@ async fn main() {
             );
             std::process::exit(1);
         }
-        if let Err(e) = add_input_accept(s.bind_port) {
+        if let Err(e) = add_input_accept(s.bind_port, s.proto == slot::Proto::Tcp) {
             eprintln!("fatal: nft input accept for {} failed: {}", s.bind_port, e);
             std::process::exit(1);
         }
