@@ -20,8 +20,15 @@ cleanup_nft() {
     done
 }
 
+# Remove the daemon's tuple-egress policy (table 1001 / prio 25100).
+cleanup_egress() {
+    ip rule del prio 25100 2>/dev/null
+    ip route flush table 1001 2>/dev/null
+}
+
 stop_service() {
     cleanup_nft
+    cleanup_egress
 }
 
 start_service() {

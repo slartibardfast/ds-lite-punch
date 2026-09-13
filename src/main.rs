@@ -287,6 +287,41 @@ fn add_stun_routes(servers: &[SocketAddrV4], gateway: &str) {
     }
 }
 
+/// Dedicated table for the relay's tuple-sourced egress (RCA 2026-09-13:
+/// the accepted TCP connections' replies and the fold-holder's outbound
+/// follow the kernel's output lookup, whose main-table default is the
+/// vdsl4 PPPoE, never the eth1 line the AFTR mapping lives on; the AFTR
+/// can translate a return path only on that line).
+const EGRESS_TABLE: &str = "1001";
+const EGRESS_PRIO: &str = "25100";
+
+/// Force every tuple-sourced egress out the VM line: a policy rule from
+/// the bind address into the dedicated table whose default is the hub.
+/// Local-destination replies still loop (the local table outranks the
+/// rule), so a self-sourced probe can never complete a handshake; the
+/// rule exists for genuinely remote peers. Idempotent; the init script
+/// removes the rule and flushes the table on stop.
+fn add_egress_rule(bind_ip: &SocketAddr, gateway: &str) {
+    let from = bind_ip.ip().to_string();
+    let _ = Command::new("ip")
+        .args([
+            "route", "replace", "default", "via", gateway,
+            "table", EGRESS_TABLE,
+        ])
+        .status();
+    let status = Command::new("ip")
+        .args([
+            "rule", "add", "from", &from, "lookup", EGRESS_TABLE,
+            "prio", EGRESS_PRIO,
+        ])
+        .status();
+    if let Ok(st) = status {
+        if !st.success() {
+            eprintln!("warn: ip rule egress {} -> {}", from, st);
+        }
+    }
+}
+
 async fn resolve_stun(hosts: &[String]) -> Vec<SocketAddrV4> {
     let mut out = Vec::new();
     for h in hosts {
@@ -433,6 +468,7 @@ async fn main() {
         std::process::exit(1);
     }
     add_stun_routes(&servers, &cfg.gateway);
+    add_egress_rule(&cfg.bind, &cfg.gateway);
 
     // Slot table: built entirely via restore() (B8) so statics are inserted
     // exactly once — config statics are authoritative, persisted granted
