@@ -603,7 +603,7 @@ async fn main() {
             // TCP slot datapath (call/0017): listener on the pin tuple
             // with a STUN-over-TCP holder at the C3-sized cadence. The
             // holder publishes the slot's external TCP tuple per-R.
-            let listener = match tcpslot::bind_pin(bind_ip, s.bind_port).await {
+            let listener = match tcpslot::bind_pin(s.bind_port).await {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!(

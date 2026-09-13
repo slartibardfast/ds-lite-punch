@@ -59,14 +59,25 @@ impl HolderState {
 
 // ---- runtime ----
 
-/// Bind the slot's TCP pin: a reuseaddr listener on (ip, R). The holder
-/// socket reuses the same tuple (SO_REUSEADDR both sides) so the
-/// outbound mapping and the inbound listener share the AFTR's
-/// per-(inner, proto) external port.
-pub async fn bind_pin(bind_ip: Ipv4Addr, r: u16) -> io::Result<TcpListener> {
+/// Bind the slot's TCP pin. The listener binds WILDCARD: the holder must
+/// own the specific (ip, R) tuple to originate the outbound flow that
+/// creates and maintains the AFTR mapping, and a specific bind beside a
+/// specific listener is EADDRINUSE under every SO_REUSE* combination
+/// (verified on this kernel 2026-09-13: reuseaddr+reuseaddr refused,
+/// reuseport+reuseport misroutes inbound SYNs into the non-listening
+/// holder, reuseport-listener + reuseaddr-holder refuses the holder).
+/// The specific-vs-wildcard bind is SO_REUSEADDR's classic exception:
+/// no REUSEPORT group exists, so inbound SYNs (dst the slot's tuple)
+/// reach this listener's accept queue, the holder's established replies
+/// reach it, and eth1-scoping of inbound is enforced by the nft input
+/// accept, not by the bind.
+pub async fn bind_pin(r: u16) -> io::Result<TcpListener> {
     let sock = tokio::net::TcpSocket::new_v4()?;
     sock.set_reuseaddr(true)?;
-    sock.bind(std::net::SocketAddr::V4(SocketAddrV4::new(bind_ip, r)))?;
+    sock.bind(std::net::SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        r,
+    )))?;
     sock.listen(128)
 }
 
@@ -96,18 +107,26 @@ async fn splice(mut peer: TcpStream, target: SocketAddrV4) {
     }
 }
 
-/// One holder round: open the persistent STUN-over-TCP connection from
-/// the pin tuple and read the observed external tuple. The connection is
-/// returned to be held for the mapping lifetime.
+/// One holder round: open the STUN-over-TCP connection and read the
+/// observed external tuple. The connection originates from an EPHEMERAL
+/// local port folded to the slot's tuple by the relay's own nft snat_map
+/// (add_pin below): the AFTR's mapping is created for (bind_ip, r)
+/// without a second socket ever binding that tuple, which this kernel
+/// refuses beside the wildcard listener (verified 2026-09-13 across all
+/// SO_REUSE* combinations). The fold element is cleaned up on
+/// re-establish; the connection is returned to be held.
 async fn holder_round(
     bind_ip: Ipv4Addr,
     r: u16,
     server: SocketAddrV4,
-) -> io::Result<((Ipv4Addr, u16), TcpStream)> {
+) -> io::Result<((Ipv4Addr, u16), TcpStream, u16)> {
     let sock = tokio::net::TcpSocket::new_v4()?;
     sock.set_reuseaddr(true)?;
-    let pin = std::net::SocketAddr::V4(SocketAddrV4::new(bind_ip, r));
-    sock.bind(pin)?;
+    sock.bind(std::net::SocketAddr::V4(SocketAddrV4::new(bind_ip, 0)))?;
+    let local_port = sock.local_addr()?.port();
+    crate::nft::add_pin(bind_ip, local_port, r).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("holder fold pin: {e}"))
+    })?;
     let mut conn = sock
         .connect(std::net::SocketAddr::V4(server))
         .await?;
@@ -117,7 +136,7 @@ async fn holder_round(
     let n = conn.read(&mut buf).await?;
     let tuple = stun::parse_mapped(&buf[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "holder STUN: no mapped tuple"))?;
-    Ok((tuple, conn))
+    Ok((tuple, conn, local_port))
 }
 
 /// The holder task: at each cadence, refresh the persistent connection
@@ -134,47 +153,56 @@ pub async fn run_holder(
     let mut interval = tokio::time::interval(Duration::from_secs(TCP_KEEPALIVE_SECS));
     let mut state = HolderState::Dead;
     let mut conn: Option<TcpStream> = None;
+    let mut last_local: Option<u16> = None;
     let mut server_idx = 0usize;
     loop {
         interval.tick().await;
-        match &mut conn {
-            Some(c) => {
-                let txn = stun::random_txn();
-                let mut buf = [0u8; 2048];
-                let result = async {
-                    c.write_all(&stun::binding_request(&txn)).await?;
-                    let n = c.read(&mut buf).await?;
-                    stun::parse_mapped(&buf[..n])
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "holder refresh: no mapped"))
+        if state.is_held() && conn.is_some() {
+            // Refresh the held connection: the STUN traffic re-arms the
+            // AFTR idle timer.
+            let Some(c) = conn.as_mut() else {
+                continue;
+            };
+            let txn = stun::random_txn();
+            let mut buf = [0u8; 2048];
+            let result = async {
+                c.write_all(&stun::binding_request(&txn)).await?;
+                let n = c.read(&mut buf).await?;
+                stun::parse_mapped(&buf[..n])
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "holder refresh: no mapped"))
+            }
+            .await;
+            match result {
+                Ok(tuple) => {
+                    let mut v = vote.lock().await;
+                    if let VoteDecision::Churn(t) = v.observe(server_idx, tuple) {
+                        publisher.publish_slot(r, t.0, t.1);
+                    }
                 }
-                .await;
-                match result {
-                    Ok(tuple) => {
-                        state.on_established();
-                        let mut v = vote.lock().await;
-                        if let VoteDecision::Churn(t) = v.observe(server_idx, tuple) {
-                            publisher.publish_slot(r, t.0, t.1);
-                        }
-                    }
-                    Err(_) => {
-                        state.on_error();
-                        conn = None;
-                    }
+                Err(_) => {
+                    state.on_error();
+                    conn = None;
                 }
             }
-            None => {
-                server_idx = (server_idx + 1) % servers.len();
-                match holder_round(bind_ip, r, servers[server_idx]).await {
-                    Ok((tuple, c)) => {
-                        conn = Some(c);
-                        state.on_established();
-                        let mut v = vote.lock().await;
-                        if let VoteDecision::Churn(t) = v.observe(server_idx, tuple) {
-                            publisher.publish_slot(r, t.0, t.1);
-                        }
+        } else {
+            // Dead: re-establish on the next cadence, rotating servers.
+            state.on_error();
+            conn = None;
+            if let Some(lp) = last_local.take() {
+                let _ = crate::nft::del_pin(bind_ip, lp);
+            }
+            server_idx = (server_idx + 1) % servers.len();
+            match holder_round(bind_ip, r, servers[server_idx]).await {
+                Ok((tuple, c, lp)) => {
+                    conn = Some(c);
+                    last_local = Some(lp);
+                    state.on_established();
+                    let mut v = vote.lock().await;
+                    if let VoteDecision::Churn(t) = v.observe(server_idx, tuple) {
+                        publisher.publish_slot(r, t.0, t.1);
                     }
-                    Err(_) => {}
                 }
+                Err(_) => {}
             }
         }
     }
