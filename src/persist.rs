@@ -46,6 +46,9 @@ pub fn load_epoch(dir: &Path, now: u64) -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedSlot {
     pub bind_port: u16,
+    /// IANA proto code: 17 = UDP, 6 = TCP (the last column; rows without
+    /// it are legacy UDP).
+    pub proto: u8,
     pub kind: u8, // 0=static, 1=granted
     pub client: Ipv4Addr,
     pub int_port: u16,
@@ -63,7 +66,7 @@ pub fn tsv(slots: &[PersistedSlot]) -> String {
     let mut out = String::new();
     for s in rows {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             s.bind_port,
             s.kind,
             s.client,
@@ -71,7 +74,8 @@ pub fn tsv(slots: &[PersistedSlot]) -> String {
             s.bookkeeping_ext_port,
             s.granted_lifetime,
             s.expires_at_unix,
-            s.created_at_unix
+            s.created_at_unix,
+            s.proto
         ));
     }
     out
@@ -105,10 +109,22 @@ pub fn read_leases(dir: &Path) -> (Vec<PersistedSlot>, usize) {
     let mut skipped = 0usize;
     for line in text.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() != 8 {
+        if parts.len() != 8 && parts.len() != 9 {
             skipped += 1;
             continue;
         }
+        // Proto code is the appended column; rows without it are legacy
+        // UDP. A malformed proto column counts as a malformed row.
+        let proto: u8 = match parts.get(8) {
+            Some(p) => match p.parse::<u8>() {
+                Ok(v) if v == 17 || v == 6 => v,
+                _ => {
+                    skipped += 1;
+                    continue;
+                }
+            },
+            None => 17,
+        };
         match (
             parts[0].parse::<u16>().ok(),
             parts[1].parse::<u8>().ok(),
@@ -130,6 +146,7 @@ pub fn read_leases(dir: &Path) -> (Vec<PersistedSlot>, usize) {
                 Some(created_at_unix),
             ) => out.push(PersistedSlot {
                 bind_port,
+                proto,
                 kind,
                 client,
                 int_port,
@@ -169,6 +186,7 @@ mod tests {
         let slots = vec![
             PersistedSlot {
                 bind_port: 30001,
+                proto: 17,
                 kind: 1,
                 client: Ipv4Addr::new(192, 168, 21, 50),
                 int_port: 3478,
@@ -179,6 +197,7 @@ mod tests {
             },
             PersistedSlot {
                 bind_port: 30000,
+                proto: 17,
                 kind: 0,
                 client: Ipv4Addr::new(0, 0, 0, 0),
                 int_port: 0,
@@ -225,6 +244,7 @@ mod tests {
         // unit test instead (recorded in the brief's Kani non-goals).
         let mk = |bind_port: u16, kind: u8| PersistedSlot {
             bind_port,
+            proto: 17,
             kind,
             client: Ipv4Addr::new(192, 168, 21, 50),
             int_port: 0,

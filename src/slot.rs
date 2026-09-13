@@ -25,16 +25,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---- protocol ----
 
-/// UDP only. TCP is structurally refused until C3 (TCP idle lifetime) is
-/// measured — see IMPLEMENTATION.md D3.
+/// UDP and TCP. TCP was structurally refused until C3 measured the AFTR
+/// TCP mapping idle lifetime (results/RESULTS-2026-09-13-c3.md); the
+/// refusal is lifted by call/0017.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Proto {
     Udp,
+    Tcp,
 }
 
 impl Proto {
     pub fn code(self) -> u8 {
-        17 // IANA UDP, on the wire in PCP/NAT-PMP
+        match self {
+            Proto::Udp => 17, // IANA UDP, on the wire in PCP/NAT-PMP
+            Proto::Tcp => 6,  // IANA TCP
+        }
     }
 }
 
@@ -82,6 +87,7 @@ impl Lease {
 pub struct Slot {
     /// Deterministic bind port R — the CGNAT-facing inner tuple port.
     pub bind_port: u16,
+    pub proto: Proto,
     pub target: Ipv4Addr,
     pub target_port: u16,
     pub lease: Lease,
@@ -100,7 +106,7 @@ impl Slot {
     /// are not addressable by PCP.
     pub fn pcp_key(&self) -> Option<(Proto, u16, Ipv4Addr)> {
         match self.lease {
-            Lease::Granted { client, int_port, .. } => Some((Proto::Udp, int_port, client)),
+            Lease::Granted { client, int_port, .. } => Some((self.proto, int_port, client)),
             Lease::Static => None,
         }
     }
@@ -160,7 +166,6 @@ pub enum UpsertOutcome {
     Refreshed { bind_port: u16 },
     UserQuotaExceeded,
     TableFull,
-    TcpRefused,
 }
 
 /// The slot table. `slots` is the single source of truth; the two lookup
@@ -226,8 +231,7 @@ impl LeaseTable {
         // (E3 GetExternalIPAddress / D4). The UPnP control point key is the
         // port it requested; we treat R as that key so delete/enumerate are
         // unambiguous and unique.
-        let _ = proto;
-        self.by_bind_port(ext_port)
+        self.slots.iter().find(|s| s.bind_port == ext_port && s.proto == proto)
     }
 
     // -- allocation counts --
@@ -261,9 +265,6 @@ impl LeaseTable {
         target: Ipv4Addr,
         target_port: u16,
     ) -> UpsertOutcome {
-        if proto != Proto::Udp {
-            return UpsertOutcome::TcpRefused;
-        }
         if let Some(idx) = self.index_of_key(proto, int_port, client) {
             // refresh: extend expiry, keep R and target
             self.slots[idx].lease = Lease::Granted {
@@ -288,6 +289,7 @@ impl LeaseTable {
         };
         self.slots.push(Slot {
             bind_port,
+            proto,
             target,
             target_port,
             lease: Lease::Granted {
@@ -303,7 +305,8 @@ impl LeaseTable {
     }
 
     /// Insert a static lease from config (`--static-map R=ip:port`).
-    /// Refuses a bind port already in use or outside the range.
+    /// Statics are UDP by definition: the classic relay datapath. A TCP
+    /// pin arrives via the grant path (call/0017).
     ///
     /// Error is a `Copy` enum, not `String`: the Kani proofs exercise
     /// `restore`/`insert_static` and must not model heap allocation in the
@@ -322,6 +325,7 @@ impl LeaseTable {
         }
         self.slots.push(Slot {
             bind_port,
+            proto: Proto::Udp,
             target,
             target_port,
             lease: Lease::Static,
@@ -404,6 +408,7 @@ impl LeaseTable {
             let expires_at_unix = now_unix.saturating_add(remaining.clamp(1, lifetime as u64));
             self.slots.push(Slot {
                 bind_port: rec.bind_port,
+                proto: rec.proto,
                 target: rec.target,
                 target_port: rec.target_port,
                 lease: Lease::Granted {
@@ -424,6 +429,7 @@ impl LeaseTable {
 #[derive(Clone, Copy, Debug)]
 pub struct GrantedRecord {
     pub bind_port: u16,
+    pub proto: Proto,
     pub client: Ipv4Addr,
     pub int_port: u16,
     pub target: Ipv4Addr,
@@ -543,10 +549,32 @@ mod tests {
     }
 
     #[test]
-    fn tcp_refused() {
-        // only UDP exists as a variant; the refusal path is exercised via the
-        // facade layer. Kept as a guard that the API shape stays explicit.
+    fn tcp_grant_and_udp_share_the_table_proto_dimension() {
+        // C3 unlocked TCP grants (call/0017): the same (client, int_port)
+        // across protocols yields distinct slots with their own bind
+        // ports, matching the AFTR's per-protocol external ports.
         assert_eq!(Proto::Udp.code(), 17);
+        assert_eq!(Proto::Tcp.code(), 6);
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 50);
+        assert!(matches!(
+            t.upsert_pcp(Proto::Tcp, 3478, c, 300, NOW, c, 3478),
+            UpsertOutcome::Granted { .. }
+        ));
+        let g = t.upsert_pcp(Proto::Udp, 3478, c, 300, NOW, c, 3478);
+        match g {
+            UpsertOutcome::Granted { bind_port } => {
+                let s = t.by_bind_port(bind_port).unwrap();
+                assert_eq!(s.proto, Proto::Udp);
+            }
+            _ => panic!("UDP grant expected"),
+        }
+        let tcp_slot = t
+            .slots()
+            .iter()
+            .find(|s| s.proto == Proto::Tcp)
+            .expect("a TCP slot exists");
+        assert_eq!(tcp_slot.pcp_key(), Some((Proto::Tcp, 3478, c)));
     }
 
     #[test]
@@ -605,6 +633,7 @@ mod tests {
                 Lease::Granted { client, int_port, granted_lifetime, expires_at_unix } => {
                     Some(GrantedRecord {
                         bind_port: s.bind_port,
+                        proto: s.proto,
                         client,
                         int_port,
                         target: s.target,

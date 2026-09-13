@@ -470,6 +470,10 @@ async fn main() {
         .filter(|p| p.kind == 1 && !static_rs.contains(&p.bind_port))
         .map(|p| slot::GrantedRecord {
             bind_port: p.bind_port,
+            proto: match p.proto {
+                6 => slot::Proto::Tcp,
+                _ => slot::Proto::Udp,
+            },
             client: p.client,
             int_port: p.int_port,
             target: p.client, // granted slot forwards to its own flow
@@ -494,6 +498,7 @@ async fn main() {
         .map(|s| match s.lease {
             slot::Lease::Static => PersistedSlot {
                 bind_port: s.bind_port,
+                proto: s.proto.code(),
                 kind: 0,
                 client: Ipv4Addr::UNSPECIFIED,
                 int_port: 0,
@@ -509,6 +514,7 @@ async fn main() {
                 expires_at_unix,
             } => PersistedSlot {
                 bind_port: s.bind_port,
+                proto: s.proto.code(),
                 kind: 1,
                 client,
                 int_port,
