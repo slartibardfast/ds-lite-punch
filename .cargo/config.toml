@@ -1,0 +1,5 @@
+# ds-lite-punch deploys to the ImmortalWrt router — always musl-static.
+# A host-glibc release build boots with rc=127 on the router (no ELF
+# interpreter). P1 shipped this way; the slot-engine keeps the rule.
+[build]
+target = "x86_64-unknown-linux-musl"

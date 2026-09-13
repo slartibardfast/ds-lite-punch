@@ -1,0 +1,25 @@
+[package]
+name = "ds-lite-punch"
+version = "0.1.0"
+edition = "2021"
+description = "CGNAT-aware UDP relay for the Virgin Media ds-lite line: keeps the AFTR mapping alive with STUN keepalives and forwards inbound UDP to a br-lan target, preserving the peer source."
+
+[[bin]]
+name = "ds-lite-punch"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
+libc = "0.2"
+
+# Register the `kani` cfg so rustc doesn't warn about the #[cfg(kani)] proof
+# modules when Kani isn't running.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
