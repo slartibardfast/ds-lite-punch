@@ -17,6 +17,7 @@ mod persist;
 mod publish;
 mod slot;
 mod stun;
+mod tcpslot;
 mod vote;
 
 use cdc::CdcKind;
@@ -598,6 +599,31 @@ async fn main() {
     let n = slots_snapshot.len() as u32;
     let interval = cfg.interval;
     for (i, s) in slots_snapshot.iter().enumerate() {
+        if s.proto == slot::Proto::Tcp {
+            // TCP slot datapath (call/0017): listener on the pin tuple
+            // with a STUN-over-TCP holder at the C3-sized cadence. The
+            // holder publishes the slot's external TCP tuple per-R.
+            let listener = match tcpslot::bind_pin(bind_ip, s.bind_port).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "fatal: bind tcp slot {}:{} failed: {}",
+                        bind_ip, s.bind_port, e
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let target = SocketAddrV4::new(s.target, s.target_port);
+            let publisher = publisher.clone();
+            let servers = state.lock().await.servers.clone();
+            let vote = Arc::new(Mutex::new(VoteState::new()));
+            let bind_port = s.bind_port;
+            tokio::spawn(tcpslot::run_tcp_slot(listener, target));
+            tokio::spawn(tcpslot::run_holder(
+                bind_ip, bind_port, servers, vote, publisher,
+            ));
+            continue;
+        }
         let sock = Arc::new(
             match UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(bind_ip, s.bind_port))).await {
                 Ok(sk) => sk,

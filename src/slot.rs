@@ -793,6 +793,7 @@ mod verify {
         kani::assume(port <= 30009); // alloc_ok() hi bound
         let rec = GrantedRecord {
             bind_port: port,
+            proto: Proto::Udp,
             client: a,
             int_port: 1000,
             target: a,
@@ -827,6 +828,7 @@ mod verify {
         assert!(t.insert_static(30005, a, 4444).is_ok());
         let rec = GrantedRecord {
             bind_port: 30005,
+            proto: Proto::Udp,
             client: a,
             int_port: 1000,
             target: a,

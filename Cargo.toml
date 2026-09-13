@@ -9,7 +9,7 @@ name = "ds-lite-punch"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 libc = "0.2"
 
 # Register the `kani` cfg so rustc doesn't warn about the #[cfg(kani)] proof
