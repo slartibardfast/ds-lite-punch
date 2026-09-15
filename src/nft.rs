@@ -32,8 +32,9 @@
 //! warning-free at every phase gate, and re-exported for the deploy script.
 #![allow(dead_code)] // del_pin / remove_ruleset consumed by B8/B9 revoke paths
 use std::io;
+use std::io::Write;
 use std::net::Ipv4Addr;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// The NAT address every pinned console flow egresses as: the hub-LAN
 /// address the relay sockets bind. Matches the `--bind` default in main.rs.
@@ -49,6 +50,91 @@ fn run(args: &[&str]) -> io::Result<()> {
             format!("nft {} -> {}", args.join(" "), status),
         ))
     }
+}
+
+/// Run a multi-statement nft script (`nft -f -`) as ONE atomic batch: a
+/// single subprocess per transaction instead of one per statement. A
+/// failing statement aborts the whole batch, so the datapath state is
+/// all-or-nothing (the facade grant/revoke use this; the fixed-startup
+/// ruleset stays per-statement for its fine-grained idempotency).
+pub fn run_script(script: &str) -> io::Result<()> {
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "nft -f - stdin unavailable"))?
+        .write_all(script.as_bytes())?;
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("nft batch -> {}", status),
+        ))
+    }
+}
+
+/// The per-slot accept rule text (shared by the grant batch and the
+/// fallback path so the comment and match never drift).
+fn accept_rule(bind_port: u16, tcp: bool) -> String {
+    let comment = format!("dslitepunch-{}{}", bind_port, if tcp { "-tcp" } else { "" });
+    let kw = if tcp { "tcp" } else { "udp" };
+    format!(
+        "insert rule inet fw4 input iifname \"eth1\" {} dport {} accept comment \"{}\"",
+        kw, bind_port, comment
+    )
+}
+
+/// Grant a slot datapath atomically: the snat_map pin and the input-accept
+/// in one `nft -f -` batch (one subprocess, all-or-nothing). Falls back to
+/// the per-op functions when the batch fails (e.g. the respawn re-add case
+/// where `add element` EEXISTs — `add_pin` tolerates that by value check,
+/// and `add_input_accept` cleans a stale rule first). The stale-rule edge
+/// (same R re-granted after the revoke) is handled by the fallback; a
+/// duplicate accept is otherwise unreachable because R reuse only follows
+/// a successful revoke.
+pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
+    let elem = format!("{} . {} : {} . {}", client, int_port, NAT_ADDR, bind_port);
+    let script = format!(
+        "add element ip dslp snat_map {{ {} }}\n{}\n",
+        elem,
+        accept_rule(bind_port, tcp)
+    );
+    if run_script(&script).is_ok() {
+        return Ok(());
+    }
+    // fallback: the proven per-op sequence (with its own idempotency).
+    add_pin(client, int_port, bind_port)?;
+    if let Err(e) = add_input_accept(bind_port, tcp) {
+        let _ = del_pin(client, int_port);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Revoke a slot datapath atomically: element delete plus rule delete (by
+/// expression — no handle lookup) in one batch; falls back to the per-op
+/// functions.
+pub fn revoke_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
+    let comment = format!("dslitepunch-{}{}", bind_port, if tcp { "-tcp" } else { "" });
+    let kw = if tcp { "tcp" } else { "udp" };
+    let script = format!(
+        "delete element ip dslp snat_map {{ {} . {} }}\n\
+         delete rule inet fw4 input iifname \"eth1\" {} dport {} accept comment \"{}\"\n",
+        client, int_port, kw, bind_port, comment
+    );
+    if run_script(&script).is_ok() {
+        return Ok(());
+    }
+    let _ = del_pin(client, int_port);
+    let _ = del_input_accept(bind_port, tcp);
+    Ok(())
 }
 
 /// Install the fixed ruleset. Idempotent: table creation is a no-op when

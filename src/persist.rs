@@ -58,6 +58,44 @@ pub struct PersistedSlot {
     pub created_at_unix: u64,
 }
 
+/// Snapshot the live slot table for persisting (B8 respawn restore; the
+/// UPnP facade grants reuse the same projection so respawn re-binds the
+/// granted Rs).
+pub fn snapshot(table: &[crate::slot::Slot], now_unix: u64) -> Vec<PersistedSlot> {
+    table
+        .iter()
+        .map(|s| match s.lease {
+            crate::slot::Lease::Static => PersistedSlot {
+                bind_port: s.bind_port,
+                proto: s.proto.code(),
+                kind: 0,
+                client: Ipv4Addr::UNSPECIFIED,
+                int_port: 0,
+                bookkeeping_ext_port: 0,
+                granted_lifetime: 0,
+                expires_at_unix: 0,
+                created_at_unix: now_unix,
+            },
+            crate::slot::Lease::Granted {
+                client,
+                int_port,
+                granted_lifetime,
+                expires_at_unix,
+            } => PersistedSlot {
+                bind_port: s.bind_port,
+                proto: s.proto.code(),
+                kind: 1,
+                client,
+                int_port,
+                bookkeeping_ext_port: 0,
+                granted_lifetime,
+                expires_at_unix,
+                created_at_unix: now_unix,
+            },
+        })
+        .collect()
+}
+
 /// Serialize slots to TSV. Deterministic order (by bind_port) so diffs
 /// between respawns are stable.
 pub fn tsv(slots: &[PersistedSlot]) -> String {
@@ -217,6 +255,67 @@ mod tests {
         assert_eq!(got[1].bind_port, 30001);
         assert_eq!(got[1].client, Ipv4Addr::new(192, 168, 21, 50));
         assert_eq!(got[1].granted_lifetime, 600);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn snapshot_projects_static_and_granted_exactly() {
+        // Regression (review S6): snapshot is the respawn-restore
+        // projection; a field dropped or mis-keyed in the Granted arm
+        // (kind flipped, client/int swapped, lifetime zeroed) would ship
+        // green and silently kill facade grants on the next respawn.
+        let now = 1_800_000_000u64;
+        let slots = [
+            crate::slot::Slot {
+                bind_port: 30000,
+                proto: crate::slot::Proto::Udp,
+                target: Ipv4Addr::new(192, 168, 0, 21),
+                target_port: 30000,
+                lease: crate::slot::Lease::Static,
+                phase_ms: 0,
+                last_activity_unix: 0,
+            },
+            crate::slot::Slot {
+                bind_port: 30001,
+                proto: crate::slot::Proto::Tcp,
+                target: Ipv4Addr::new(192, 168, 21, 50),
+                target_port: 4000,
+                lease: crate::slot::Lease::Granted {
+                    client: Ipv4Addr::new(192, 168, 21, 50),
+                    int_port: 4000,
+                    granted_lifetime: 3600,
+                    expires_at_unix: now + 3600,
+                },
+                phase_ms: 0,
+                last_activity_unix: 0,
+            },
+        ];
+        let p = snapshot(&slots, now);
+        assert_eq!(p.len(), 2);
+        // static row: kind 0, zeroed client/int, UDP code
+        assert_eq!(p[0].kind, 0);
+        assert_eq!(p[0].client, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(p[0].int_port, 0);
+        assert_eq!(p[0].proto, 17);
+        // granted row: kind 1, fields intact, TCP code
+        assert_eq!(p[1].kind, 1);
+        assert_eq!(p[1].client, Ipv4Addr::new(192, 168, 21, 50));
+        assert_eq!(p[1].int_port, 4000);
+        assert_eq!(p[1].granted_lifetime, 3600);
+        assert_eq!(p[1].expires_at_unix, now + 3600);
+        assert_eq!(p[1].proto, 6);
+        // the TSV round-trip recovers the granted row for main's kind==1
+        // restore filter
+        let d = tmpdir("snapshot");
+        write_leases(&d, &[p[1].clone()]).unwrap();
+        let (got, skipped) = read_leases(&d);
+        assert_eq!(skipped, 0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, 1);
+        assert_eq!(got[0].client, p[1].client);
+        assert_eq!(got[0].int_port, 4000);
+        assert_eq!(got[0].granted_lifetime, 3600);
+        assert_eq!(got[0].expires_at_unix, now + 3600);
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -43,6 +43,12 @@ start_service() {
         nft insert rule inet fw4 input iifname "eth1" udp dport "${BIND##*:}" accept comment dslitepunch
     fi
 
+    # The facade is default-on; an operator with a real IGD on the LAN (or
+    # a dead UDP 1900) can disable it via UPNP=0 in the env file — the rc
+    # surface must expose the flag, or every fix would be overwritten by
+    # an opkg upgrade.
+    NO_UPNP=
+    [ "${UPNP:-1}" = "1" ] || NO_UPNP=--no-upnp
     procd_open_instance
     procd_set_param command "$PROG" \
         --bind "$BIND" --target "$TARGET" --stun "$STUN" \
@@ -50,6 +56,9 @@ start_service() {
         --slot-port-range "${SLOT_RANGE:-30000-39999}" \
         --max-slots "${MAX_SLOTS:-32}" \
         --max-maps-per-client "${MAX_MAPS_PER_CLIENT:-16}" \
+        --upnp-port "${UPNP_PORT:-49152}" \
+        --lan-ip "${LAN_IP:-192.168.21.1}" \
+        $NO_UPNP \
         ${OBSERVATION:+--observation}
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1

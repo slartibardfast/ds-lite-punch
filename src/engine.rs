@@ -440,7 +440,7 @@ mod tests {
             max,
             grace,
             Vec::new(),
-            Arc::new(Publisher::new("/tmp/dslp-test")),
+            Arc::new(Publisher::with_watch("/tmp/dslp-test", tokio::sync::watch::channel(Ipv4Addr::UNSPECIFIED).0)),
             Arc::new(NopPins),
         )
     }

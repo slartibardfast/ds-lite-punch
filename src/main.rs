@@ -18,12 +18,14 @@ mod publish;
 mod slot;
 mod stun;
 mod tcpslot;
+mod upnp;
+mod upnpsvc;
 mod vote;
 
 use cdc::CdcKind;
 use mapping::State;
 use nft::{add_input_accept, add_pin, ensure_flow_obs, ensure_ruleset};
-use persist::{load_epoch, read_leases, write_leases, PersistedSlot, DEFAULT_DIR};
+use persist::{load_epoch, read_leases, snapshot, write_leases, DEFAULT_DIR};
 use publish::Publisher;
 use slot::{Epoch, LeaseTable, PortAllocator, StaticMapErr};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -32,7 +34,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+use upnp::DEFAULT_LAN_IP;
+use upnpsvc::UpnpFacade;
 use vote::{VoteDecision, VoteState};
 
 /// Format a static-map/restore rejection for logs (the enum stays heap-free
@@ -70,6 +74,11 @@ struct Config {
     observation: bool,
     max_rescues: u32,
     cdc: CdcKind,
+    // UPnP IGD facade (plan/0007 phase E): br-lan only.
+    upnp_enabled: bool,
+    upnp_port: u16,
+    lan_ip: Ipv4Addr,
+    upnp_name: String,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -86,6 +95,10 @@ fn parse_args() -> Result<Config, String> {
     let mut gc_grace_factor: u32 = 3;
     let mut observation = false;
     let mut max_rescues: u32 = 8;
+    let mut upnp_enabled = true;
+    let mut upnp_port: u16 = upnp::UPNP_DEFAULT_PORT;
+    let mut lan_ip = DEFAULT_LAN_IP;
+    let mut upnp_name = "ds-lite-punch IGD".to_string();
     // G1 primary = the nft flow_obs mirror (gating test passed 2026-09-02);
     // /proc stays reachable as the fallback (--cdc proc).
     let mut cdc_kind = CdcKind::Nft;
@@ -180,6 +193,22 @@ fn parse_args() -> Result<Config, String> {
                 };
                 i += 2
             }
+            "--upnp-port" => {
+                upnp_port = v()?.parse().map_err(|e| format!("--upnp-port: {}", e))?;
+                i += 2
+            }
+            "--lan-ip" => {
+                lan_ip = v()?.parse().map_err(|e| format!("--lan-ip: {}", e))?;
+                i += 2
+            }
+            "--upnp-name" => {
+                upnp_name = v()?;
+                i += 2
+            }
+            "--no-upnp" => {
+                upnp_enabled = false;
+                i += 1
+            }
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -256,6 +285,10 @@ fn parse_args() -> Result<Config, String> {
         observation,
         max_rescues,
         cdc: cdc_kind,
+        upnp_enabled,
+        upnp_port,
+        lan_ip,
+        upnp_name,
     })
 }
 
@@ -266,7 +299,9 @@ fn usage() {
          [--state-dir /run/ds-lite-punch] [--slot-port-range LO-HI] \
          [--max-slots 32] [--max-maps-per-client 16] \
          [--gc-grace-factor 3] [--observation] [--max-rescues 8] \
-         [--cdc proc|nft|aya]\n\
+         [--cdc proc|nft|aya] \
+         [--upnp-port 49152] [--lan-ip 192.168.21.1] [--upnp-name NAME] \
+         [--no-upnp]\n\
          Legacy single-map form (P1): --bind 192.168.0.21:R --target ip:port"
     );
 }
@@ -340,7 +375,10 @@ async fn resolve_stun(hosts: &[String]) -> Vec<SocketAddrV4> {
     out
 }
 
-async fn keepalive_loop(
+/// The slot keepalive loop. Spawned by the slot's caller (static path and
+/// the UPnP facade grant path) so that path owns the JoinHandle and can
+/// abort both tasks on teardown.
+pub(crate) async fn keepalive_loop(
     sock: Arc<UdpSocket>,
     state: Arc<Mutex<State>>,
     interval: Duration,
@@ -373,22 +411,20 @@ async fn keepalive_loop(
 
 /// One slot: keepalive task (staggered) + recv loop on its own socket.
 /// Byte-identical to v1 core when there is exactly one slot (no stagger:
-/// single socket, same forward path).
-async fn run_slot(
+/// single socket, same forward path). `pub(crate)`: the UPnP facade grants
+/// spawn the same datapath for a granted UDP slot.
+///
+/// The keepalive task is NOT spawned here: the caller spawns it (and owns
+/// both JoinHandles) so a facade grant revocation can abort the keepalive
+/// too — otherwise the keepalive's own Arc clone would keep the slot socket
+/// bound after the recv loop is aborted (the 2026-09-14 leak).
+pub(crate) async fn run_slot(
     sock: Arc<UdpSocket>,
     state: Arc<Mutex<State>>,
     target: SocketAddrV4,
     publisher: Arc<Publisher>,
     bind_port: u16,
-    interval: Duration,
-    phase_ms: u32,
 ) {
-    let ka_sock = sock.clone();
-    let ka_state = state.clone();
-    tokio::spawn(async move {
-        keepalive_loop(ka_sock, ka_state, interval, phase_ms).await;
-    });
-
     // B6 STUN majority vote: publication happens only when >=2 servers
     // agree on a new tuple; a single disagreeing observation marks the
     // server suspect (rotate) without republishing.
@@ -528,55 +564,25 @@ async fn main() {
     }
 
     // Snapshot the whole table (static + granted) back to disk so the
-    // respawn cycle is stable.
-    let persisted_snapshot: Vec<PersistedSlot> = table
-        .slots()
-        .iter()
-        .map(|s| match s.lease {
-            slot::Lease::Static => PersistedSlot {
-                bind_port: s.bind_port,
-                proto: s.proto.code(),
-                kind: 0,
-                client: Ipv4Addr::UNSPECIFIED,
-                int_port: 0,
-                bookkeeping_ext_port: 0,
-                granted_lifetime: 0,
-                expires_at_unix: 0,
-                created_at_unix: now,
-            },
-            slot::Lease::Granted {
-                client,
-                int_port,
-                granted_lifetime,
-                expires_at_unix,
-            } => PersistedSlot {
-                bind_port: s.bind_port,
-                proto: s.proto.code(),
-                kind: 1,
-                client,
-                int_port,
-                bookkeeping_ext_port: 0,
-                granted_lifetime,
-                expires_at_unix,
-                created_at_unix: now,
-            },
-        })
-        .collect();
+    // respawn cycle is stable. One projection lives in persist::snapshot
+    // (the facade's persist() writes through it too); the boot path must
+    // not carry a second copy that can drift from it.
+    let persisted_snapshot: Vec<persist::PersistedSlot> = snapshot(table.slots(), now);
     if let Err(e) = write_leases(persist_dir, &persisted_snapshot) {
         eprintln!("warn: persist leases failed: {}", e);
     }
 
-    // B9 GC ticker: scan every 60 s; free granted leases expired past
-    // (grace_factor x 60 s) with no inbound activity. Statics never GC. The
-    // per-slot teardown (element delete, socket close) is owned by the
-    // facade layer for granted leases (D/E); today the table only holds
-    // statics, so this logs at most. Holds the table lock briefly.
-    // Snapshot the slots before the table is moved into the GC task:
-    // pins, accepts and slot tasks are all driven from this frozen set
-    // (facade-added leases get their own spawn path in D/E).
+    // B9 GC: scan every 60 s; free granted leases expired past
+    // (grace_factor x 60 s) with no inbound activity. Statics never GC. In
+    // facade mode the UPnP facade's own GC owns the per-slot teardown
+    // (nft element delete, task abort, entry removal) so the table-only
+    // loop here only runs without the facade.
+    // Snapshot the slots before the table is moved into the tasks: pins,
+    // accepts and slot tasks are all driven from this frozen set
+    // (facade-added leases get their own spawn path in phase E).
     let slots_snapshot: Vec<slot::Slot> = table.slots().to_vec();
-    {
-        let table = Arc::new(tokio::sync::Mutex::new(table));
+    let table = Arc::new(Mutex::new(table));
+    if !cfg.upnp_enabled {
         let grace = cfg.gc_grace_factor.saturating_mul(60);
         let gc_table = table.clone();
         tokio::spawn(async move {
@@ -587,14 +593,23 @@ async fn main() {
                 let now = Epoch::now();
                 let freed = gc_table.lock().await.gc(now, grace as u64);
                 if !freed.is_empty() {
-                    eprintln!("gc: freed slots {:?} (no refresh, no traffic, past grace)", freed);
+                    eprintln!(
+                        "gc: freed slots {:?} (no refresh, no traffic, past grace)",
+                        freed
+                    );
                 }
             }
         });
     }
 
-    let publisher = Arc::new(Publisher::new(&cfg.state_dir));
-    let state = Arc::new(Mutex::new(State::new(servers)));
+    // The tuple watch carries the last published external IP: the facade's
+    // GetExternalIPAddress reads it and GENA events fire on its changes.
+    // Seeded from the persisted slot-0 tuple file (respawn continuity), so
+    // a pre-discovery request is answered from the last known value.
+    let (ip_tx, ip_rx) =
+        watch::channel(seed_external_ip(&cfg.state_dir, cfg.bind.port()));
+    let publisher = Arc::new(Publisher::with_watch(&cfg.state_dir, ip_tx));
+    let state = Arc::new(Mutex::new(State::new(servers.clone())));
     let target = cfg.target;
 
     // B4: install the fixed nft ruleset once, then pin + accept per slot.
@@ -635,6 +650,15 @@ async fn main() {
     let n = slots_snapshot.len() as u32;
     let interval = cfg.interval;
     for (i, s) in slots_snapshot.iter().enumerate() {
+        // In facade mode, granted leases (respawn-restored from leases.tsv)
+        // have their datapath rebuilt and registered in the facade's task
+        // map by UpnpFacade::start — the one owner that can tear them down.
+        // A second spawn here would double-bind the slot socket and orphan
+        // the handles. Statics stay on this path: the facade never tears a
+        // static slot down, so main's discarded handles are correct for it.
+        if cfg.upnp_enabled && !s.is_static() {
+            continue;
+        }
         if s.proto == slot::Proto::Tcp {
             // TCP slot datapath (call/0017): listener on the pin tuple
             // with a STUN-over-TCP holder at the C3-sized cadence. The
@@ -676,10 +700,63 @@ async fn main() {
         let target = SocketAddrV4::new(s.target, s.target_port);
         let publisher = publisher.clone();
         let bind_port = s.bind_port;
+        // The keepalive is a sibling task (not spawned inside run_slot):
+        // the caller owns both JoinHandles, so a facade grant revocation
+        // can abort them together. The static path here never tears a slot
+        // down, so the handles are deliberately discarded.
+        let ka_sock = sock.clone();
+        let ka_state = state.clone();
         tokio::spawn(async move {
-            run_slot(sock, state, target, publisher, bind_port, interval, phase_ms).await
+            keepalive_loop(ka_sock, ka_state, interval, phase_ms).await
+        });
+        tokio::spawn(async move {
+            run_slot(sock, state, target, publisher, bind_port).await
         });
     }
+
+    // Phase E: the UPnP IGD facade (plan/0007). SSDP + description docs +
+    // SOAP (POST/M-POST) + GENA on br-lan; AddPortMapping grants UDP and
+    // TCP slots with real datapaths (the facade spawns a slot's runtime as
+    // its own job, per the D/E note above). In facade mode the facade's
+    // local GC owns the granted-lease teardown (the table-only GC above is
+    // skipped); the tuple watch feeds GetExternalIPAddress and the GENA
+    // events.
+    let facade = if cfg.upnp_enabled {
+        let facade_servers = servers.clone();
+        match UpnpFacade::start(
+            upnpsvc::UpnpConfig {
+                lan_ip: cfg.lan_ip,
+                upnp_port: cfg.upnp_port,
+                bind_ip,
+                state_dir: cfg.state_dir.clone(),
+                servers: facade_servers,
+                interval: cfg.interval,
+                name: cfg.upnp_name.clone(),
+                grace_secs: u64::from(cfg.gc_grace_factor.saturating_mul(60)),
+            },
+            table.clone(),
+            publisher.clone(),
+            ip_rx,
+        )
+        .await
+        {
+            Ok(f) => {
+                println!(
+                    "{{\"event\":\"upnp\",\"lan\":\"{}:{}\",\"udn\":\"uuid:{}\"}}",
+                    cfg.lan_ip,
+                    cfg.upnp_port,
+                    f.udn()
+                );
+                Some(f)
+            }
+            Err(e) => {
+                eprintln!("upnp: facade unavailable, continuing without it: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Phase G: observation rescue engine (--observation). The selected CDC
     // produces live candidate flows; the engine claims them with shadow
@@ -733,7 +810,83 @@ async fn main() {
     }
 
     // All work happens in spawned tasks; keep main alive. procd sends
-    // SIGTERM on stop — the daemon makes no graceful-shutdown guarantees;
-    // the init script's stop() removes the nft ruleset (B8).
+    // SIGTERM on stop. In facade mode a handler sends the SSDP byebye
+    // NOTIFYs before exiting (the init script's stop() removes the nft
+    // ruleset); without the facade the default SIGTERM action applies.
+    if let Some(facade) = &facade {
+        let f = facade.clone();
+        tokio::spawn(async move {
+            // Exit only on a received SIGTERM: a registration failure here
+            // (the guard's Err arm) must leave the default SIGTERM action
+            // in place, never self-terminate moments after boot.
+            if let Ok(mut sigterm) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                sigterm.recv().await;
+                f.send_byebye().await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                std::process::exit(0);
+            }
+        });
+    }
     std::future::pending::<()>().await;
+}
+
+/// Seed the facade's external-IP watch from the persisted tuple files
+/// (slot-0's per-slot file first, then the aggregate): the last known
+/// value across respawns, so a pre-discovery GetExternalIPAddress is never
+/// answered with an unset address.
+fn seed_external_ip(state_dir: &str, primary: u16) -> Ipv4Addr {
+    let slot_file = format!("{}/tuple-{}", state_dir, primary);
+    let agg_file = format!("{}/tuple", state_dir);
+    for f in [slot_file, agg_file] {
+        if let Ok(s) = std::fs::read_to_string(&f) {
+            if let Some((ip, _)) = s.trim().split_once(':') {
+                if let Ok(ip) = ip.parse() {
+                    return ip;
+                }
+            }
+        }
+    }
+    Ipv4Addr::UNSPECIFIED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_external_ip_prefers_slot_over_aggregate() {
+        // Regression (review S6): the seeded GetExternalIPAddress answer
+        // depends on the file order and the trim-before-split; a regression
+        // here silently answered 501 after every reboot with a stale tuple.
+        let d = std::env::temp_dir().join(format!("dslp-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // aggregate only
+        std::fs::write(d.join("tuple"), "87.116.31.222:40001\n").unwrap();
+        assert_eq!(
+            seed_external_ip(d.to_str().unwrap(), 40000),
+            "87.116.31.222".parse::<Ipv4Addr>().unwrap()
+        );
+        // per-slot file wins over the aggregate (it is the fresher record)
+        std::fs::write(d.join("tuple-40000"), "87.116.31.223:40001\n").unwrap();
+        assert_eq!(
+            seed_external_ip(d.to_str().unwrap(), 40000),
+            "87.116.31.223".parse::<Ipv4Addr>().unwrap()
+        );
+        // a trailing-newline-only variant still parses (trim before split)
+        std::fs::write(d.join("tuple"), "87.116.31.224:40001").unwrap();
+        assert_eq!(
+            seed_external_ip(d.to_str().unwrap(), 40001),
+            "87.116.31.224".parse::<Ipv4Addr>().unwrap()
+        );
+        // nothing readable -> UNSPECIFIED
+        let missing = std::env::temp_dir().join(format!("dslp-seed-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(seed_external_ip(missing.to_str().unwrap(), 40000), Ipv4Addr::UNSPECIFIED);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&missing);
+    }
 }

@@ -1,17 +1,27 @@
 //! Tuple publication: write the current external tuple to a state file and
 //! emit a JSON line (journald) on every change. Downstream (DDNS, dashboards)
-//! consumes the file; the daemon never blocks on consumers.
+//! consumes the file; the daemon never blocks on consumers. When a watch
+//! sender is attached (UPnP facade mode), every published tuple also feeds
+//! the facade's external-IP state (E3 GetExternalIPAddress + E5 GENA
+//! events) — fire-and-forget: the facade runs with the latest value.
 use std::fs;
 use std::net::Ipv4Addr;
 
+use tokio::sync::watch;
+
 pub struct Publisher {
     dir: String,
+    ip_watch: Option<watch::Sender<Ipv4Addr>>,
 }
 
 impl Publisher {
-    pub fn new(dir: &str) -> Self {
+    /// Attach the facade's external-IP watch (UPnP facade mode).
+    pub fn with_watch(dir: &str, ip_watch: watch::Sender<Ipv4Addr>) -> Self {
         let _ = fs::create_dir_all(dir);
-        Publisher { dir: dir.to_string() }
+        Publisher {
+            dir: dir.to_string(),
+            ip_watch: Some(ip_watch),
+        }
     }
 
     pub fn publish(&self, ip: Ipv4Addr, port: u16) {
@@ -22,7 +32,8 @@ impl Publisher {
 
     /// Per-slot tuple file (B6/B8): `tuple-<R>` alongside the aggregate
     /// `tuple` file (last writer). Respawn restore reads `tuple-<R>` per
-    /// slot; existing consumers keep reading `tuple` unchanged.
+    /// slot; existing consumers keep reading `tuple` unchanged. The facade
+    /// watch mirrors the same value for the SOAP/GENA layers.
     pub fn publish_slot(&self, bind_port: u16, ip: Ipv4Addr, port: u16) {
         let path = format!("{}/tuple-{}", self.dir, bind_port);
         let _ = fs::write(&path, format!("{}:{}\n", ip, port));
@@ -31,6 +42,9 @@ impl Publisher {
             bind_port, ip, port
         );
         self.publish(ip, port);
+        if let Some(tx) = &self.ip_watch {
+            let _ = tx.send(ip);
+        }
     }
 
     pub fn log_transition(&self, event: &str, detail: &str) {
