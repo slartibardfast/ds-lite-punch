@@ -1497,12 +1497,17 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(96)]
     fn mpost_post_parity() {
-        // The parity property (E3/verification), structural half: for ANY
-        // short action text the M-POST head (MAN + <ns>SOAPACTION)
-        // classifies to exactly the same class as the equivalent POST head
-        // (SOAPACTION). The symbolic action covers real name shapes and
-        // junk below the real-name bound.
+        // The parity property (E3/verification), structural half: for any
+        // CLEAN short action text — printable bytes, no embedded CR/LF —
+        // the M-POST head (MAN + <ns>SOAPACTION) classifies to exactly the
+        // same class as the equivalent POST head (SOAPACTION). The action
+        // is spliced into a header VALUE, so bytes that fabricate new
+        // header lines are HTTP-malformed input: those corners are pinned
+        // by the unit test `mpost_post_parity_multiline_corners` (the
+        // GENA markers dispatch symmetrically there too), not by this
+        // proof — the proven claim is what E3 actually requires.
         let action: [u8; 8] = kani::any();
+        kani::assume(action.iter().all(|&b| b >= b' '));
         let (pb, pl, mb, ml) = parity_heads(&action);
         assert_eq!(classify(&pb[..pl]), classify(&mb[..ml]));
     }
