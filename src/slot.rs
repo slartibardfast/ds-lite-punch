@@ -266,13 +266,15 @@ impl LeaseTable {
         target_port: u16,
     ) -> UpsertOutcome {
         if let Some(idx) = self.index_of_key(proto, int_port, client) {
-            // refresh: extend expiry, keep R and target
+            // refresh: extend expiry, keep R and target. The client is
+            // provably present (it just sent Add): stamp last-seen too.
             self.slots[idx].lease = Lease::Granted {
                 client,
                 int_port,
                 granted_lifetime,
                 expires_at_unix: now_unix.saturating_add(granted_lifetime as u64),
             };
+            self.slots[idx].last_activity_unix = now_unix;
             return UpsertOutcome::Refreshed {
                 bind_port: self.slots[idx].bind_port,
             };
@@ -299,7 +301,7 @@ impl LeaseTable {
                 expires_at_unix: now_unix.saturating_add(granted_lifetime as u64),
             },
             phase_ms: 0, // assigned by the runtime stager
-            last_activity_unix: 0,
+            last_activity_unix: now_unix, // the grant is the first-seen signal
         });
         UpsertOutcome::Granted { bind_port }
     }
@@ -382,6 +384,78 @@ impl LeaseTable {
         freed
     }
 
+    /// The lease policy's last-seen stamp, rate-limited: the datapath can
+    /// fire many times a second, so one write per slot per
+    /// `min_interval_secs` is plenty of clock resolution for a 24 h policy.
+    pub fn stamp_activity_if_stale(
+        &mut self,
+        bind_port: u16,
+        now_unix: u64,
+        min_interval_secs: u64,
+    ) {
+        let Some(s) = self.slots.iter_mut().find(|s| s.bind_port == bind_port) else {
+            return;
+        };
+        if now_unix.saturating_sub(s.last_activity_unix) >= min_interval_secs {
+            s.last_activity_unix = now_unix;
+        }
+    }
+
+    /// Backstop sweep of the lease policy: reap UDP grants whose client
+    /// has shown no activity (datapath or control) for `backstop_secs`,
+    /// whatever the pool state. Statics never reap. TCP grants are out of
+    /// the lease policy entirely: a live TCP splice can be control-silent,
+    /// so reaping on the control clock would break a live session (the
+    /// AFTR already reaps an idle TCP mapping at the C3 bound). Returns
+    /// the freed bind ports.
+    pub fn gc_idle(&mut self, now_unix: u64, backstop_secs: u64) -> Vec<u16> {
+        let cutoff = now_unix.saturating_sub(backstop_secs);
+        let mut freed = Vec::new();
+        let mut keep = Vec::with_capacity(self.slots.len());
+        for s in self.slots.drain(..) {
+            let idle = matches!(&s.lease, Lease::Granted { .. })
+                && s.proto == Proto::Udp
+                && s.last_activity_unix < cutoff;
+            if idle {
+                freed.push(s.bind_port);
+            } else {
+                keep.push(s);
+            }
+        }
+        self.slots = keep;
+        freed
+    }
+
+    /// The pressure-eviction candidate: the longest-idle UDP grant of a
+    /// client OTHER than `requester`, idle past `grace`. The requesting
+    /// client's own grants are never evicted (its live mappings stay).
+    /// Returns the slot identity the caller needs to tear it down.
+    pub fn evict_idle_client(
+        &self,
+        now_unix: u64,
+        grace_secs: u64,
+        requester: Ipv4Addr,
+    ) -> Option<(u16, Ipv4Addr, u16, Proto)> {
+        let cutoff = now_unix.saturating_sub(grace_secs);
+        let mut best: Option<(u64, u16, Ipv4Addr, u16)> = None; // (idle, bind, client, int)
+        for s in &self.slots {
+            let Lease::Granted { client, int_port, .. } = &s.lease else {
+                continue;
+            };
+            if *client == requester || s.proto != Proto::Udp {
+                continue;
+            }
+            if s.last_activity_unix >= cutoff {
+                continue;
+            }
+            let idle = now_unix.saturating_sub(s.last_activity_unix);
+            if best.is_none_or(|(b, ..)| idle > b) {
+                best = Some((idle, s.bind_port, *client, *int_port));
+            }
+        }
+        best.map(|(_, bind, client, int_port)| (bind, client, int_port, Proto::Udp))
+    }
+
     /// Build the table from persisted lease records after a respawn
     /// (B8). Re-allocates the exact same bind ports; static leases come from
     /// config; granted leases are re-bound with their remaining lifetime.
@@ -418,7 +492,10 @@ impl LeaseTable {
                     expires_at_unix,
                 },
                 phase_ms: 0,
-                last_activity_unix: 0,
+                // a restored grant counts as freshly active: never insta-reap
+                // a mapping that survived a respawn (the last-seen clock is
+                // not persisted; a restart resets it conservatively)
+                last_activity_unix: now_unix,
             });
         }
         Ok(())
@@ -483,6 +560,137 @@ mod tests {
 
     fn table() -> LeaseTable {
         LeaseTable::new(PortAllocator::new(30000, 30003).unwrap(), 4, 2)
+    }
+
+    #[test]
+    fn stamp_rate_limits_and_upsert_seeds_activity() {
+        // The lease policy's clock: a grant starts seen at its own
+        // creation, and the rate-limited stamp only advances it.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 50);
+        let g = t.upsert_pcp(Proto::Udp, 3478, c, 300, NOW, c, 3478);
+        let port = match g {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("must grant"),
+        };
+        assert_eq!(
+            t.by_bind_port(port).unwrap().last_activity_unix,
+            NOW,
+            "a grant is its own first-seen"
+        );
+        // a refresh re-stamps (the client is provably present)
+        t.upsert_pcp(Proto::Udp, 3478, c, 300, NOW + 50, c, 3478);
+        assert_eq!(t.by_bind_port(port).unwrap().last_activity_unix, NOW + 50);
+        // rate limit: within the window the stamp does not advance
+        t.stamp_activity_if_stale(port, NOW + 60, 15);
+        assert_eq!(t.by_bind_port(port).unwrap().last_activity_unix, NOW + 50);
+        // past the window it does
+        t.stamp_activity_if_stale(port, NOW + 70, 15);
+        assert_eq!(t.by_bind_port(port).unwrap().last_activity_unix, NOW + 70);
+    }
+
+    #[test]
+    fn gc_idle_reaps_only_silent_udp_grants() {
+        let mut t = table();
+        let a = Ipv4Addr::new(192, 168, 21, 50);
+        let b = Ipv4Addr::new(192, 168, 21, 51);
+        // a static lease: never reaped
+        assert!(t.insert_static(30000, a, 9999).is_ok());
+        // an idle UDP grant (silent for 8 days)
+        let g1 = t.upsert_pcp(Proto::Udp, 3478, a, 300, NOW - 700_000, a, 3478);
+        let p1 = match g1 {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("grant 1"),
+        };
+        t.stamp_activity_if_stale(p1, NOW - 700_000, 0);
+        // a recent UDP grant (stamped 1 h ago): kept
+        let g2 = t.upsert_pcp(Proto::Udp, 3479, a, 300, NOW - 3600, a, 3479);
+        let p2 = match g2 {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("grant 2"),
+        };
+        // an idle TCP grant: outside the lease policy, kept
+        let g3 = t.upsert_pcp(Proto::Tcp, 80, b, 300, NOW - 700_000, b, 80);
+        let p3 = match g3 {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("grant 3"),
+        };
+        t.stamp_activity_if_stale(p3, NOW - 700_000, 0);
+        let freed = t.gc_idle(NOW, 604_800);
+        assert_eq!(freed, vec![p1], "only the silent UDP grant reaps");
+        assert!(t.by_bind_port(30000).is_some(), "static kept");
+        assert!(t.by_bind_port(p2).is_some(), "recent grant kept");
+        assert!(t.by_bind_port(p3).is_some(), "TCP grant kept");
+    }
+
+    #[test]
+    fn evict_idle_client_picks_longest_idle_other_client() {
+        let mut t = LeaseTable::new(PortAllocator::new(30000, 30009).unwrap(), 8, 4);
+        let requester = Ipv4Addr::new(192, 168, 21, 50);
+        let other = Ipv4Addr::new(192, 168, 21, 51);
+        // the requester's own idle grant: never a candidate
+        let g_self = t.upsert_pcp(Proto::Udp, 1000, requester, 300, NOW - 700_000, requester, 1000);
+        let p_self = match g_self {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("self grant"),
+        };
+        t.stamp_activity_if_stale(p_self, NOW - 700_000, 0);
+        // another client, idle 30 h (past the 24 h grace)
+        let g_a = t.upsert_pcp(Proto::Udp, 1001, other, 300, NOW - 100_000, other, 1001);
+        let p_a = match g_a {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("other grant"),
+        };
+        t.stamp_activity_if_stale(p_a, NOW - 100_000, 0);
+        // a third client idle 8 days: the longest
+        let third = Ipv4Addr::new(192, 168, 21, 52);
+        let g_b = t.upsert_pcp(Proto::Udp, 1002, third, 300, NOW - 700_000, third, 1002);
+        let p_b = match g_b {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("third grant"),
+        };
+        t.stamp_activity_if_stale(p_b, NOW - 700_000, 0);
+        // a TCP grant of another client: outside the policy
+        let g_t = t.upsert_pcp(Proto::Tcp, 80, Ipv4Addr::new(192, 168, 21, 53), 300, NOW - 700_000, Ipv4Addr::new(192, 168, 21, 53), 80);
+        let p_t = match g_t {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("tcp grant"),
+        };
+        t.stamp_activity_if_stale(p_t, NOW - 700_000, 0);
+        let got = t.evict_idle_client(NOW, 86_400, requester);
+        assert_eq!(got, Some((p_b, third, 1002, Proto::Udp)), "longest-idle other-client UDP");
+        assert!(got != Some((p_self, requester, 1000, Proto::Udp)), "requester never evicted");
+    }
+
+    #[test]
+    fn restore_counts_grants_freshly_active() {
+        // a respawned grant must never be insta-reaped by the backstop:
+        // restore seeds last-seen = now (the clock is not persisted).
+        let mut t = table();
+        t.restore(
+            &[],
+            &[GrantedRecord {
+                bind_port: 30000,
+                proto: Proto::Udp,
+                client: Ipv4Addr::new(192, 168, 21, 50),
+                int_port: 3478,
+                target: Ipv4Addr::new(192, 168, 21, 50),
+                target_port: 3478,
+                granted_lifetime: 300,
+                expires_at_unix: NOW + 300,
+            }],
+            NOW,
+        )
+        .expect("restore ok");
+        assert_eq!(
+            t.by_bind_port(30000).unwrap().last_activity_unix,
+            NOW,
+            "restored grant starts seen at restore"
+        );
+        assert!(
+            t.gc_idle(NOW, 604_800).is_empty(),
+            "backstop must not reap a just-restored grant"
+        );
     }
 
     #[test]

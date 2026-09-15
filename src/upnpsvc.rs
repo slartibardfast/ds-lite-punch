@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +34,15 @@ use crate::vote::VoteState;
 
 /// Concurrency cap for the HTTP service (E8: bounded connections).
 const HTTP_CONN_CAP: usize = 16;
+/// Lease policy (2026-09-15): the granted lease appears infinite
+/// (U32_MAX wire/index) while the effective lifetime is managed
+/// underneath. A UDP grant becomes a reap candidate when its client has
+/// shown no evidence (datapath peer data or any SOAP action) for
+/// `LEASE_GRACE_S`; the 7-day backstop catches true ghosts whatever the
+/// pool state. TCP grants are outside the policy (a live splice can be
+/// control-silent; the AFTR reaps idle TCP at the C3 bound).
+const LEASE_GRACE_S: u64 = 86_400;
+const LEASE_BACKSTOP_S: u64 = 604_800;
 /// The GENA prune cadence (subscriptions live at 2x the requested timeout).
 const GENA_PRUNE_S: u64 = 60;
 /// The local GC cadence for granted leases (facade teardown ownership).
@@ -392,11 +401,15 @@ impl UpnpFacade {
         }
         let lifetime = if lifetime == 0 { INFINITE_LEASE } else { lifetime };
         let now = Epoch::now();
+        let mut outcome = self.upsert_once(proto, int_port, client, lifetime, now).await;
+        if outcome == UpsertOutcome::TableFull && self.evict_candidate(client).await.is_some() {
+            // Pool pressure: the first upsert found no slot. Reclaim the
+            // longest-idle UDP grant of ANOTHER client (idle past
+            // LEASE_GRACE_S) and retry once. Never evicts this client's
+            // own grants, and never a slot with recent activity.
+            outcome = self.upsert_once(proto, int_port, client, lifetime, now).await;
+        }
         let bind_port;
-        let outcome = {
-            let mut t = self.table.lock().await;
-            t.upsert_pcp(proto, int_port, client, lifetime, now, client, int_port)
-        };
         let granted_new = match outcome {
             UpsertOutcome::Granted { bind_port: r } => {
                 bind_port = r;
@@ -467,6 +480,49 @@ impl UpnpFacade {
         Ok(String::new())
     }
 
+    /// One upsert attempt. A retry after pressure eviction is the caller's
+    /// business (at most one eviction per Add).
+    async fn upsert_once(
+        &self,
+        proto: Proto,
+        int_port: u16,
+        client: Ipv4Addr,
+        lifetime: u32,
+        now: u64,
+    ) -> UpsertOutcome {
+        let mut t = self.table.lock().await;
+        t.upsert_pcp(proto, int_port, client, lifetime, now, client, int_port)
+    }
+
+    /// Under pool pressure, reclaim the longest-idle UDP grant of a
+    /// DIFFERENT client (idle past LEASE_GRACE_S) and tear it down so the
+    /// retry can allocate. Never evicts the requesting client's own
+    /// mappings. Returns the evicted slot's identity.
+    async fn evict_candidate(&self, requester: Ipv4Addr) -> Option<(u16, Ipv4Addr, u16, Proto)> {
+        let now = Epoch::now();
+        let cand = {
+            let t = self.table.lock().await;
+            t.evict_idle_client(now, LEASE_GRACE_S, requester)
+        };
+        let (old_bind, old_client, old_int, old_proto) = cand?;
+        {
+            let mut t = self.table.lock().await;
+            let _ = t.delete_by_bind_port(old_bind); // may already be gone (GC)
+        }
+        let _ = nft::revoke_datapath(old_client, old_int, old_bind, old_proto == Proto::Tcp);
+        if let Some(h) = self.tasks.lock().await.remove(&old_bind) {
+            for jh in h {
+                jh.abort();
+            }
+        }
+        {
+            let mut es = self.entries.lock().await;
+            es.retain(|e| e.bind_port != old_bind);
+        } // guard must drop before persist() (it re-locks entries)
+        self.persist().await;
+        Some((old_bind, old_client, old_int, old_proto))
+    }
+
     async fn spawn_udp_slot(
         &self,
         bind_port: u16,
@@ -483,11 +539,12 @@ impl UpnpFacade {
         // the keepalive's clone would keep the slot socket bound.
         let ka_sock = sock.clone();
         let ka_state = state.clone();
+        let table = self.table.clone();
         let ka = tokio::spawn(async move {
             crate::keepalive_loop(ka_sock, ka_state, interval, 0).await
         });
         let recv = tokio::spawn(async move {
-            crate::run_slot(sock, state, target, publisher, bind_port).await
+            crate::run_slot(sock, state, table, target, publisher, bind_port).await
         });
         Ok(vec![ka, recv])
     }
@@ -716,8 +773,9 @@ impl UpnpFacade {
 
     async fn gc_loop(&self) {
         let grace = self.cfg.grace_secs;
+        // expiry-GC for finite leases (the appearing-infinite grants never
+        // trip this; their lifecycle belongs to the lease policy below)
         let now = Epoch::now();
-        // capture the pre-GC slots to know the torn-down client tuples
         let pre: Vec<Slot> = {
             let t = self.table.lock().await;
             t.slots().to_vec()
@@ -726,10 +784,32 @@ impl UpnpFacade {
             let mut t = self.table.lock().await;
             t.gc(now, grace)
         };
-        if freed.is_empty() {
-            return;
+        if !freed.is_empty() {
+            self.tear_down_ports(&pre, &freed).await;
+            eprintln!("upnp: gc freed expired slots {:?}", freed);
         }
-        for port in &freed {
+        // lease-policy backstop: reap UDP grants whose client went silent
+        // past LEASE_BACKSTOP_S, whatever the pool state (the pressure
+        // path handles the shorter grace under TableFull).
+        let now = Epoch::now();
+        let pre: Vec<Slot> = {
+            let t = self.table.lock().await;
+            t.slots().to_vec()
+        };
+        let idle_freed = {
+            let mut t = self.table.lock().await;
+            t.gc_idle(now, LEASE_BACKSTOP_S)
+        };
+        if !idle_freed.is_empty() {
+            self.tear_down_ports(&pre, &idle_freed).await;
+            eprintln!("upnp: gc freed idle slots {:?}", idle_freed);
+        }
+    }
+
+    /// Shared teardown for freed ports: revoke the datapath, abort the
+    /// slot tasks, drop the control-plane entry, persist.
+    async fn tear_down_ports(&self, pre: &[Slot], freed: &[u16]) {
+        for port in freed {
             let info = pre.iter().find(|s| s.bind_port == *port).copied();
             if let Some(s) = info {
                 if let Some(client) = s.client() {
@@ -745,7 +825,27 @@ impl UpnpFacade {
             es.retain(|e| e.bind_port != *port);
         }
         self.persist().await;
-        eprintln!("upnp: gc freed slots {:?}", freed);
+    }
+
+    /// Client-presence stamp from the control plane: any SOAP action from
+    /// this IP proves the client is alive; refresh its grants' last-seen
+    /// (the lease policy's second producer, beside the datapath stamp).
+    async fn stamp_client(&self, client: Ipv4Addr) {
+        let now = Epoch::now();
+        let ports: Vec<u16> = {
+            let es = self.entries.lock().await;
+            es.iter()
+                .filter(|e| e.client == client)
+                .map(|e| e.bind_port)
+                .collect()
+        };
+        if ports.is_empty() {
+            return;
+        }
+        let mut t = self.table.lock().await;
+        for p in ports {
+            t.stamp_activity_if_stale(p, now, 0);
+        }
     }
 
     // ---- persistence ----
@@ -798,7 +898,7 @@ async fn http_loop(facade: Arc<UpnpFacade>) -> io::Result<()> {
 async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Result<()> {
     let permits = Arc::new(Semaphore::new(HTTP_CONN_CAP));
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
                 // A transient accept error (fd pressure, EMFILE/ENOBUFS)
@@ -814,6 +914,10 @@ async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Resul
             Ok(p) => p,
             Err(_) => continue,
         };
+        let client_ip = match peer {
+            SocketAddr::V4(v4) => *v4.ip(),
+            _ => Ipv4Addr::UNSPECIFIED,
+        };
         let f = facade.clone();
         tokio::spawn(async move {
             let _guard = permit;
@@ -825,7 +929,7 @@ async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Resul
             // request but caps the damage.
             let _ = tokio::time::timeout(
                 Duration::from_secs(30),
-                handle_conn(f, stream),
+                handle_conn(f, stream, client_ip),
             )
             .await;
         });
@@ -834,7 +938,7 @@ async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Resul
 
 /// One client connection: read the head (capped), read a body when
 /// Content-Length says so, classify, dispatch.
-async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream) {
+async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: Ipv4Addr) {
     let raw = match read_head(&mut stream).await {
         Ok(h) => h,
         Err(_) => return,
@@ -880,6 +984,10 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream) {
         }
         ReqClass::Soap { service, action } => {
             handle_soap(&facade, service, action, &body, &mut stream).await;
+            // Client-presence stamp for the lease policy: any SOAP action
+            // from this IP proves the client is alive. Stamp result
+            // regardless of the action's own outcome (the client talked).
+            facade.stamp_client(client_ip).await;
         }
         ReqClass::GenaSubscribe => {
             let callback = upnp::find_header(head, b"CALLBACK").unwrap_or(b"");
@@ -2295,6 +2403,140 @@ mod tests {
         facade.notify_all(Ipv4Addr::new(87, 116, 31, 223)).await;
         let (mut s2, _) = l.accept().await.unwrap();
         assert_eq!(seq_of_head(&mut s2).await, 2, "keys must be strictly increasing");
+    }
+// ---- lease policy (2026-09-15): last-seen reaping ----
+
+    fn policy_seed(client: Ipv4Addr, int_port: u16, silent_secs: u64) -> (LeaseTable, u16) {
+        let now = Epoch::now();
+        let mut t = LeaseTable::new(PortAllocator::new(30000, 30009).unwrap(), 8, 4);
+        let g = t.upsert_pcp(Proto::Udp, int_port, client, INFINITE_LEASE, now, client, int_port);
+        let port = match g {
+            UpsertOutcome::Granted { bind_port } => bind_port,
+            _ => panic!("seed grant"),
+        };
+        t.stamp_activity_if_stale(port, now.saturating_sub(silent_secs), 0);
+        (t, port)
+    }
+
+    async fn policy_facade_table_and_entry(
+        t: LeaseTable,
+        port: u16,
+        client: Ipv4Addr,
+    ) -> Arc<UpnpFacade> {
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/none".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "lease-policy".into(),
+            grace_secs: 60,
+        };
+        // the seed's int port is unknown here; rebuild the entry from the
+        // slot so the reaped entry assertion has an index to check
+        let int_port = t.by_bind_port(port).unwrap().target_port;
+        let entry = FacadeEntry {
+            req_ext: int_port,
+            proto: Proto::Udp,
+            client,
+            int_port,
+            bind_port: port,
+            granted_lifetime: INFINITE_LEASE,
+            expires_at_unix: Epoch::now().saturating_add(u64::from(INFINITE_LEASE)),
+        };
+        Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(t)),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::LOCALHOST).0,
+            )),
+            entries: Mutex::new(vec![entry]),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("lease-policy"),
+            started_unix: 0,
+            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn backstop_reaps_silent_udp_grant() {
+        // a UDP grant whose client went silent past the 7-day backstop
+        // reaps on the sweep, whatever the pool state (the residue case:
+        // a vanished console's leftover mapping).
+        let client = Ipv4Addr::new(192, 168, 21, 50);
+        let (t, port) = policy_seed(client, 3478, 700_000);
+        let facade = policy_facade_table_and_entry(t, port, client).await;
+        facade.gc_loop().await;
+        assert!(
+            facade.table.lock().await.by_bind_port(port).is_none(),
+            "silent grant must reap on the backstop"
+        );
+        assert!(
+            facade.entries.lock().await.iter().all(|e| e.bind_port != port),
+            "the control-plane entry must go with the slot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stamp_client_prevents_backstop_reap() {
+        // any SOAP action from the client refreshes its grants' last-seen,
+        // so a client that keeps talking is never reaped.
+        let client = Ipv4Addr::new(192, 168, 21, 50);
+        let (t, port) = policy_seed(client, 3478, 700_000);
+        let facade = policy_facade_table_and_entry(t, port, client).await;
+        facade.stamp_client(client).await;
+        facade.gc_loop().await;
+        assert!(
+            facade.table.lock().await.by_bind_port(port).is_some(),
+            "a client that just talked must not be reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn control_stamp_updates_slot_last_seen() {
+        let client = Ipv4Addr::new(192, 168, 21, 50);
+        let (t, port) = policy_seed(client, 3478, 0); // fresh
+        let facade = policy_facade_table_and_entry(t, port, client).await;
+        let before = facade.table.lock().await.by_bind_port(port).unwrap().last_activity_unix;
+        facade.stamp_client(client).await;
+        let after = facade.table.lock().await.by_bind_port(port).unwrap().last_activity_unix;
+        assert!(after >= before, "the control stamp advances last-seen");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_candidate_reclaims_other_client_slot() {
+        // under pool pressure the facade reclaims the longest-idle grant
+        // of a DIFFERENT client (idle past the grace) and tears it down.
+        let owner = Ipv4Addr::new(192, 168, 21, 50);
+        let requester = Ipv4Addr::new(192, 168, 21, 51);
+        let (t, port) = policy_seed(owner, 3478, 100_000); // idle past 24 h
+        let facade = policy_facade_table_and_entry(t, port, owner).await;
+        let got = facade.evict_candidate(requester).await;
+        assert_eq!(got, Some((port, owner, 3478, Proto::Udp)));
+        assert!(
+            facade.table.lock().await.by_bind_port(port).is_none(),
+            "evicted slot is gone"
+        );
+        assert!(
+            facade.entries.lock().await.iter().all(|e| e.bind_port != port),
+            "evicted entry is gone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evict_candidate_never_takes_requester_own_grant() {
+        let requester = Ipv4Addr::new(192, 168, 21, 51);
+        let (t, port) = policy_seed(requester, 3479, 100_000);
+        let facade = policy_facade_table_and_entry(t, port, requester).await;
+        assert_eq!(
+            facade.evict_candidate(requester).await,
+            None,
+            "never evict the requesting client's own grants"
+        );
     }
 }
 

@@ -329,6 +329,10 @@ fn add_stun_routes(servers: &[SocketAddrV4], gateway: &str) {
 /// can translate a return path only on that line).
 const EGRESS_TABLE: &str = "1001";
 const EGRESS_PRIO: &str = "25100";
+/// Lease-policy last-seen stamp interval: the datapath can fire many
+/// times a second; one write per slot per 15 s is ample resolution for a
+/// 24 h grace period.
+const LEASE_STAMP_MIN_S: u64 = 15;
 
 /// Force every tuple-sourced egress out the VM line: a policy rule from
 /// the bind address into the dedicated table whose default is the hub.
@@ -421,6 +425,7 @@ pub(crate) async fn keepalive_loop(
 pub(crate) async fn run_slot(
     sock: Arc<UdpSocket>,
     state: Arc<Mutex<State>>,
+    table: Arc<Mutex<LeaseTable>>,
     target: SocketAddrV4,
     publisher: Arc<Publisher>,
     bind_port: u16,
@@ -480,6 +485,13 @@ pub(crate) async fn run_slot(
             }
             // STUN packet we can't parse: ignore.
         } else {
+            // Peer data reaching the client = the mapping is in use: stamp
+            // the last-seen clock (rate-limited) so the lease policy can
+            // tell a live session from a ghost.
+            {
+                let mut t = table.lock().await;
+                t.stamp_activity_if_stale(bind_port, Epoch::now(), LEASE_STAMP_MIN_S);
+            }
             if let Err(e) = forward::forward(pkt, src_v4, target) {
                 eprintln!("warn: forward {} -> {} failed: {}", src_v4, target, e);
             }
@@ -709,8 +721,9 @@ async fn main() {
         tokio::spawn(async move {
             keepalive_loop(ka_sock, ka_state, interval, phase_ms).await
         });
+        let table_for_slot = table.clone();
         tokio::spawn(async move {
-            run_slot(sock, state, target, publisher, bind_port).await
+            run_slot(sock, state, table_for_slot, target, publisher, bind_port).await
         });
     }
 
