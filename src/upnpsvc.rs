@@ -551,13 +551,22 @@ impl UpnpFacade {
     /// protocol).
     async fn allocate_exact(
         &self,
-        req_ext: u16,
-        proto: Proto,
-        client: Ipv4Addr,
-        int_port: u16,
-        lifetime: u32,
-        desc: String,
+        req: MappingReq,
+        view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
+        let MappingReq {
+            ext: req_ext,
+            proto,
+            client,
+            int_port,
+            lifetime,
+            desc,
+        } = req;
+        if let Some(c) = view {
+            if !request_within(c, client, req_ext, int_port) {
+                return Err(UpnpErr::NotAuthorized);
+            }
+        }
         if !in_lan(client, self.cfg.lan_ip) {
             return Err(UpnpErr::InvalidArgs);
         }
@@ -730,7 +739,12 @@ impl UpnpFacade {
         Ok(vec![h1, h2])
     }
 
-    async fn delete_mapping(&self, req_ext: u16, proto: Proto) -> Result<String, UpnpErr> {
+    async fn delete_mapping(
+        &self,
+        req_ext: u16,
+        proto: Proto,
+        view: Option<Contain>,
+    ) -> Result<String, UpnpErr> {
         let (bind_port, client, int_port) = {
             let es = self.entries.lock().await;
             let Some(e) = es
@@ -739,6 +753,11 @@ impl UpnpFacade {
             else {
                 return Err(UpnpErr::NoSuchEntry);
             };
+            if let Some(c) = view {
+                if !entry_within(c, e) {
+                    return Err(UpnpErr::NotAuthorized);
+                }
+            }
             (e.bind_port, e.client, e.int_port)
         };
         {
@@ -759,7 +778,12 @@ impl UpnpFacade {
         Ok(String::new())
     }
 
-    async fn get_specific(&self, req_ext: u16, proto: Proto) -> Result<String, UpnpErr> {
+    async fn get_specific(
+        &self,
+        req_ext: u16,
+        proto: Proto,
+        view: Option<Contain>,
+    ) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
         let Some(e) = es
             .iter()
@@ -767,12 +791,27 @@ impl UpnpFacade {
         else {
             return Err(UpnpErr::NoSuchEntry);
         };
+        // 2.5.14.2: a contained caller may retrieve only its own entries,
+        // and an entry it may not see is not "not found" but forbidden
+        if let Some(c) = view {
+            if !entry_within(c, e) {
+                return Err(UpnpErr::NotAuthorized);
+            }
+        }
         Ok(entry_xml(e, false))
     }
 
-    async fn get_generic(&self, index: u32) -> Result<String, UpnpErr> {
+    /// GetGenericPortMappingEntry. A contained caller enumerates its own
+    /// visible subset, so the index space is what it may see: walking past
+    /// the end answers 714, which is the terminator a control point's
+    /// enumeration loop expects (2.5.14.2).
+    async fn get_generic(&self, index: u32, view: Option<Contain>) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
-        let keys: Vec<UpnpKey> = es
+        let visible: Vec<&FacadeEntry> = es
+            .iter()
+            .filter(|e| view.is_none_or(|c| entry_within(c, e)))
+            .collect();
+        let keys: Vec<UpnpKey> = visible
             .iter()
             .map(|e| UpnpKey {
                 req_ext: e.req_ext,
@@ -782,7 +821,7 @@ impl UpnpFacade {
             })
             .collect();
         let k = upnp::entry_at(&keys, index).ok_or(UpnpErr::NoSuchEntry)?;
-        let e = es
+        let e = visible
             .iter()
             .find(|e| e.req_ext == k.req_ext && e.proto == k.proto)
             .expect("entry_at found the key in the same list");
@@ -796,6 +835,16 @@ impl UpnpFacade {
     fn dp_enforce(&self, key: Ipv4Addr, required: &dp::DpAuthz, now: u64) -> Result<(), UpnpErr> {
         let state = self.dp.lock().unwrap();
         state.enforce(key, required, now).map_err(map_dp_err)
+    }
+
+    /// Whether the caller holds the containment lift: a live session whose
+    /// roles satisfy Basic, which Admin also satisfies (plan/0008 section
+    /// 26.20). The policy function is the same one the boundary uses, so
+    /// the lift cannot drift from the gate.
+    fn dp_holds_lift(&self, key: Ipv4Addr, now: u64) -> bool {
+        let state = self.dp.lock().unwrap();
+        let roles = state.session_roles(key, now);
+        dp::authorize(&roles, &dp::DpAuthz::Roles(vec!["Basic".to_string()]))
     }
 
     /// Refresh a session's activity stamp after an authorized action.
@@ -818,19 +867,41 @@ impl UpnpFacade {
     /// maps one tuple at a time.
     async fn allocate_preferred(
         &self,
-        req_ext: u16,
-        proto: Proto,
-        client: Ipv4Addr,
-        int_port: u16,
-        lifetime: u32,
-        desc: String,
+        req: MappingReq,
+        view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
+        let MappingReq {
+            ext,
+            proto,
+            client,
+            int_port,
+            lifetime,
+            desc,
+        } = req;
+        // the containment is judged on the request, before the port is
+        // resolved: a preference below the floor is a request the contained
+        // caller may not make, not one to be silently substituted
+        if let Some(c) = view {
+            if !request_within(c, client, ext, int_port) {
+                return Err(UpnpErr::NotAuthorized);
+            }
+        }
         let req_ext = {
             let es = self.entries.lock().await;
-            preferred_port(&es, req_ext, proto, client)
+            preferred_port(&es, ext, proto, client)
         };
-        self.allocate_exact(req_ext, proto, client, int_port, lifetime, desc)
-            .await?;
+        self.allocate_exact(
+            MappingReq {
+                ext: req_ext,
+                proto,
+                client,
+                int_port,
+                lifetime,
+                desc,
+            },
+            None,
+        )
+        .await?;
         Ok(format!("<NewReservedPort>{}</NewReservedPort>", req_ext))
     }
 
@@ -840,11 +911,20 @@ impl UpnpFacade {
     /// PortMappingNotFound the spec requires (2.5.19.2), and the delete
     /// is atomic in the sense that matters here: the target list is
     /// collected before any of it is removed.
-    async fn delete_mapping_range(&self, start: u16, end: u16, proto: Proto) -> Result<String, UpnpErr> {
+    async fn delete_mapping_range(
+        &self,
+        start: u16,
+        end: u16,
+        proto: Proto,
+        view: Option<Contain>,
+    ) -> Result<String, UpnpErr> {
+        // 2.5.19.2: an entry the caller may not touch is skipped and the
+        // rest of the range still goes. An empty selection is 730.
         let targets: Vec<u16> = {
             let es = self.entries.lock().await;
             es.iter()
                 .filter(|e| e.proto == proto && e.req_ext >= start && e.req_ext <= end)
+                .filter(|e| view.is_none_or(|c| entry_within(c, e)))
                 .map(|e| e.req_ext)
                 .collect()
         };
@@ -852,7 +932,7 @@ impl UpnpFacade {
             return Err(UpnpErr::PortMappingNotFound);
         }
         for ext in targets {
-            let _ = self.delete_mapping(ext, proto).await;
+            let _ = self.delete_mapping(ext, proto, view).await;
         }
         Ok(String::new())
     }
@@ -872,6 +952,7 @@ impl UpnpFacade {
         end: u16,
         proto: Option<Proto>,
         max: u16,
+        view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
         let now = Epoch::now();
@@ -888,6 +969,13 @@ impl UpnpFacade {
             }
             if max != 0 && count >= max {
                 break;
+            }
+            // 2.5.21.3: a contained caller's listing holds only its own
+            // entries at or above the floor
+            if let Some(c) = view {
+                if !entry_within(c, e) {
+                    continue;
+                }
             }
             let proto_txt = match e.proto {
                 Proto::Tcp => "TCP",
@@ -1389,6 +1477,26 @@ async fn handle_soap(
     } else {
         Ok(())
     };
+    // plan/0008 section 26.20: the containment the spec recommends for
+    // unauthenticated control points (2.5.16.2, 2.5.18.2, 2.5.14.2,
+    // 2.5.21.3), applied where the caller has a remedy. A live Basic (or
+    // Admin) DeviceProtection session is the lift, and only the v2 face can
+    // hold one, since the DP service is mounted there. So a request that
+    // names another host is refused on either face, while the port floor and
+    // the read containment bind the v2 face, where a control point can
+    // authenticate to lift them; the v1 face keeps whole reads so that
+    // anonymous LAN diagnostics (upnpc -l) still see the table.
+    let lift = facade.dp_holds_lift(client_ip, Epoch::now());
+    let write_view = if lift {
+        None
+    } else {
+        Some(Contain { caller: client_ip, high_port: v2 })
+    };
+    let read_view = if v2 && !lift {
+        Some(Contain { caller: client_ip, high_port: true })
+    } else {
+        None
+    };
     let result: Result<String, UpnpErr> = match gated {
         Err(e) => Err(e),
         Ok(()) => match (service, action) {
@@ -1456,7 +1564,17 @@ async fn handle_soap(
                     // (table 2-6 against the v1 static mapping)
                     let lifetime = if v2 { wip2_lease(lifetime) } else { lifetime };
                     facade
-                        .allocate_exact(ext, proto, client, int_port, lifetime, parse_desc(body))
+                        .allocate_exact(
+                            MappingReq {
+                                ext,
+                                proto,
+                                client,
+                                int_port,
+                                lifetime,
+                                desc: parse_desc(body),
+                            },
+                            write_view,
+                        )
                         .await
                 }
                 Err(e) => Err(e),
@@ -1465,21 +1583,21 @@ async fn handle_soap(
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::DeletePortMapping,
             ) => match parse_delete_args(body) {
-                Ok((ext, proto)) => facade.delete_mapping(ext, proto).await,
+                Ok((ext, proto)) => facade.delete_mapping(ext, proto, write_view).await,
                 Err(e) => Err(e),
             },
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetSpecificPortMappingEntry,
             ) => match parse_delete_args(body) {
-                Ok((ext, proto)) => facade.get_specific(ext, proto).await,
+                Ok((ext, proto)) => facade.get_specific(ext, proto, read_view).await,
                 Err(e) => Err(e),
             },
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetGenericPortMappingEntry,
             ) => match parse_index_arg(body) {
-                Ok(i) => facade.get_generic(i).await,
+                Ok(i) => facade.get_generic(i, read_view).await,
                 Err(e) => Err(e),
             },
             // WIP2-only surface (plan/0008 #v2-service-set). The engine is
@@ -1494,12 +1612,15 @@ async fn handle_soap(
                         let lifetime = wip2_lease(lifetime);
                         facade
                             .allocate_preferred(
-                                ext,
-                                proto,
-                                client,
-                                int_port,
-                                lifetime,
-                                parse_desc(body),
+                                MappingReq {
+                                    ext,
+                                    proto,
+                                    client,
+                                    int_port,
+                                    lifetime,
+                                    desc: parse_desc(body),
+                                },
+                                write_view,
                             )
                             .await
                     }
@@ -1509,7 +1630,7 @@ async fn handle_soap(
             (SoapService::WanIpConnection, SoapAction::DeletePortMappingRange) => {
                 match parse_range_args(body) {
                     Ok((start, end, proto)) => {
-                        facade.delete_mapping_range(start, end, proto).await
+                        facade.delete_mapping_range(start, end, proto, write_view).await
                     }
                     Err(e) => Err(e),
                 }
@@ -1517,7 +1638,7 @@ async fn handle_soap(
             (SoapService::WanIpConnection, SoapAction::GetListOfPortMappings) => {
                 match parse_list_args(body) {
                     Ok((start, end, proto, max)) => {
-                        facade.list_port_mappings(start, end, proto, max).await
+                        facade.list_port_mappings(start, end, proto, max, read_view).await
                     }
                     Err(e) => Err(e),
                 }
@@ -2053,6 +2174,50 @@ fn free_requested_port(entries: &[FacadeEntry], proto: Proto) -> u16 {
         p += 1;
     }
     p
+}
+
+/// An AddPortMapping or AddAnyPortMapping request (table 2-11): the
+/// argument set the two allocation entry points share, so the pair differs
+/// in port resolution alone.
+#[derive(Clone, Debug)]
+struct MappingReq {
+    ext: u16,
+    proto: Proto,
+    client: Ipv4Addr,
+    int_port: u16,
+    lifetime: u32,
+    desc: String,
+}
+
+/// The containment a caller without the lift is held to (plan/0008
+/// section 26.20). `caller` is the only address the caller may name;
+/// `high_port` adds the floor the spec recommends beside it (2.5.16.2,
+/// 2.5.18.2, 2.5.14.2, 2.5.21.3). The floor is a field rather than a rule
+/// because it binds only where a control point can authenticate to lift
+/// it, which is the v2 face, while the address clause needs no remedy and
+/// binds both faces.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Contain {
+    caller: Ipv4Addr,
+    high_port: bool,
+}
+
+/// Whether a mapping request is within the containment (2.5.16.2): the
+/// caller's own address, and, where the floor applies, an internal and
+/// external port at or above 1024. A wildcard external port is the
+/// any-free-port form, which resolves above the floor by construction, so
+/// it is admitted; AddPortMapping's parser refuses it anyway.
+fn request_within(c: Contain, client: Ipv4Addr, ext: u16, int_port: u16) -> bool {
+    client == c.caller
+        && (!c.high_port || (int_port >= ANY_PORT_BASE && (ext == 0 || ext >= ANY_PORT_BASE)))
+}
+
+/// Whether an existing entry is within the containment (2.5.14.2,
+/// 2.5.18.2, 2.5.21.3): the caller's own mapping, both ports at or above
+/// 1024 where the floor applies.
+fn entry_within(c: Contain, e: &FacadeEntry) -> bool {
+    e.client == c.caller
+        && (!c.high_port || (e.int_port >= ANY_PORT_BASE && e.req_ext >= ANY_PORT_BASE))
 }
 
 /// The port an AddAnyPortMapping request reserves (section 2.5.17): the
@@ -3555,6 +3720,178 @@ mod tests {
         );
     }
 
+    /// plan/0008 section 26.20: the containment the spec recommends for
+    /// unauthenticated control points. The address clause needs no remedy
+    /// and binds both faces; the port floor is a field, so one predicate
+    /// serves the v2 face, where a control point can authenticate to lift
+    /// it, and the v1 face, where it cannot.
+    #[test]
+    fn containment_predicates() {
+        let a = Ipv4Addr::new(192, 168, 21, 50);
+        let b = Ipv4Addr::new(192, 168, 21, 60);
+        let own_host = Contain { caller: a, high_port: false };
+        let own_host_high = Contain { caller: a, high_port: true };
+
+        // 2.5.16.2: another host is refused; the caller's own address is
+        // admitted, with a low port admitted where no floor applies
+        assert!(!request_within(own_host, b, 5000, 5000));
+        assert!(request_within(own_host, a, 5000, 5000));
+        assert!(request_within(own_host, a, 80, 80));
+        // with the floor, a low port is refused on either side of the pair
+        assert!(!request_within(own_host_high, a, 80, 5000));
+        assert!(!request_within(own_host_high, a, 5000, 80));
+        assert!(request_within(own_host_high, a, 1024, 1024));
+        // the wildcard external port is the any-free-port form and resolves
+        // above the floor by construction, so it is admitted
+        assert!(request_within(own_host_high, a, 0, 5000));
+        // ... and the floor never licenses another host
+        assert!(!request_within(own_host_high, b, 5000, 5000));
+
+        // 2.5.14.2, 2.5.18.2, 2.5.21.3: the same clause over an entry
+        let e = |req_ext: u16, client: Ipv4Addr, int_port: u16| FacadeEntry {
+            req_ext,
+            proto: Proto::Udp,
+            client,
+            int_port,
+            bind_port: 30000,
+            granted_lifetime: 3600,
+            expires_at_unix: 0,
+            desc: String::new(),
+        };
+        assert!(entry_within(own_host, &e(80, a, 80)), "own and low, no floor");
+        assert!(!entry_within(own_host_high, &e(80, a, 80)), "own but below");
+        assert!(!entry_within(own_host, &e(5000, b, 5000)), "another host");
+        assert!(!entry_within(own_host_high, &e(5000, a, 80)), "internal below");
+        assert!(entry_within(own_host_high, &e(5000, a, 5000)));
+    }
+
+    /// The containment over a real table: a contained caller sees, indexes
+    /// and deletes only its own entries at or above the floor, while an
+    /// uncontained one (the lifted session, or a v1 read) sees the whole
+    /// table. This is the property the plan's open policy item asked for,
+    /// and it is asserted against seeded entries because the engine's grant
+    /// path needs nft.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn containment_view_over_the_table() {
+        let a = Ipv4Addr::new(192, 168, 21, 50);
+        let b = Ipv4Addr::new(192, 168, 21, 60);
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/containment".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "containment".into(),
+            grace_secs: 60,
+        };
+        let e = |req_ext: u16, proto: Proto, client: Ipv4Addr, int_port: u16| FacadeEntry {
+            req_ext,
+            proto,
+            client,
+            int_port,
+            bind_port: 30000,
+            granted_lifetime: 3600,
+            expires_at_unix: Epoch::now() + 300,
+            desc: String::new(),
+        };
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                8,
+                4,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::LOCALHOST).0,
+            )),
+            entries: Mutex::new(vec![
+                e(80, Proto::Tcp, a, 80),
+                e(5000, Proto::Udp, a, 5000),
+                e(5001, Proto::Udp, b, 5001),
+                e(5002, Proto::Udp, a, 80),
+            ]),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("containment"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+        });
+        let view = Some(Contain { caller: a, high_port: true });
+
+        // the listing: one entry visible to A (its own, both ports high);
+        // the whole table to an uncontained caller
+        let contained = facade
+            .list_port_mappings(1, 65535, None, 0, view)
+            .await
+            .expect("A has one visible mapping");
+        assert_eq!(contained.matches("<p:PortMappingEntry>").count(), 1);
+        assert!(contained.contains("<p:NewExternalPort>5000</p:NewExternalPort>"));
+        let whole = facade
+            .list_port_mappings(1, 65535, None, 0, None)
+            .await
+            .expect("the uncontained view lists");
+        assert_eq!(whole.matches("<p:PortMappingEntry>").count(), 4);
+
+        // the specific read: another client's entry is forbidden, not
+        // missing, and A's own below the floor is forbidden too
+        assert_eq!(
+            facade.get_specific(5001, Proto::Udp, view).await,
+            Err(UpnpErr::NotAuthorized)
+        );
+        assert!(facade.get_specific(5001, Proto::Udp, None).await.is_ok());
+        assert_eq!(
+            facade.get_specific(80, Proto::Tcp, view).await,
+            Err(UpnpErr::NotAuthorized)
+        );
+
+        // the enumeration: the index space is what the caller may see, so
+        // A's walk ends after its one entry and an uncontained walk runs
+        // the whole table
+        assert!(facade.get_generic(0, view).await.is_ok());
+        assert_eq!(
+            facade.get_generic(1, view).await,
+            Err(UpnpErr::NoSuchEntry),
+            "the contained index space holds one entry"
+        );
+        for i in 0..4 {
+            assert!(facade.get_generic(i, None).await.is_ok(), "uncontained index {}", i);
+        }
+        assert_eq!(facade.get_generic(4, None).await, Err(UpnpErr::NoSuchEntry));
+
+        // a delete of another client's mapping is refused
+        assert_eq!(
+            facade.delete_mapping(5001, Proto::Udp, view).await,
+            Err(UpnpErr::NotAuthorized)
+        );
+        assert!(
+            facade.entries.lock().await.iter().any(|x| x.req_ext == 5001),
+            "the other client's mapping survives"
+        );
+
+        // a range covering everything deletes A's visible entry and skips
+        // the two it may not touch (2.5.19.2), so the action succeeds; a
+        // range holding only another client's entry is 730
+        assert_eq!(
+            facade.delete_mapping_range(1, 65535, Proto::Udp, view).await,
+            Ok(String::new())
+        );
+        let after = facade.entries.lock().await;
+        assert!(!after.iter().any(|x| x.req_ext == 5000), "A's visible entry went");
+        assert!(after.iter().any(|x| x.req_ext == 5001), "B's entry stayed");
+        assert!(after.iter().any(|x| x.req_ext == 5002), "A's low-internal entry stayed");
+        drop(after);
+        assert_eq!(
+            facade.delete_mapping_range(5001, 5001, Proto::Udp, view).await,
+            Err(UpnpErr::PortMappingNotFound),
+            "nothing in the range is A's to delete"
+        );
+    }
+
     /// plan/0008 section 17: allocate_exact and allocate_preferred resolve
     /// the same request differently over one engine. Exact honours the
     /// requested port and takes it over from whoever holds it; preferred
@@ -3719,7 +4056,7 @@ mod tests {
         // PortMappingList of PortMappingEntry elements, the invented
         // element tree of the placeholder gone
         let listing = facade
-            .list_port_mappings(5000, 6000, Some(Proto::Udp), 0)
+            .list_port_mappings(5000, 6000, Some(Proto::Udp), 0, None)
             .await
             .expect("a populated range lists");
         assert!(listing.starts_with(
@@ -3760,7 +4097,7 @@ mod tests {
         assert_eq!(listing.matches("<p:PortMappingEntry>").count(), 2);
         // the cap still bounds the listing (NewNumberOfPorts)
         let capped = facade
-            .list_port_mappings(5000, 6000, None, 1)
+            .list_port_mappings(5000, 6000, None, 1, None)
             .await
             .expect("a capped range lists");
         assert_eq!(capped.matches("<p:PortMappingEntry>").count(), 1);
@@ -3769,15 +4106,15 @@ mod tests {
         // the range refusals the spec requires: 730 on an empty range for
         // both range actions (2.5.19.2, 2.5.21.3)
         assert_eq!(
-            facade.list_port_mappings(6001, 7000, None, 0).await,
+            facade.list_port_mappings(6001, 7000, None, 0, None).await,
             Err(UpnpErr::PortMappingNotFound)
         );
         assert_eq!(
-            facade.delete_mapping_range(6001, 7000, Proto::Udp).await,
+            facade.delete_mapping_range(6001, 7000, Proto::Udp, None).await,
             Err(UpnpErr::PortMappingNotFound)
         );
         assert_eq!(
-            facade.delete_mapping_range(5000, 6000, Proto::Tcp).await,
+            facade.delete_mapping_range(5000, 6000, Proto::Tcp, None).await,
             Ok(String::new()),
             "the TCP entry in range is deleted"
         );
@@ -3858,7 +4195,7 @@ mod tests {
         // The control point deletes the restored mapping: the slot row, nft
         // element and tasks must all go — the socket must be released.
         facade
-            .delete_mapping(8666, Proto::Udp)
+            .delete_mapping(8666, Proto::Udp, None)
             .await
             .expect("delete of a restored mapping");
         assert!(
@@ -4985,8 +5322,10 @@ mod ifindex_probe {
             "v2 boundary denies unauth: {}",
             &r[..r.len().min(300)]
         );
-        // ... while the same request against the :1 face is NOT gated (it
-        // reaches the engine, which fails on nft here, but not with 606)
+        // ... while the :1 face is not gated by DeviceProtection, its
+        // containment still refuses a request that names another host
+        // (2.5.16.2, section 26.20): this is the door the plan's policy
+        // item closes on the compatibility face.
         r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -4994,9 +5333,23 @@ mod ifindex_probe {
             &format!("{}AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewRemoteHost></NewRemoteHost><NewExternalPort>12346</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>12346</NewInternalPort><NewInternalClient>192.168.21.50</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>dp-wire</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration></AddPortMapping></s:Body></s:Envelope>", env))
         .await;
         assert!(
-            !r.contains("</errorCode>606") && !r.contains("<errorCode>606</errorCode>"),
-            "v1 face un-gated: {}",
+            r.contains("<errorCode>606</errorCode>"),
+            "v1 refuses a door for another host: {}",
             &r[..r.len().min(300)]
+        );
+        // ... and the same request naming the caller itself reaches the
+        // engine (which fails on nft here, 501), so the containment is the
+        // caller's address and not a blanket refusal of the v1 face
+        r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping",
+            &format!("{}AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewRemoteHost></NewRemoteHost><NewExternalPort>12346</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>12346</NewInternalPort><NewInternalClient>127.0.0.1</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>dp-wire</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration></AddPortMapping></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>501</errorCode>"),
+            "v1 admits the caller's own mapping: {}",
+            &r[..r.len().min(400)]
         );
 
         // the full PKCS5 ceremony over the wire: challenge -> authenticator
