@@ -53,6 +53,10 @@ const WIP2_MAX_LEASE: u32 = 604_800;
 /// The floor of an automatic external-port choice, the AddAnyPortMapping
 /// wildcard of section 2.5.17.
 const ANY_PORT_BASE: u16 = 1024;
+/// The stored length of a control point's mapping description (2.3.22).
+/// The format is application-defined and the spec imposes no bound; this
+/// keeps the record and the persisted index line bounded.
+const DESC_MAX: usize = 64;
 /// Lease policy (2026-09-15): the granted lease appears infinite
 /// (U32_MAX wire/index) while the effective lifetime is managed
 /// underneath. A UDP grant becomes a reap candidate when its client has
@@ -84,8 +88,10 @@ pub struct UpnpConfig {
 /// One granted mapping's control-plane record. `req_ext` is the requested
 /// external port — the UPnP key — while the slot's `bind_port` is the
 /// granted inner R; the AFTR's real external tuple is discovered via STUN
-/// and reported through the tuple watch ("report-requested", E3).
-#[derive(Clone, Copy, Debug)]
+/// and reported through the tuple watch ("report-requested", E3). `desc`
+/// is the control point's own label (2.3.22), kept so the enumeration and
+/// the Listing can return what the control point actually sent.
+#[derive(Clone, Debug)]
 struct FacadeEntry {
     req_ext: u16,
     proto: Proto,
@@ -94,6 +100,7 @@ struct FacadeEntry {
     bind_port: u16,
     granted_lifetime: u32,
     expires_at_unix: u64,
+    desc: String,
 }
 
 /// One GENA subscription (E5): callback URL validated to be http + br-lan,
@@ -540,6 +547,7 @@ impl UpnpFacade {
         client: Ipv4Addr,
         int_port: u16,
         lifetime: u32,
+        desc: String,
     ) -> Result<String, UpnpErr> {
         if !in_lan(client, self.cfg.lan_ip) {
             return Err(UpnpErr::InvalidArgs);
@@ -607,7 +615,9 @@ impl UpnpFacade {
         // resolve to the slot the control point actually owns.
         let stray = {
             let mut es = self.entries.lock().await;
-            apply_entry(&mut es, req_ext, proto, client, int_port, bind_port, lifetime, now)
+            apply_entry(
+                &mut es, req_ext, proto, client, int_port, bind_port, lifetime, now, desc,
+            )
         };
         if let Some((old_bind, old_client, old_int)) = stray {
             {
@@ -803,13 +813,14 @@ impl UpnpFacade {
         client: Ipv4Addr,
         int_port: u16,
         lifetime: u32,
+        desc: String,
     ) -> Result<String, UpnpErr> {
         let req_ext = if req_ext == 0 {
             free_requested_port(&self.entries.lock().await, proto)
         } else {
             req_ext
         };
-        self.add_mapping(req_ext, proto, client, int_port, lifetime)
+        self.add_mapping(req_ext, proto, client, int_port, lifetime, desc)
             .await?;
         Ok(format!("<NewReservedPort>{}</NewReservedPort>", req_ext))
     }
@@ -880,7 +891,10 @@ impl UpnpFacade {
             listing.push_str(&format!("<p:NewInternalPort>{}</p:NewInternalPort>", e.int_port));
             listing.push_str(&format!("<p:NewInternalClient>{}</p:NewInternalClient>", e.client));
             listing.push_str("<p:NewEnabled>1</p:NewEnabled>");
-            listing.push_str("<p:NewDescription></p:NewDescription>");
+            listing.push_str(&format!(
+                "<p:NewDescription>{}</p:NewDescription>",
+                xml_escape(&e.desc)
+            ));
             listing.push_str(&format!(
                 "<p:NewLeaseTime>{}</p:NewLeaseTime>",
                 e.expires_at_unix.saturating_sub(now)
@@ -1134,16 +1148,7 @@ impl UpnpFacade {
         let es = self.entries.lock().await;
         let mut out = String::new();
         for e in es.iter() {
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                e.req_ext,
-                e.proto.code(),
-                e.bind_port,
-                e.client,
-                e.int_port,
-                e.granted_lifetime,
-                e.expires_at_unix
-            ));
+            out.push_str(&entry_line(e));
         }
         drop(es);
         let dir = std::path::Path::new(DEFAULT_DIR);
@@ -1398,7 +1403,9 @@ async fn handle_soap(
                     // the URN's version decides the lease reading
                     // (table 2-6 against the v1 static mapping)
                     let lifetime = if v2 { wip2_lease(lifetime) } else { lifetime };
-                    facade.add_mapping(ext, proto, client, int_port, lifetime).await
+                    facade
+                        .add_mapping(ext, proto, client, int_port, lifetime, parse_desc(body))
+                        .await
                 }
                 Err(e) => Err(e),
             },
@@ -1433,7 +1440,16 @@ async fn handle_soap(
                         // this arm is v2-only, so the version 2 lease
                         // reading always applies here
                         let lifetime = wip2_lease(lifetime);
-                        facade.add_mapping_any(ext, proto, client, int_port, lifetime).await
+                        facade
+                            .add_mapping_any(
+                                ext,
+                                proto,
+                                client,
+                                int_port,
+                                lifetime,
+                                parse_desc(body),
+                            )
+                            .await
                     }
                     Err(e) => Err(e),
                 }
@@ -1995,6 +2011,39 @@ fn wip2_lease(lifetime: u32) -> u32 {
     if lifetime == 0 { WIP2_MAX_LEASE } else { lifetime }
 }
 
+/// NewPortMappingDescription: the control point's label for the mapping
+/// (2.3.22). The description is control-point-controlled text that the
+/// device stores and later emits, so two things are done here rather than
+/// at the writers: control characters are dropped, because the persisted
+/// index is one tab-separated line per entry and a newline in the label
+/// would forge a second one, and the length is bounded.
+fn parse_desc(body: &[u8]) -> String {
+    let raw = xml_tag(body, b"NewPortMappingDescription").unwrap_or(b"");
+    let clean: String = String::from_utf8_lossy(raw)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    clean.chars().take(DESC_MAX).collect()
+}
+
+/// Escape the five XML metacharacters. Only the description needs it: the
+/// other emitted fields are numbers or a parsed address, while the
+/// description is arbitrary text a control point chose.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn entry_xml(e: &FacadeEntry, with_key: bool) -> String {
     let proto = match e.proto {
         Proto::Tcp => "TCP",
@@ -2009,7 +2058,10 @@ fn entry_xml(e: &FacadeEntry, with_key: bool) -> String {
     s.push_str(&format!("<NewInternalPort>{}</NewInternalPort>", e.int_port));
     s.push_str(&format!("<NewInternalClient>{}</NewInternalClient>", e.client));
     s.push_str("<NewEnabled>1</NewEnabled>");
-    s.push_str("<NewPortMappingDescription>ds-lite-punch grant</NewPortMappingDescription>");
+    s.push_str(&format!(
+        "<NewPortMappingDescription>{}</NewPortMappingDescription>",
+        xml_escape(&e.desc)
+    ));
     s.push_str(&format!("<NewLeaseDuration>{}</NewLeaseDuration>", e.granted_lifetime));
     s
 }
@@ -2038,6 +2090,7 @@ fn apply_entry(
     bind_port: u16,
     lifetime: u32,
     now_unix: u64,
+    desc: String,
 ) -> Option<(u16, Ipv4Addr, u16)> {
     let expires = now_unix.saturating_add(u64::from(lifetime));
     // Same internal tuple: the upsert refreshed the existing slot in place
@@ -2051,6 +2104,7 @@ fn apply_entry(
         e.req_ext = req_ext;
         e.granted_lifetime = lifetime;
         e.expires_at_unix = expires;
+        e.desc = desc;
         insert_sorted(es, e);
         return None;
     }
@@ -2075,6 +2129,7 @@ fn apply_entry(
         e.bind_port = bind_port;
         e.granted_lifetime = lifetime;
         e.expires_at_unix = expires;
+        e.desc = desc;
         return stray;
     }
     insert_sorted(
@@ -2087,6 +2142,7 @@ fn apply_entry(
             bind_port,
             granted_lifetime: lifetime,
             expires_at_unix: expires,
+            desc,
         },
     );
     None
@@ -2517,40 +2573,62 @@ fn random_sid() -> Sid {
 
 // ---- persisted entry index (respawn continuity of the req-ext key) ----
 
+/// One persisted index row: the seven fixed fields, then the control
+/// point's description.
+fn entry_line(e: &FacadeEntry) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        e.req_ext,
+        e.proto.code(),
+        e.bind_port,
+        e.client,
+        e.int_port,
+        e.granted_lifetime,
+        e.expires_at_unix,
+        e.desc
+    )
+}
+
+/// A persisted index row back to an entry. The description was added
+/// after the first rows were written, so a seven-field row from the
+/// earlier build restores with an empty description rather than being
+/// dropped and losing the mapping a control point already holds. A row
+/// that parses to nothing is skipped.
+fn entry_from_line(line: &str) -> Option<FacadeEntry> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() != 7 && parts.len() != 8 {
+        return None;
+    }
+    let req_ext: u16 = parts[0].parse().ok()?;
+    let proto = match parts[1].trim() {
+        "6" => Proto::Tcp,
+        _ => Proto::Udp,
+    };
+    let bind_port: u16 = parts[2].parse().ok()?;
+    let client: Ipv4Addr = parts[3].parse().ok()?;
+    let int_port: u16 = parts[4].parse().ok()?;
+    let granted_lifetime: u32 = parts[5].parse().ok()?;
+    let expires_at_unix: u64 = parts[6].parse().ok()?;
+    let desc = parts.get(7).copied().unwrap_or("").to_string();
+    Some(FacadeEntry {
+        req_ext,
+        proto,
+        client,
+        int_port,
+        bind_port,
+        granted_lifetime,
+        expires_at_unix,
+        desc,
+    })
+}
+
+/// The persisted entry index: seven fixed fields, then the control
+/// point's description, which was added later.
 fn restore_entries() -> Vec<FacadeEntry> {
     let path = format!("{}/upnp.tsv", DEFAULT_DIR);
     let mut out = Vec::new();
     if let Ok(s) = std::fs::read_to_string(&path) {
-        for line in s.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != 7 {
-                continue;
-            }
-            let mk = || -> Option<FacadeEntry> {
-                let req_ext: u16 = parts[0].parse().ok()?;
-                let proto = match parts[1].trim() {
-                    "6" => Proto::Tcp,
-                    _ => Proto::Udp,
-                };
-                let bind_port: u16 = parts[2].parse().ok()?;
-                let client: Ipv4Addr = parts[3].parse().ok()?;
-                let int_port: u16 = parts[4].parse().ok()?;
-                let granted_lifetime: u32 = parts[5].parse().ok()?;
-                let expires_at_unix: u64 = parts[6].parse().ok()?;
-                Some(FacadeEntry {
-                    req_ext,
-                    proto,
-                    client,
-                    int_port,
-                    bind_port,
-                    granted_lifetime,
-                    expires_at_unix,
-                })
-            };
-            if let Some(e) = mk() {
-                out.push(e);
-            }
-        }
+        out.extend(s.lines().filter_map(entry_from_line));
     }
     out
 }
@@ -3086,6 +3164,7 @@ mod tests {
             bind_port: req_ext + 1000,
             granted_lifetime: 600,
             expires_at_unix: 0,
+            desc: String::new(),
         };
         insert_sorted(&mut es, mk(2000, Proto::Udp));
         insert_sorted(&mut es, mk(1000, Proto::Tcp));
@@ -3347,33 +3426,34 @@ mod tests {
         let now = 1_700_000_000u64;
         let a = Ipv4Addr::new(192, 168, 21, 50);
         let b = Ipv4Addr::new(192, 168, 21, 60);
+        let d = |s: &str| s.to_string();
         let mut es: Vec<FacadeEntry> = Vec::new();
         // A maps 3074/UDP -> slot 30000.
-        assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, 4000, 30000, 3600, now), None);
+        assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         // A re-adds the SAME internal tuple at a new external port: the
         // entry rides the port, the same slot, nothing torn down.
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, 4000, 30000, 3600, now), None);
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].req_ext, 3075);
         assert_eq!(es[0].bind_port, 30000);
         // B takes 3075/UDP with a different internal tuple: NEW slot 30001,
         // and A's occupant of 3075 is surrendered (replace semantics).
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now), Some((30000, a, 4000)));
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), Some((30000, a, 4000)));
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].client, b);
         assert_eq!(es[0].int_port, 5000);
         assert_eq!(es[0].bind_port, 30001);
         // B re-adds the same internal tuple at the same port: plain refresh.
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now), None);
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 1);
         // A fresh mapping on a free port: plain insert.
-        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, 9000, 30002, 3600, now), None);
+        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, 9000, 30002, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 2);
         // B re-Adds A's OWN 9000/TCP with a new internal tuple: the entry
         // pivots to B's slot and A's slot is the stray — a delete of the
         // port must then hit the newcomer, not the old slot.
-        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, 6000, 30003, 3600, now), Some((30002, a, 9000)));
+        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, 6000, 30003, 3600, now, d("client-b")), Some((30002, a, 9000)));
         assert_eq!(es.iter().find(|e| e.req_ext == 9000).unwrap().bind_port, 30003);
         assert_eq!(es.len(), 2, "still one entry per external port");
     }
@@ -3397,6 +3477,7 @@ mod tests {
             bind_port: 30000,
             granted_lifetime: 3600,
             expires_at_unix: 0,
+            desc: String::new(),
         };
         assert_eq!(free_requested_port(&[], Proto::Udp), ANY_PORT_BASE);
         assert_eq!(
@@ -3422,6 +3503,70 @@ mod tests {
         );
     }
 
+    /// NewPortMappingDescription is stored, not replaced by a device
+    /// string (2.3.22): the enumeration and the Listing answer with what
+    /// the control point sent, and the stored text cannot forge a line in
+    /// the persisted index or an element in the SOAP response.
+    #[test]
+    fn mapping_description_is_stored_and_safe() {
+        // the parse drops control characters and bounds the length
+        let body = b"<NewPortMappingDescription>BitTorrent</NewPortMappingDescription>";
+        assert_eq!(parse_desc(body), "BitTorrent");
+        let hostile =
+            b"<NewPortMappingDescription>x\n999\t6\t1\t1.1.1.1\t1\t1\t1</NewPortMappingDescription>";
+        let clean = parse_desc(hostile);
+        assert!(
+            !clean.contains('\n') && !clean.contains('\t'),
+            "a label cannot forge a persisted row: {:?}",
+            clean
+        );
+        let long = format!(
+            "<NewPortMappingDescription>{}</NewPortMappingDescription>",
+            "d".repeat(200)
+        );
+        assert_eq!(parse_desc(long.as_bytes()).chars().count(), DESC_MAX);
+        assert_eq!(parse_desc(b"<NewEnabled>1</NewEnabled>"), "", "absent means empty");
+
+        // the emitted text is escaped, whatever the label holds
+        assert_eq!(xml_escape("a<b&c\"d'e>f"), "a&lt;b&amp;c&quot;d&apos;e&gt;f");
+        let e = FacadeEntry {
+            req_ext: 3074,
+            proto: Proto::Udp,
+            client: Ipv4Addr::new(192, 168, 21, 50),
+            int_port: 3074,
+            bind_port: 30000,
+            granted_lifetime: 3600,
+            expires_at_unix: 0,
+            desc: "Xbox <live> & \"party\"".to_string(),
+        };
+        let xml = entry_xml(&e, true);
+        assert!(
+            xml.contains("<NewPortMappingDescription>Xbox &lt;live&gt; &amp; &quot;party&quot;</NewPortMappingDescription>"),
+            "the stored label is emitted escaped: {}",
+            xml
+        );
+        // the enumeration no longer invents a device string
+        assert!(
+            !xml.contains("ds-lite-punch grant"),
+            "the placeholder's device-authored description is gone"
+        );
+
+        // the index round-trips the label, and a row from the earlier
+        // build (seven fields, no label) still restores its mapping
+        let line = entry_line(&e);
+        assert!(line.ends_with('\n') && line.matches('\t').count() == 7);
+        let back = entry_from_line(line.trim_end()).expect("the row round-trips");
+        assert_eq!(back.desc, e.desc);
+        assert_eq!(back.req_ext, e.req_ext);
+        assert_eq!(back.bind_port, e.bind_port);
+        let legacy = "3074\t17\t30000\t192.168.21.50\t3074\t3600\t1700000000";
+        let old = entry_from_line(legacy).expect("a seven-field row still loads");
+        assert_eq!(old.desc, "");
+        assert_eq!(old.req_ext, 3074);
+        assert_eq!(old.proto, Proto::Udp);
+        assert!(entry_from_line("not\ta\trow").is_none(), "junk rows drop");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn wip2_listing_fragment_and_range_refusals() {
         let cfg = UpnpConfig {
@@ -3435,7 +3580,7 @@ mod tests {
             grace_secs: 60,
         };
         let now = Epoch::now();
-        let entry = |req_ext: u16, proto: Proto, int_port: u16| FacadeEntry {
+        let entry = |req_ext: u16, proto: Proto, int_port: u16, desc: &str| FacadeEntry {
             req_ext,
             proto,
             client: Ipv4Addr::new(192, 168, 21, 50),
@@ -3443,6 +3588,7 @@ mod tests {
             bind_port: 30000,
             granted_lifetime: 3600,
             expires_at_unix: now + 3000,
+            desc: desc.to_string(),
         };
         let facade = Arc::new(UpnpFacade {
             cfg,
@@ -3456,9 +3602,9 @@ mod tests {
                 watch::channel(Ipv4Addr::LOCALHOST).0,
             )),
             entries: Mutex::new(vec![
-                entry(5555, Proto::Udp, 5555),
-                entry(5556, Proto::Udp, 6666),
-                entry(5557, Proto::Tcp, 5557),
+                entry(5555, Proto::Udp, 5555, "BitTorrent"),
+                entry(5556, Proto::Udp, 6666, ""),
+                entry(5557, Proto::Tcp, 5557, "remote-desktop"),
             ]),
             tasks: Mutex::new(HashMap::new()),
             gena: Mutex::new(GenaState::default()),
@@ -3488,7 +3634,14 @@ mod tests {
         assert!(listing.contains("<p:NewInternalPort>5555</p:NewInternalPort>"));
         assert!(listing.contains("<p:NewInternalClient>192.168.21.50</p:NewInternalClient>"));
         assert!(listing.contains("<p:NewEnabled>1</p:NewEnabled>"));
-        assert!(listing.contains("<p:NewDescription></p:NewDescription>"));
+        assert!(
+            listing.contains("<p:NewDescription>BitTorrent</p:NewDescription>"),
+            "the stored label is reported (2.3.25)"
+        );
+        assert!(
+            listing.contains("<p:NewDescription></p:NewDescription>"),
+            "an unlabelled mapping reports an empty description"
+        );
         // a query reports the lease remaining, not the granted one (2.4.6);
         // the entry was seeded with roughly 3000 seconds left
         let open = "<p:NewLeaseTime>";
@@ -3584,6 +3737,7 @@ mod tests {
                 bind_port: 30000,
                 granted_lifetime: 3600,
                 expires_at_unix: now + 3600,
+                desc: String::new(),
             }]),
             tasks: Mutex::new(HashMap::new()),
             gena: Mutex::new(GenaState::default()),
@@ -3734,6 +3888,7 @@ mod tests {
             bind_port: port,
             granted_lifetime: INFINITE_LEASE,
             expires_at_unix: Epoch::now().saturating_add(u64::from(INFINITE_LEASE)),
+            desc: String::new(),
         };
         Arc::new(UpnpFacade {
             cfg,
