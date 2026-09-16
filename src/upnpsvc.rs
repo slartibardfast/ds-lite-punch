@@ -543,7 +543,13 @@ impl UpnpFacade {
         )
     }
 
-    async fn add_mapping(
+    /// allocate_exact (plan/0008 section 17): the requested external port
+    /// is authoritative, which is what WANIPConnection's AddPortMapping
+    /// means at either version. A re-Add pivots the requester's mapping to
+    /// the requested port, and a different requester on a held port takes
+    /// it over (last write wins, one mapping per external port and
+    /// protocol).
+    async fn allocate_exact(
         &self,
         req_ext: u16,
         proto: Proto,
@@ -798,18 +804,19 @@ impl UpnpFacade {
         state.touch(key, now);
     }
 
-    /// AddAnyPortMapping: same engine path as AddPortMapping. Under the
-    /// report-requested premise the requested port is the key and the
-    /// granted external tuple stays underneath, so NewReservedPort
-    /// reports the reserved port. A wildcard (0) request is the action's
-    /// any-free-port form (section 2.5.17): the facade reserves the
-    /// lowest requested port at or above 1024 that no entry of the
-    /// protocol claims and answers it, which is the reading a control
-    /// point can act on. The spec's alternative reading of 2.5.17.3, a
-    /// wildcard mapping that answers 0 as "all unmapped external ports",
-    /// is not a mapping this NAT can install: the AFTR is the mapper and
-    /// it maps one tuple at a time.
-    async fn add_mapping_any(
+    /// allocate_preferred (plan/0008 section 17): WANIPConnection:2's
+    /// AddAnyPortMapping, where the requested port is a preference and the
+    /// answer is the port actually reserved. The engine underneath is the
+    /// same one allocate_exact drives, so a preferred request resolves to
+    /// the same mapping objects; only the port resolution differs. A
+    /// wildcard (0) asks for any free port, and a request for a port
+    /// another client holds is moved to a free one rather than evicting
+    /// that client, which is what 2.5.17 requires and what a control point
+    /// reads NewReservedPort for. The spec's other reading of 2.5.17.3, a
+    /// wildcard answered as 0 meaning "all unmapped external ports", is
+    /// not a mapping this NAT can install: the AFTR is the mapper and it
+    /// maps one tuple at a time.
+    async fn allocate_preferred(
         &self,
         req_ext: u16,
         proto: Proto,
@@ -818,12 +825,11 @@ impl UpnpFacade {
         lifetime: u32,
         desc: String,
     ) -> Result<String, UpnpErr> {
-        let req_ext = if req_ext == 0 {
-            free_requested_port(&self.entries.lock().await, proto)
-        } else {
-            req_ext
+        let req_ext = {
+            let es = self.entries.lock().await;
+            preferred_port(&es, req_ext, proto, client)
         };
-        self.add_mapping(req_ext, proto, client, int_port, lifetime, desc)
+        self.allocate_exact(req_ext, proto, client, int_port, lifetime, desc)
             .await?;
         Ok(format!("<NewReservedPort>{}</NewReservedPort>", req_ext))
     }
@@ -1450,7 +1456,7 @@ async fn handle_soap(
                     // (table 2-6 against the v1 static mapping)
                     let lifetime = if v2 { wip2_lease(lifetime) } else { lifetime };
                     facade
-                        .add_mapping(ext, proto, client, int_port, lifetime, parse_desc(body))
+                        .allocate_exact(ext, proto, client, int_port, lifetime, parse_desc(body))
                         .await
                 }
                 Err(e) => Err(e),
@@ -1487,7 +1493,7 @@ async fn handle_soap(
                         // reading always applies here
                         let lifetime = wip2_lease(lifetime);
                         facade
-                            .add_mapping_any(
+                            .allocate_preferred(
                                 ext,
                                 proto,
                                 client,
@@ -2047,6 +2053,25 @@ fn free_requested_port(entries: &[FacadeEntry], proto: Proto) -> u16 {
         p += 1;
     }
     p
+}
+
+/// The port an AddAnyPortMapping request reserves (section 2.5.17): the
+/// requested port when it is free or already this client's, and otherwise
+/// any free port of the protocol. The distinction is the whole of the
+/// preferred semantics: a port another client holds is not evicted, so the
+/// answer NewReservedPort carries differs from the request, which is the
+/// case the action exists for. A wildcard (0) is the same question with no
+/// preference expressed.
+fn preferred_port(entries: &[FacadeEntry], req_ext: u16, proto: Proto, client: Ipv4Addr) -> u16 {
+    let held_by_another = req_ext != 0
+        && entries
+            .iter()
+            .any(|e| e.proto == proto && e.req_ext == req_ext && e.client != client);
+    if req_ext == 0 || held_by_another {
+        free_requested_port(entries, proto)
+    } else {
+        req_ext
+    }
 }
 
 /// The version 2 reading of NewLeaseDuration (sections 2.3.16, 2.5.16.2
@@ -3528,6 +3553,53 @@ mod tests {
             ANY_PORT_BASE,
             "a claim above the floor leaves the floor free"
         );
+    }
+
+    /// plan/0008 section 17: allocate_exact and allocate_preferred resolve
+    /// the same request differently over one engine. Exact honours the
+    /// requested port and takes it over from whoever holds it; preferred
+    /// moves to a free port and leaves the other client's mapping standing.
+    /// The difference is the port resolution, and it is asserted here on
+    /// one shared table state.
+    #[test]
+    fn allocate_exact_and_preferred_differ() {
+        let a = Ipv4Addr::new(192, 168, 21, 50);
+        let b = Ipv4Addr::new(192, 168, 21, 60);
+        let e = |req_ext: u16, proto: Proto, client: Ipv4Addr| FacadeEntry {
+            req_ext,
+            proto,
+            client,
+            int_port: req_ext,
+            bind_port: 30000,
+            granted_lifetime: 3600,
+            expires_at_unix: 0,
+            desc: String::new(),
+        };
+        let held = vec![e(5000, Proto::Udp, a), e(5001, Proto::Udp, b)];
+
+        // preferred: the port belongs to another client, so B is given a
+        // free one and A keeps its mapping
+        assert_eq!(preferred_port(&held, 5000, Proto::Udp, b), ANY_PORT_BASE);
+        // a wildcard asks the same question with no preference stated
+        assert_eq!(preferred_port(&held, 0, Proto::Udp, b), ANY_PORT_BASE);
+        // the requester's own port is honoured, so a re-Add refreshes
+        assert_eq!(preferred_port(&held, 5001, Proto::Udp, b), 5001);
+        // a free port is honoured
+        assert_eq!(preferred_port(&held, 8100, Proto::Udp, b), 8100);
+        // another protocol's claim is not this request's obstacle
+        assert_eq!(preferred_port(&held, 5000, Proto::Tcp, b), 5000);
+
+        // exact: the same request on the same state takes the port over.
+        // Over the one engine that is apply_entry's replace semantics; the
+        // occupant is surrendered to the caller for teardown.
+        let mut es = held.clone();
+        assert_eq!(
+            apply_entry(&mut es, 5000, Proto::Udp, b, 7000, 30010, 3600, 1_700_000_000, "b".into()),
+            Some((30000, a, 5000)),
+            "exact evicts the occupant of the requested port"
+        );
+        assert_eq!(es.iter().find(|x| x.req_ext == 5000).unwrap().client, b);
+        assert_eq!(es.len(), 2, "one mapping per external port and protocol");
     }
 
     /// NewPortMappingDescription is stored, not replaced by a device

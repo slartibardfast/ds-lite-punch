@@ -240,6 +240,13 @@ port algorithm is vendor-defined and this implementation's engine supplies it.
   remote host, internal client or protocol returns
   `NewReservedPort != NewExternalPort`; an identical remote host, external
   port, protocol and internal client is an overwrite.
+- The distinction is why the mapping engine is reached through two entry
+  points (plan/0008 section 17): `allocate_exact` for `AddPortMapping`, where
+  the requested port is authoritative and a different requester on a held port
+  takes it over, and `allocate_preferred` for this action, where a port another
+  client holds moves the request to a free one and leaves that client's
+  mapping standing. Both resolve to the same mapping objects over the one
+  engine; only the port resolution differs.
 
 ### DeletePortMappingRange (2.5.19)
 
