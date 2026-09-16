@@ -36,10 +36,13 @@ use crate::vote::VoteState;
 /// Concurrency cap for the HTTP service (E8: bounded connections).
 const HTTP_CONN_CAP: usize = 16;
 /// plan/0008 R6 mount gate: the IGD:2 facade is served only when its
-/// complete service set (WIP2 + DeviceProtection:1) is real. Flipped by
-/// the plan/0008 #v2-service-set task; until then the device presents
-/// the v1 compatibility facade only.
-const IGD_V2_ENABLED: bool = false;
+/// complete service set (WIP2 + DeviceProtection:1) is real. The
+/// #v2-service-set task flips it here, and it stays on: the v2 mount
+/// carries the 21-action WANIPConnection:2 SCPD, the DP SCPD, and the
+/// DeviceProtection service in the root description (sections 26.4 and
+/// 26.11, which forbid an IGD:2 facade without DP). The v1 presentation
+/// stays served beside it (section 26.12).
+const IGD_V2_ENABLED: bool = true;
 /// plan/0008 R6: the per-control-point discovery window. 1 s is the UDA
 /// default for a missing MX, so a deferred ssdp:all response always
 /// lands inside its own allowed response window.
@@ -4313,8 +4316,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn versioned_doc_routing() {
         // section 21: /igd/v1/* serves the v1 presentation, the legacy
-        // paths stay served, and the gated /igd/v2/* is not offered
-        // until the #v2-service-set task (404 while gated off).
+        // paths stay served, and /igd/v2/* serves the v2 presentation
+        // now that the mount gate is on (plan/0008 #v2-service-set).
         let cfg = UpnpConfig {
             lan_ip: Ipv4Addr::LOCALHOST,
             upnp_port: 0,
@@ -4377,16 +4380,56 @@ mod tests {
             ok,
             &body[..body.len().min(220)]
         );
+        // the mounted v2 root description: IGD:2, and (sections 26.4 and
+        // 26.11) DeviceProtection:1 beside WANIPConnection:2, since an
+        // IGD:2 facade without an enforced DP surface is the shortcut the
+        // plan forbids
         let (ok, body) = get("/igd/v2/rootDesc.xml").await;
-        assert!(!ok && body.contains("404"), "the v2 surface is not offered while the gate is off");
-        let (ok, _) = get("/igd/v2/DP.xml").await;
-        assert!(!ok, "DP is not offered while the gate is off");
+        assert!(
+            ok && body.contains("InternetGatewayDevice:2"),
+            "v2 canonical URL serves the v2 doc; ok={} head={:?}",
+            ok,
+            &body[..body.len().min(220)]
+        );
+        for want in [
+            "urn:schemas-upnp-org:service:DeviceProtection:1",
+            "urn:schemas-upnp-org:service:WANIPConnection:2",
+            "/igd/v2/DP.xml",
+            "/igd/v2/WANIPCn.xml",
+        ] {
+            assert!(body.contains(want), "the v2 root description carries {}", want);
+        }
+        // the v2 service descriptions: the transcribed WIP2 surface (21
+        // actions) and the DP surface (13)
+        let (ok, body) = get("/igd/v2/WANIPCn.xml").await;
+        assert!(
+            ok && body.contains("AddAnyPortMapping") && body.contains("DeletePortMappingRange"),
+            "the WIP2 SCPD is served"
+        );
+        assert_eq!(
+            body.matches("<action>").count(),
+            21,
+            "the v2 mount publishes the transcribed 21-action surface"
+        );
+        let (ok, body) = get("/igd/v2/DP.xml").await;
+        assert!(
+            ok && body.contains("GetUserLoginChallenge") && body.contains("SetUserLoginPassword"),
+            "the DP SCPD is served"
+        );
+        assert_eq!(
+            body.matches("<action>").count(),
+            13,
+            "the DP surface is the authoritative 13 actions"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ssdp_loop_answers_v1_search_only() {
-        // the rewired M-SEARCH responder answers v1 targets immediately
-        // and stays silent for v2 targets while the gate is off
+    async fn ssdp_loop_answers_the_mounted_surface() {
+        // section 24's discovery rows at the packet level: an explicit
+        // IGD:2 or WIP:2 search is answered from the v2 presentation, a
+        // v1 search from the v1 presentation, and a bare ssdp:all is
+        // deferred to the debounce deadline and answered from v1 unless a
+        // :2 search arrives inside the window (section 12)
         let cfg = UpnpConfig {
             lan_ip: Ipv4Addr::LOCALHOST,
             upnp_port: 0,
@@ -4443,16 +4486,99 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
         assert!(resp.contains("ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"));
         assert!(resp.contains("/igd/v1/rootDesc.xml"));
-        // an IGD:2 search gets no answer while the gate is off
+        // an explicit IGD:2 search is answered from the v2 presentation
         probe
             .send_to(msearch("urn:schemas-upnp-org:device:InternetGatewayDevice:2", "1").as_bytes(), addr)
             .await
             .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), probe.recv_from(&mut buf))
+            .await
+            .expect("v2 answer within 3 s")
+            .expect("recv ok");
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), probe.recv_from(&mut buf))
+            resp.contains("ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2\r\n"),
+            "the answer carries the searched target: {}",
+            resp
+        );
+        assert!(resp.contains("/igd/v2/rootDesc.xml"), "and the v2 LOCATION: {}", resp);
+
+        // an explicit WIP:2 search resolves to the v2 description too
+        probe
+            .send_to(msearch("urn:schemas-upnp-org:service:WANIPConnection:2", "1").as_bytes(), addr)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), probe.recv_from(&mut buf))
+            .await
+            .expect("WIP:2 answer within 3 s")
+            .expect("recv ok");
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.contains("/igd/v2/rootDesc.xml") && resp.contains("WANIPConnection:2\r\n"),
+            "WIP:2 resolves to the v2 description: {}",
+            resp
+        );
+
+        // a bare ssdp:all is deferred, then answered from v1 because no
+        // :2 arrived inside the window. The deadline is the implementation
+        // parameter: the deferred answer lands at receive + the debounce,
+        // with no further jitter (section 12 constraint 3).
+        let t0 = std::time::Instant::now();
+        probe.send_to(msearch("ssdp:all", "1").as_bytes(), addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), probe.recv_from(&mut buf))
+            .await
+            .expect("the deferred ssdp:all answer arrives")
+            .expect("recv ok");
+        let waited = t0.elapsed();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        // the deferred :all answer carries the root-device target, which
+        // is the UDA-appropriate response target for ssdp:all (section 24
+        // reads "ssdp:all/appropriate response targets")
+        assert!(resp.contains("ST: upnp:rootdevice\r\n"), "st: {}", resp);
+        assert!(
+            resp.contains("/igd/v1/rootDesc.xml"),
+            "nothing in the burst says v2, so the answer is v1: {}",
+            resp
+        );
+        assert!(
+            waited >= Duration::from_millis(900) && waited <= Duration::from_millis(1800),
+            "the deferred answer lands at the debounce deadline, not before and not much after: {:?}",
+            waited
+        );
+
+        // the same burst with an explicit :2 inside the window: both
+        // answers are the v2 presentation, and the deferred :all is
+        // released early
+        probe.send_to(msearch("ssdp:all", "1").as_bytes(), addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        probe
+            .send_to(msearch("urn:schemas-upnp-org:device:InternetGatewayDevice:2", "1").as_bytes(), addr)
+            .await
+            .unwrap();
+        let mut all_seen = false;
+        let mut igd2_seen = false;
+        for _ in 0..2 {
+            let (n, _) = tokio::time::timeout(Duration::from_secs(3), probe.recv_from(&mut buf))
                 .await
-                .is_err(),
-            "no v2 answer while the gate is off"
+                .expect("both answers arrive")
+                .expect("recv ok");
+            let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                resp.contains("/igd/v2/rootDesc.xml"),
+                "the flip answers both from v2: {}",
+                resp
+            );
+            if resp.contains("ST: upnp:rootdevice\r\n") {
+                all_seen = true;
+            }
+            if resp.contains("ST: urn:schemas-upnp-org:device:InternetGatewayDevice:2\r\n") {
+                igd2_seen = true;
+            }
+        }
+        assert!(
+            all_seen && igd2_seen,
+            "the deferred ssdp:all and the explicit :2 are both answered"
         );
     }
 }
