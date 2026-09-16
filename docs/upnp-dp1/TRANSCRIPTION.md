@@ -78,6 +78,24 @@ specimen typo.
 - GetSupportedProtocols returns this document as ProtocolList, and its
   minimum required value is the two mandated names (2.6.2.2).
 
+### The WPS introduction protocol is not implemented
+
+Section 2.4.3.1 mandates an `<Introduction><Name>WPS</Name>` entry in
+`SupportedProtocols`, and 2.6.1.2 requires `SendSetupMessage`'s
+`ProtocolType` to match one of the advertised names. This device advertises
+WPS and answers a WPS setup attempt with 704 Processing Error and an empty
+`OutMessage`.
+
+The reason is a limit on what can be transcribed rather than a choice about
+effort. Appendix A defines the WPS Registration Protocol's messages by
+deferring to the Wi-Fi Alliance WPS specification's Message Encoding and
+Data Element Definitions sections, which are not internalized here, and it
+requires the exchange to run inside a certificate-authenticated TLS
+channel, where this facade serves the service over plain HTTP. The
+decision, the rejected alternative (600, whose meaning would contradict the
+published protocol list), and the two things a reversal needs are recorded
+in [host call/0021](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0021-wps-introduction-not-implemented.md).
+
 ## The ACL model (2.4.4)
 
 - `ACL` contains `<Identities>` each with `<User>` entries: `<Name>`
@@ -240,7 +258,9 @@ internalized conversion, no re-conversion needed):
 1. The SCPD action surface: wrong (miniupnpd-derived) names replaced by the
    thirteen authoritative actions above.
 2. SendSetupMessage's OutMessage returns a Base64 setup message; the WPS
-   transport is not a separate action — it is the WPS protocol spoken
+   transport is not a separate action, it is the WPS protocol spoken
    through SendSetupMessage with ProtocolType = "WPS" (2.6.1.2, 2.6.1.4).
+   That protocol is not implemented here, for the reasons in "The WPS
+   introduction protocol is not implemented" above.
 3. SetupReady is a hint, not a guarantee (2.4.2); the facade events it
    rather than gating dispatch on it.
