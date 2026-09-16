@@ -229,6 +229,29 @@ DeviceProtection session principal, and the enforcement is a pure function of
 the principal's roles and the action's requirement, never of the transport
 address (plan/0008 section 26.19).
 
+### The policy this device enforces
+
+The specification leaves the enforced set to the device (1.2, 26.6 in
+plan/0008), so the applied set is stated here rather than inferred:
+
+- `AddPortMapping`, `AddAnyPortMapping`, `DeletePortMapping` and
+  `DeletePortMappingRange` require an authenticated session holding at least
+  `Basic` (plan/0008 sections 26.7 and 26.10). An unauthenticated invocation
+  receives 606 and no mapping changes.
+- The remaining WANIPConnection:2 actions, `GetListOfPortMappings` among them,
+  are public in this policy: an unauthenticated control point may read the
+  mapping table and the connection status.
+
+The consequence worth naming, because the specification's recommendation goes
+the other way: an unauthenticated `GetListOfPortMappings` is answered in full,
+where 2.5.21.3 recommends restricting it to the control point's own entries
+and to ports at or above 1024. The same recommendation would restrict
+`GetGenericPortMappingEntry` and `GetSpecificPortMappingEntry`, which the v1
+service already answers publicly. The restrictive reading of plan/0008 section
+26.10 is therefore applied to the mapping mutators and not to the reads, and
+tightening the reads is a policy change to be taken deliberately rather than a
+transcription detail.
+
 ## Error codes (section 2.5.23)
 
 | Code | Name | Where it applies |

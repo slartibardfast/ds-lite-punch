@@ -881,6 +881,13 @@ pub enum UpnpErr {
     NoSuchEntry,
     /// 501 Action Failed (quota, table full, datapath failure).
     ActionFailed,
+    /// 730 PortMappingNotFound (DeviceProtection is not the only service
+    /// with a 7xx table; this is WANIPConnection:2's own code for a range
+    /// action that found nothing, sections 2.5.19.6 and 2.5.21.7).
+    PortMappingNotFound,
+    /// 733 InconsistentParameters (the range endpoints disagree, the same
+    /// sections 2.5.19.6 and 2.5.21.7).
+    InconsistentParameters,
     /// 600 Argument Value Invalid (DeviceProtection: 2.6.15).
     InvalidValue,
     /// 606 Action not authorized (DeviceProtection: 2.6.5.10 and the
@@ -915,6 +922,14 @@ pub const FAULT_NO_SUCH_ENTRY: UpnpFault = UpnpFault {
     code: 714,
     desc: "NoSuchEntryInArray",
 };
+pub const FAULT_PORT_MAPPING_NOT_FOUND: UpnpFault = UpnpFault {
+    code: 730,
+    desc: "PortMappingNotFound",
+};
+pub const FAULT_INCONSISTENT_PARAMETERS: UpnpFault = UpnpFault {
+    code: 733,
+    desc: "InconsistentParameters",
+};
 pub const FAULT_INVALID_VALUE: UpnpFault = UpnpFault {
     code: 600,
     desc: "Argument Value Invalid",
@@ -937,6 +952,8 @@ pub fn fault_of(e: UpnpErr) -> UpnpFault {
         UpnpErr::InvalidArgs => FAULT_INVALID_ARGS,
         UpnpErr::NoSuchEntry => FAULT_NO_SUCH_ENTRY,
         UpnpErr::ActionFailed => FAULT_ACTION_FAILED,
+        UpnpErr::PortMappingNotFound => FAULT_PORT_MAPPING_NOT_FOUND,
+        UpnpErr::InconsistentParameters => FAULT_INCONSISTENT_PARAMETERS,
         UpnpErr::InvalidValue => FAULT_INVALID_VALUE,
         UpnpErr::NotAuthorized => FAULT_NOT_AUTHORIZED,
         UpnpErr::AuthFailure => FAULT_AUTH_FAILURE,
@@ -1451,6 +1468,11 @@ mod tests {
         assert_eq!(fault_of(UpnpErr::InvalidArgs), FAULT_INVALID_ARGS);
         assert_eq!(fault_of(UpnpErr::NoSuchEntry), FAULT_NO_SUCH_ENTRY);
         assert_eq!(fault_of(UpnpErr::ActionFailed), FAULT_ACTION_FAILED);
+        // the WANIPConnection:2 range codes keep their own numbers: the
+        // 7xx table is shared across services, and these two are this
+        // service's (sections 2.5.19.6 and 2.5.21.7)
+        assert_eq!(fault_of(UpnpErr::PortMappingNotFound).code, 730);
+        assert_eq!(fault_of(UpnpErr::InconsistentParameters).code, 733);
     }
 
     #[test]

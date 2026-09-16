@@ -47,6 +47,12 @@ const DISCOVERY_DEBOUNCE_MS: u64 = 1000;
 /// The versioned description URLs (plan/0008 section 21).
 const DOC_V1: &str = "/igd/v1/rootDesc.xml";
 const DOC_V2: &str = "/igd/v2/rootDesc.xml";
+/// The WANIPConnection:2 maximum lease (table 2-6): the version 2 reading
+/// of a lease of 0, where version 1 read it as a static mapping.
+const WIP2_MAX_LEASE: u32 = 604_800;
+/// The floor of an automatic external-port choice, the AddAnyPortMapping
+/// wildcard of section 2.5.17.
+const ANY_PORT_BASE: u16 = 1024;
 /// Lease policy (2026-09-15): the granted lease appears infinite
 /// (U32_MAX wire/index) while the effective lifetime is managed
 /// underneath. A UDP grant becomes a reap candidate when its client has
@@ -782,8 +788,14 @@ impl UpnpFacade {
     /// AddAnyPortMapping: same engine path as AddPortMapping. Under the
     /// report-requested premise the requested port is the key and the
     /// granted external tuple stays underneath, so NewReservedPort
-    /// reports the requested port. An "any port" (0) request is refused
-    /// with 402 for now — the allocation path is recorded as deferred.
+    /// reports the reserved port. A wildcard (0) request is the action's
+    /// any-free-port form (section 2.5.17): the facade reserves the
+    /// lowest requested port at or above 1024 that no entry of the
+    /// protocol claims and answers it, which is the reading a control
+    /// point can act on. The spec's alternative reading of 2.5.17.3, a
+    /// wildcard mapping that answers 0 as "all unmapped external ports",
+    /// is not a mapping this NAT can install: the AFTR is the mapper and
+    /// it maps one tuple at a time.
     async fn add_mapping_any(
         &self,
         req_ext: u16,
@@ -792,9 +804,11 @@ impl UpnpFacade {
         int_port: u16,
         lifetime: u32,
     ) -> Result<String, UpnpErr> {
-        if req_ext == 0 {
-            return Err(UpnpErr::InvalidArgs);
-        }
+        let req_ext = if req_ext == 0 {
+            free_requested_port(&self.entries.lock().await, proto)
+        } else {
+            req_ext
+        };
         self.add_mapping(req_ext, proto, client, int_port, lifetime)
             .await?;
         Ok(format!("<NewReservedPort>{}</NewReservedPort>", req_ext))
@@ -802,7 +816,10 @@ impl UpnpFacade {
 
     /// DeletePortMappingRange: delete every entry whose requested port
     /// lies in [start, end] for the protocol. Bounded by the entries
-    /// table, never by the port span.
+    /// table, never by the port span. An empty range is the 730
+    /// PortMappingNotFound the spec requires (2.5.19.2), and the delete
+    /// is atomic in the sense that matters here: the target list is
+    /// collected before any of it is removed.
     async fn delete_mapping_range(&self, start: u16, end: u16, proto: Proto) -> Result<String, UpnpErr> {
         let targets: Vec<u16> = {
             let es = self.entries.lock().await;
@@ -811,6 +828,9 @@ impl UpnpFacade {
                 .map(|e| e.req_ext)
                 .collect()
         };
+        if targets.is_empty() {
+            return Err(UpnpErr::PortMappingNotFound);
+        }
         for ext in targets {
             let _ = self.delete_mapping(ext, proto).await;
         }
@@ -823,7 +843,9 @@ impl UpnpFacade {
     /// The fragment shape is the sample of the spec's section 2.3.25.2: a
     /// PortMappingList of PortMappingEntry elements in the
     /// urn:schemas-upnp-org:gw:WANIPConnection namespace. NewLeaseTime is
-    /// the remaining lease, as section 2.4.6 requires of a query.
+    /// the remaining lease, as section 2.4.6 requires of a query. An
+    /// empty selection is 730 PortMappingNotFound, as for the delete
+    /// (2.5.21.3).
     async fn list_port_mappings(
         &self,
         start: u16,
@@ -865,6 +887,9 @@ impl UpnpFacade {
             ));
             listing.push_str("</p:PortMappingEntry>");
             count += 1;
+        }
+        if count == 0 {
+            return Err(UpnpErr::PortMappingNotFound);
         }
         listing.push_str("</p:PortMappingList>");
         Ok(listing)
@@ -1370,6 +1395,9 @@ async fn handle_soap(
                 SoapAction::AddPortMapping,
             ) => match parse_add_args(body) {
                 Ok((ext, proto, int_port, client, lifetime)) => {
+                    // the URN's version decides the lease reading
+                    // (table 2-6 against the v1 static mapping)
+                    let lifetime = if v2 { wip2_lease(lifetime) } else { lifetime };
                     facade.add_mapping(ext, proto, client, int_port, lifetime).await
                 }
                 Err(e) => Err(e),
@@ -1402,6 +1430,9 @@ async fn handle_soap(
             (SoapService::WanIpConnection, SoapAction::AddAnyPortMapping) => {
                 match parse_add_args_any(body) {
                     Ok((ext, proto, int_port, client, lifetime)) => {
+                        // this arm is v2-only, so the version 2 lease
+                        // reading always applies here
+                        let lifetime = wip2_lease(lifetime);
                         facade.add_mapping_any(ext, proto, client, int_port, lifetime).await
                     }
                     Err(e) => Err(e),
@@ -1772,20 +1803,15 @@ fn substring(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 // ---- WIP2-only action argument parsing (plan/0008 #v2-service-set) ----
 
-/// AddAnyPortMapping: like AddPortMapping but the requested external port
-/// is a preference (0 = "any" is rejected explicitly for now; the engine
-/// allocates the granted port and NewReservedPort answers it).
-fn parse_add_args_any(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
-    parse_add_args(body)
-}
-
-/// DeletePortMappingRange: NewStartPort/NewEndPort/NewProtocol. The range
-/// endpoints are honored as an entry filter — no scan over the port span.
+/// DeletePortMappingRange: NewStartPort/NewEndPort/NewProtocol/NewManage.
+/// The range endpoints are honored as an entry filter, so no scan runs
+/// over the port span. A start above the end is the 733
+/// InconsistentParameters of 2.5.19.6, not a malformed request.
 fn parse_range_args(body: &[u8]) -> Result<(u16, u16, Proto), UpnpErr> {
     let start = tag_u16(body, b"NewStartPort").ok_or(UpnpErr::InvalidArgs)?;
     let end = tag_u16(body, b"NewEndPort").ok_or(UpnpErr::InvalidArgs)?;
     if end < start {
-        return Err(UpnpErr::InvalidArgs);
+        return Err(UpnpErr::InconsistentParameters);
     }
     let proto = match xml_tag(body, b"NewProtocol") {
         Some(p) if eq_ia(p, b"TCP") => Proto::Tcp,
@@ -1796,13 +1822,14 @@ fn parse_range_args(body: &[u8]) -> Result<(u16, u16, Proto), UpnpErr> {
 }
 
 /// GetListOfPortMappings: NewStartPort/NewEndPort/NewProtocol
-/// (TCP|UDP|ALL)/NewNumberOfPorts. NewManage is accepted and ignored
-/// (managed entries are not a concept this facade exposes).
+/// (TCP|UDP|ALL)/NewNumberOfPorts, with NewManage accepted and ignored
+/// (managed entries are not a concept this facade exposes). A start above
+/// the end is 733 InconsistentParameters, as for the delete (2.5.21.7).
 fn parse_list_args(body: &[u8]) -> Result<(u16, u16, Option<Proto>, u16), UpnpErr> {
     let start = tag_u16(body, b"NewStartPort").ok_or(UpnpErr::InvalidArgs)?;
     let end = tag_u16(body, b"NewEndPort").ok_or(UpnpErr::InvalidArgs)?;
     if end < start {
-        return Err(UpnpErr::InvalidArgs);
+        return Err(UpnpErr::InconsistentParameters);
     }
     let proto = match xml_tag(body, b"NewProtocol") {
         Some(p) if eq_ia(p, b"TCP") => Some(Proto::Tcp),
@@ -1828,6 +1855,24 @@ async fn deliver_notify(cb_ip: Ipv4Addr, cb_port: u16, req: &[u8]) {
 // ---- argument parsing (E3: fallible, never panics) ----
 
 fn parse_add_args(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
+    parse_add_args_impl(body, false)
+}
+
+/// AddAnyPortMapping: the AddPortMapping argument table plus NewReservedPort
+/// (table 2-41). Unlike AddPortMapping, a wildcard NewExternalPort is not a
+/// malformed request here: it is the action's any-free-port form, which a
+/// device may support (2.5.17.3), and this one does. The facade decides what
+/// port the wildcard reserves.
+fn parse_add_args_any(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
+    parse_add_args_impl(body, true)
+}
+
+/// The shared parse of the AddPortMapping argument table (table 2-11). The
+/// wildcard external port is the only difference between the two callers.
+fn parse_add_args_impl(
+    body: &[u8],
+    wildcard_ext: bool,
+) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
     let ext = tag_u16(body, b"NewExternalPort").ok_or(UpnpErr::InvalidArgs)?;
     let proto = match xml_tag(body, b"NewProtocol") {
         Some(p) if eq_ia(p, b"TCP") => Proto::Tcp,
@@ -1839,7 +1884,7 @@ fn parse_add_args(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpE
         .and_then(|c| std::str::from_utf8(c).ok())
         .and_then(|c| c.parse::<Ipv4Addr>().ok())
         .ok_or(UpnpErr::InvalidArgs)?;
-    if ext == 0 || int_port == 0 || client == Ipv4Addr::UNSPECIFIED {
+    if (ext == 0 && !wildcard_ext) || int_port == 0 || client == Ipv4Addr::UNSPECIFIED {
         return Err(UpnpErr::InvalidArgs);
     }
     // RemoteHost accepted and ignored (EIF); NewEnabled and the description
@@ -1925,6 +1970,29 @@ fn in_lan(ip: Ipv4Addr, lan: Ipv4Addr) -> bool {
     let a = u32::from(ip) & 0xffff_ff00;
     let b = u32::from(lan) & 0xffff_ff00;
     a == b
+}
+
+/// The AddAnyPortMapping wildcard's port choice (section 2.5.17): the
+/// lowest requested port at or above 1024 that no entry of this protocol
+/// claims. The 1024 floor is the recommended lower bound for a control
+/// point with limited permission (2.5.16.2), and reserving above it keeps
+/// the well-known range out of the automatic choice. The scan always
+/// terminates: the lease table caps at a configured few hundred slots
+/// while the port space holds 64512 of them.
+fn free_requested_port(entries: &[FacadeEntry], proto: Proto) -> u16 {
+    let mut p = ANY_PORT_BASE;
+    while p < u16::MAX && entries.iter().any(|e| e.proto == proto && e.req_ext == p) {
+        p += 1;
+    }
+    p
+}
+
+/// The version 2 reading of NewLeaseDuration (sections 2.3.16, 2.5.16.2
+/// and 2.5.17.3): version 2 has no static mappings, so a lease of 0 means
+/// the maximum, 604800 seconds. The v1 face keeps 0 as the permanent
+/// mapping a legacy control point means by it.
+fn wip2_lease(lifetime: u32) -> u32 {
+    if lifetime == 0 { WIP2_MAX_LEASE } else { lifetime }
 }
 
 fn entry_xml(e: &FacadeEntry, with_key: bool) -> String {
@@ -3310,6 +3378,159 @@ mod tests {
         assert_eq!(es.len(), 2, "still one entry per external port");
     }
 
+    /// The v2 readings the transcription fixes, each a property a name-only
+    /// implementation fails by construction: the wildcard's port choice
+    /// (2.5.17), the version 2 lease reading (table 2-6), and the Listing
+    /// fragment with the spec's own 7xx refusals (2.5.19, 2.5.21).
+    #[test]
+    fn wip2_wildcard_and_lease_readings() {
+        assert_eq!(wip2_lease(0), WIP2_MAX_LEASE, "version 2: 0 is the maximum");
+        assert_eq!(wip2_lease(1), 1);
+        assert_eq!(wip2_lease(3600), 3600);
+        assert_eq!(wip2_lease(WIP2_MAX_LEASE), WIP2_MAX_LEASE);
+
+        let e = |req_ext: u16, proto: Proto| FacadeEntry {
+            req_ext,
+            proto,
+            client: Ipv4Addr::new(192, 168, 21, 50),
+            int_port: 4000,
+            bind_port: 30000,
+            granted_lifetime: 3600,
+            expires_at_unix: 0,
+        };
+        assert_eq!(free_requested_port(&[], Proto::Udp), ANY_PORT_BASE);
+        assert_eq!(
+            free_requested_port(&[e(ANY_PORT_BASE, Proto::Udp)], Proto::Udp),
+            ANY_PORT_BASE + 1
+        );
+        assert_eq!(
+            free_requested_port(
+                &[e(ANY_PORT_BASE, Proto::Udp), e(ANY_PORT_BASE + 1, Proto::Udp)],
+                Proto::Udp
+            ),
+            ANY_PORT_BASE + 2
+        );
+        assert_eq!(
+            free_requested_port(&[e(ANY_PORT_BASE, Proto::Tcp)], Proto::Udp),
+            ANY_PORT_BASE,
+            "another protocol's claim is not this protocol's claim"
+        );
+        assert_eq!(
+            free_requested_port(&[e(7000, Proto::Udp)], Proto::Udp),
+            ANY_PORT_BASE,
+            "a claim above the floor leaves the floor free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wip2_listing_fragment_and_range_refusals() {
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/wip2-listing".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "wip2-listing".into(),
+            grace_secs: 60,
+        };
+        let now = Epoch::now();
+        let entry = |req_ext: u16, proto: Proto, int_port: u16| FacadeEntry {
+            req_ext,
+            proto,
+            client: Ipv4Addr::new(192, 168, 21, 50),
+            int_port,
+            bind_port: 30000,
+            granted_lifetime: 3600,
+            expires_at_unix: now + 3000,
+        };
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                8,
+                4,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::LOCALHOST).0,
+            )),
+            entries: Mutex::new(vec![
+                entry(5555, Proto::Udp, 5555),
+                entry(5556, Proto::Udp, 6666),
+                entry(5557, Proto::Tcp, 5557),
+            ]),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("wip2-listing"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+        });
+
+        // the fragment is the spec's sample shape (2.3.25.2): a namespaced
+        // PortMappingList of PortMappingEntry elements, the invented
+        // element tree of the placeholder gone
+        let listing = facade
+            .list_port_mappings(5000, 6000, Some(Proto::Udp), 0)
+            .await
+            .expect("a populated range lists");
+        assert!(listing.starts_with(
+            "<p:PortMappingList xmlns:p=\"urn:schemas-upnp-org:gw:WANIPConnection\""
+        ));
+        assert!(listing.ends_with("</p:PortMappingList>"));
+        assert!(listing.contains("<p:PortMappingEntry>"));
+        assert!(listing.contains("<p:NewRemoteHost></p:NewRemoteHost>"));
+        assert!(listing.contains("<p:NewExternalPort>5555</p:NewExternalPort>"));
+        assert!(listing.contains("<p:NewProtocol>UDP</p:NewProtocol>"));
+        assert!(listing.contains("<p:NewInternalPort>5555</p:NewInternalPort>"));
+        assert!(listing.contains("<p:NewInternalClient>192.168.21.50</p:NewInternalClient>"));
+        assert!(listing.contains("<p:NewEnabled>1</p:NewEnabled>"));
+        assert!(listing.contains("<p:NewDescription></p:NewDescription>"));
+        // a query reports the lease remaining, not the granted one (2.4.6);
+        // the entry was seeded with roughly 3000 seconds left
+        let open = "<p:NewLeaseTime>";
+        let at = listing.find(open).expect("a lease tag") + open.len();
+        let close = listing[at..].find("</p:NewLeaseTime>").expect("a lease close");
+        let lease: u64 = listing[at..at + close].parse().expect("a numeric lease");
+        assert!(
+            (2900..=3000).contains(&lease),
+            "the remaining lease is reported: {}",
+            lease
+        );
+        assert!(
+            !listing.contains("NewPortListingEntry"),
+            "the placeholder's element tree is gone"
+        );
+        // one protocol filter, one entry: the TCP claim is not listed
+        assert_eq!(listing.matches("<p:PortMappingEntry>").count(), 2);
+        // the cap still bounds the listing (NewNumberOfPorts)
+        let capped = facade
+            .list_port_mappings(5000, 6000, None, 1)
+            .await
+            .expect("a capped range lists");
+        assert_eq!(capped.matches("<p:PortMappingEntry>").count(), 1);
+        assert!(capped.contains("<p:NewProtocol>UDP</p:NewProtocol>"));
+
+        // the range refusals the spec requires: 730 on an empty range for
+        // both range actions (2.5.19.2, 2.5.21.3)
+        assert_eq!(
+            facade.list_port_mappings(6001, 7000, None, 0).await,
+            Err(UpnpErr::PortMappingNotFound)
+        );
+        assert_eq!(
+            facade.delete_mapping_range(6001, 7000, Proto::Udp).await,
+            Err(UpnpErr::PortMappingNotFound)
+        );
+        assert_eq!(
+            facade.delete_mapping_range(5000, 6000, Proto::Tcp).await,
+            Ok(String::new()),
+            "the TCP entry in range is deleted"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn restored_grant_revoke_frees_socket() {
         // Regression (review C1): main's slot loop skips granted leases in
@@ -4468,6 +4689,61 @@ mod ifindex_probe {
             !r.contains("<errorCode>606</errorCode>"),
             "authorized v2 reaches the engine: {}",
             &r[..r.len().min(300)]
+        );
+
+        // the v2 range actions answer the spec's own 7xx codes rather than
+        // a generic failure: an empty range is 730 PortMappingNotFound
+        // (2.5.19.2, 2.5.21.3) and a crossed range is 733
+        // InconsistentParameters (2.5.19.6, 2.5.21.7)
+        let r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#DeletePortMappingRange",
+            &format!("{}DeletePortMappingRange xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewStartPort>5000</NewStartPort><NewEndPort>6000</NewEndPort><NewProtocol>UDP</NewProtocol><NewManage>0</NewManage></DeletePortMappingRange></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>730</errorCode>"),
+            "an empty delete range is 730: {}",
+            &r[..r.len().min(300)]
+        );
+        let r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#GetListOfPortMappings",
+            &format!("{}GetListOfPortMappings xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewStartPort>5000</NewStartPort><NewEndPort>6000</NewEndPort><NewProtocol>UDP</NewProtocol><NewManage>0</NewManage><NewNumberOfPorts>0</NewNumberOfPorts></GetListOfPortMappings></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>730</errorCode>"),
+            "an empty listing is 730: {}",
+            &r[..r.len().min(300)]
+        );
+        let r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#DeletePortMappingRange",
+            &format!("{}DeletePortMappingRange xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewStartPort>6000</NewStartPort><NewEndPort>5000</NewEndPort><NewProtocol>UDP</NewProtocol><NewManage>0</NewManage></DeletePortMappingRange></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>733</errorCode>"),
+            "a crossed range is 733: {}",
+            &r[..r.len().min(300)]
+        );
+        // the AddAnyPortMapping wildcard asks for any free port rather than
+        // being a malformed request: it reaches the engine (which allocates
+        // 1024 from the wildcard and then fails on nft here, 501) where the
+        // placeholder answered 402 without consulting anything. The in-LAN
+        // client is this test's loopback LAN, so the engine's own
+        // containment check is not what refuses it.
+        let r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#AddAnyPortMapping",
+            &format!("{}AddAnyPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewRemoteHost></NewRemoteHost><NewExternalPort>0</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>12399</NewInternalPort><NewInternalClient>127.0.0.1</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>dp-wire-any</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration></AddAnyPortMapping></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>501</errorCode>"),
+            "the wildcard reaches the engine: {}",
+            &r[..r.len().min(700)]
         );
 
         // UserLogout closes the session: GetACLData is 606 again
