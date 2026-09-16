@@ -2141,30 +2141,71 @@ const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
 </scpd>
 "#;
 
-/// plan/0008: the DeviceProtection:1 SCPD (gated route data). The
-/// service is exercised only once its complete implementation lands at
-/// the #v2-service-set task (R5: no carve-outs); this carries the
-/// specification's full action surface and the state variables declared
-/// per the field research annex. Argument tables are transcribed from
-/// the normative DeviceProtection:1 spec at that task's gate.
+/// DeviceProtection:1 service description (urn:schemas-upnp-org:service:DeviceProtection:1).
+/// The action surface is transcribed from the normative spec
+/// (docs/upnp-dp1/UPnP-gw-DeviceProtection-V1-Service.md, sections 2.6.1-2.6.13):
+/// thirteen actions, every argument table per the spec. Earlier
+/// miniupnpd-derived names (RequestUserLogin, ValidateIdentity, AddACLEntry,
+/// LoginWithPIN, ...) were wrong and are superseded. The Kani gate verifies
+/// this document carries exactly the authoritative action names.
 const SCPD_DP: &str = r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
 <actionList>
-<action><name>GetSupportedProtocols</name></action>
-<action><name>GetAssignedRoles</name></action>
-<action><name>RequestUserLogin</name></action>
-<action><name>ValidateIdentity</name></action>
-<action><name>SendSetupMessage</name></action>
-<action><name>GetACLData</name></action>
-<action><name>AddACLEntry</name></action>
-<action><name>RemoveACLEntry</name></action>
-<action><name>GetListOfRoles</name></action>
-<action><name>RevokeRole</name></action>
-<action><name>GetRolesForAction</name></action>
-<action><name>GetUserLoginChallenge</name></action>
-<action><name>LoginWithPIN</name></action>
-<action><name>LoginWithThirdParty</name></action>
+<action><name>SendSetupMessage</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>InMessage</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>OutMessage</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetSupportedProtocols</name><argumentList>
+<argument><name>ProtocolList</name><direction>out</direction><relatedStateVariable>SupportedProtocols</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetAssignedRoles</name><argumentList>
+<argument><name>RoleList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetRolesForAction</name><argumentList>
+<argument><name>DeviceUDN</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>ServiceId</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>ActionName</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>RoleList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>RestrictedRoleList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetUserLoginChallenge</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Name</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Salt</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>Challenge</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>UserLogin</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Challenge</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>Authenticator</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>UserLogout</name></action>
+<action><name>GetACLData</name><argumentList>
+<argument><name>ACL</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ACL</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>AddIdentityList</name><argumentList>
+<argument><name>IdentityList</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_IdentityList</relatedStateVariable></argument>
+<argument><name>IdentityListResult</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_IdentityList</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>RemoveIdentity</name><argumentList>
+<argument><name>Identity</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Identity</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>SetUserLoginPassword</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Name</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Stored</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>Salt</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>AddRolesForIdentity</name><argumentList>
+<argument><name>Identity</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Identity</relatedStateVariable></argument>
+<argument><name>RoleList</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>RemoveRolesForIdentity</name><argumentList>
+<argument><name>Identity</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Identity</relatedStateVariable></argument>
+<argument><name>RoleList</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
 </actionList>
 <serviceStateTable>
 <stateVariable sendEvents="yes"><name>SetupReady</name><dataType>boolean</dataType></stateVariable>
@@ -2918,22 +2959,33 @@ mod tests {
         assert!(wip2.contains("GetListOfPortMappings"));
         let dp = String::from_utf8_lossy(SCPD_DP.as_bytes());
         for a in [
+            "SendSetupMessage",
             "GetSupportedProtocols",
             "GetAssignedRoles",
+            "GetRolesForAction",
+            "GetUserLoginChallenge",
+            "UserLogin",
+            "UserLogout",
+            "GetACLData",
+            "AddIdentityList",
+            "RemoveIdentity",
+            "SetUserLoginPassword",
+            "AddRolesForIdentity",
+            "RemoveRolesForIdentity",
+        ] {
+            assert!(dp.contains(a), "DP SCPD must declare {}", a);
+        }
+        for a in [
             "RequestUserLogin",
             "ValidateIdentity",
-            "SendSetupMessage",
-            "GetACLData",
             "AddACLEntry",
             "RemoveACLEntry",
             "GetListOfRoles",
             "RevokeRole",
-            "GetRolesForAction",
-            "GetUserLoginChallenge",
             "LoginWithPIN",
             "LoginWithThirdParty",
         ] {
-            assert!(dp.contains(a), "DP SCPD must declare {}", a);
+            assert!(!dp.contains(a), "DP SCPD must not carry {}", a);
         }
         assert!(dp.contains("SetupReady"), "DP SetupReady state var");
     }
