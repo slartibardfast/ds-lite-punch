@@ -1398,6 +1398,49 @@ async fn handle_soap(
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetConnectionTypeInfo,
             ) => Ok(facade.get_connection_type_info()),
+            // The line is auto-configured (the ISP owns the ds-lite WAN),
+            // so ConnectionType is read-only: 2.5.1's note that it may be,
+            // and the code 2.5.23 names for a SetConnectionType that
+            // cannot set it.
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::SetConnectionType,
+            ) => Err(UpnpErr::ReadOnly),
+            // RequestConnection: its precondition (2.5.3.4) is a status of
+            // Disconnected, PendingDisconnect or Connected with an
+            // IP_Routed type, and its effect (2.5.3.5) is Connected. When
+            // the facade holds an external tuple both already hold, so the
+            // action succeeds; with no tuple the provider side is not up,
+            // which is the 704 ConnectionSetupFailed of 2.5.3.6.
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::RequestConnection,
+            ) => {
+                if facade.external_ip().is_some() {
+                    Ok(String::new())
+                } else {
+                    Err(UpnpErr::ConnectionSetupFailed)
+                }
+            }
+            // ForceTermination is refused, deliberately. The facade does
+            // not own the WAN lifetime (netifd and the ISP do), and the
+            // action is public on the v1 face, so honouring it would hand
+            // every LAN device a lever that drops the household line for
+            // every client. 501 is the UDA generic failure; the spec's own
+            // table offers no code for a device that may not terminate.
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::ForceTermination,
+            ) => Err(UpnpErr::ActionFailed),
+            // GetNATRSIPStatus: the facade performs NAT (1) and this line
+            // runs no RSIP server (0), per the variables of 2.3.11/2.3.12
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::GetNatRsipStatus,
+            ) => Ok(String::from(
+                "<NewRSIPAvailable>0</NewRSIPAvailable>\
+                 <NewNATEEnabled>1</NewNATEEnabled>",
+            )),
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::AddPortMapping,
@@ -2888,30 +2931,11 @@ const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
 <argument><name>NewPossibleConnectionTypes</name><direction>out</direction><relatedStateVariable>PossibleConnectionTypes</relatedStateVariable></argument>
 </argumentList></action>
 <action><name>RequestConnection</name></action>
-<action><name>RequestTermination</name></action>
 <action><name>ForceTermination</name></action>
-<action><name>SetAutoDisconnectTime</name><argumentList>
-<argument><name>NewAutoDisconnectTime</name><direction>in</direction><relatedStateVariable>AutoDisconnectTime</relatedStateVariable></argument>
-</argumentList></action>
-<action><name>SetIdleDisconnectTime</name><argumentList>
-<argument><name>NewIdleDisconnectTime</name><direction>in</direction><relatedStateVariable>IdleDisconnectTime</relatedStateVariable></argument>
-</argumentList></action>
-<action><name>SetWarnDisconnectDelay</name><argumentList>
-<argument><name>NewWarnDisconnectDelay</name><direction>in</direction><relatedStateVariable>WarnDisconnectDelay</relatedStateVariable></argument>
-</argumentList></action>
 <action><name>GetStatusInfo</name><argumentList>
 <argument><name>NewConnectionStatus</name><direction>out</direction><relatedStateVariable>ConnectionStatus</relatedStateVariable></argument>
 <argument><name>NewLastConnectionError</name><direction>out</direction><relatedStateVariable>LastConnectionError</relatedStateVariable></argument>
 <argument><name>NewUptime</name><direction>out</direction><relatedStateVariable>Uptime</relatedStateVariable></argument>
-</argumentList></action>
-<action><name>GetAutoDisconnectTime</name><argumentList>
-<argument><name>NewAutoDisconnectTime</name><direction>out</direction><relatedStateVariable>AutoDisconnectTime</relatedStateVariable></argument>
-</argumentList></action>
-<action><name>GetIdleDisconnectTime</name><argumentList>
-<argument><name>NewIdleDisconnectTime</name><direction>out</direction><relatedStateVariable>IdleDisconnectTime</relatedStateVariable></argument>
-</argumentList></action>
-<action><name>GetWarnDisconnectDelay</name><argumentList>
-<argument><name>NewWarnDisconnectDelay</name><direction>out</direction><relatedStateVariable>WarnDisconnectDelay</relatedStateVariable></argument>
 </argumentList></action>
 <action><name>GetNATRSIPStatus</name><argumentList>
 <argument><name>NewRSIPAvailable</name><direction>out</direction><relatedStateVariable>RSIPAvailable</relatedStateVariable></argument>
@@ -4066,9 +4090,9 @@ mod tests {
         // than the literal's formatting
         let wip2_flat: String = wip2.chars().filter(|c| !c.is_whitespace()).collect();
         // the WIP2 transcription (docs/upnp-wip2/TRANSCRIPTION.md): the
-        // twenty-one actions of the spec's table 2-10, each with its
-        // argument table, so a published description that names an action
-        // without describing it fails here
+        // the fourteen actions the spec's table 2-10 marks REQUIRED of a
+        // device, each with its argument table, so a published
+        // description that names an action without describing it fails
         for (action, args) in [
             ("SetConnectionType", vec![("NewConnectionType", "in", "ConnectionType")]),
             (
@@ -4079,11 +4103,7 @@ mod tests {
                 ],
             ),
             ("RequestConnection", vec![]),
-            ("RequestTermination", vec![]),
             ("ForceTermination", vec![]),
-            ("SetAutoDisconnectTime", vec![("NewAutoDisconnectTime", "in", "AutoDisconnectTime")]),
-            ("SetIdleDisconnectTime", vec![("NewIdleDisconnectTime", "in", "IdleDisconnectTime")]),
-            ("SetWarnDisconnectDelay", vec![("NewWarnDisconnectDelay", "in", "WarnDisconnectDelay")]),
             (
                 "GetStatusInfo",
                 vec![
@@ -4092,9 +4112,6 @@ mod tests {
                     ("NewUptime", "out", "Uptime"),
                 ],
             ),
-            ("GetAutoDisconnectTime", vec![("NewAutoDisconnectTime", "out", "AutoDisconnectTime")]),
-            ("GetIdleDisconnectTime", vec![("NewIdleDisconnectTime", "out", "IdleDisconnectTime")]),
-            ("GetWarnDisconnectDelay", vec![("NewWarnDisconnectDelay", "out", "WarnDisconnectDelay")]),
             (
                 "GetNATRSIPStatus",
                 vec![
@@ -4251,9 +4268,29 @@ mod tests {
         );
         assert_eq!(
             wip2.matches("<action>").count(),
-            21,
-            "the spec's table 2-10 lists twenty-one actions"
+            14,
+            "the spec's table 2-10 marks fourteen actions REQUIRED of a device"
         );
+        // the seven OPTIONAL actions of table 2-10 are not implemented, so
+        // they must not be advertised: a device that published them would
+        // be promising a disconnect the ISP-managed line cannot make. A CP
+        // that invokes one gets 401 Invalid Action, which is the UDA
+        // answer for an action outside the published service.
+        for optional in [
+            "RequestTermination",
+            "SetAutoDisconnectTime",
+            "SetIdleDisconnectTime",
+            "SetWarnDisconnectDelay",
+            "GetAutoDisconnectTime",
+            "GetIdleDisconnectTime",
+            "GetWarnDisconnectDelay",
+        ] {
+            assert!(
+                !wip2_flat.contains(&format!("<action><name>{}</name>", optional)),
+                "{} is optional in table 2-10 and is not implemented, so it must not be advertised",
+                optional
+            );
+        }
         assert_eq!(
             wip2.matches("<stateVariable ").count(),
             23,
@@ -4408,8 +4445,8 @@ mod tests {
         );
         assert_eq!(
             body.matches("<action>").count(),
-            21,
-            "the v2 mount publishes the transcribed 21-action surface"
+            14,
+            "the v2 mount publishes the fourteen REQUIRED actions of table 2-10"
         );
         let (ok, body) = get("/igd/v2/DP.xml").await;
         assert!(
@@ -4581,6 +4618,7 @@ mod tests {
             "the deferred ssdp:all and the explicit :2 are both answered"
         );
     }
+
 }
 
 #[cfg(test)]
@@ -5148,5 +5186,175 @@ mod ifindex_probe {
         assert_eq!(reloaded.acl.identities.len(), 1);
         assert_eq!(reloaded.session_roles("192.168.21.5".parse().unwrap(), 2000).len(), 0);
         let _ = std::fs::remove_dir_all(dir);
+    }
+    /// The connection-control actions of the required WANIPConnection:2
+    /// surface at the wire: the auto-configured line answers
+    /// SetConnectionType with 731 ReadOnly, reports NAT on and RSIP off,
+    /// refuses ForceTermination instead of handing every LAN client a
+    /// lever on the household line, and treats RequestConnection as the
+    /// success it is while the external tuple is present, with 704
+    /// ConnectionSetupFailed when it is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wip2_connection_actions_wire() {
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/wip2-conn".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "wip2-conn".into(),
+            grace_secs: 60,
+        };
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                4,
+                2,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::new(87, 116, 31, 222)).0,
+            )),
+            entries: Mutex::new(Vec::new()),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            // the tuple watch holds the AFTR address: the line is up
+            ip_rx: watch::channel(Ipv4Addr::new(87, 116, 31, 222)).1,
+            udn: String::from("wip2-conn"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let f2 = facade.clone();
+        tokio::spawn(async move {
+            let _ = http_serve(listener, f2).await;
+        });
+        let addr_s = format!("127.0.0.1:{}", addr.port());
+        let env = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:";
+        let urn = "urn:schemas-upnp-org:service:WANIPConnection:2";
+        // SetConnectionType: the connection type is auto-configured and
+        // therefore read-only (2.5.1), so the answer is the spec's 731
+        let r = soap_post(
+            &addr_s,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#SetConnectionType",
+            &format!(
+                "{}SetConnectionType xmlns:u=\"{}\"<NewConnectionType>IP_Routed</NewConnectionType></SetConnectionType></s:Body></s:Envelope>",
+                env, urn
+            ),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>731</errorCode>"),
+            "an auto-configured connection type is read-only: {}",
+            &r[..r.len().min(400)]
+        );
+
+        // GetNATRSIPStatus: NAT on, RSIP off
+        let r = soap_post(
+            &addr_s,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#GetNATRSIPStatus",
+            &format!(
+                "{}GetNATRSIPStatus xmlns:u=\"{}\"/></s:Body></s:Envelope>",
+                env, urn
+            ),
+        )
+        .await;
+        assert!(
+            r.contains("<NewRSIPAvailable>0</NewRSIPAvailable>")
+                && r.contains("<NewNATEEnabled>1</NewNATEEnabled>"),
+            "RSIP off and NAT on: {}",
+            &r[..r.len().min(500)]
+        );
+
+        // RequestConnection while the tuple is present: the precondition
+        // and the effect of 2.5.3 both already hold, so it succeeds
+        let r = soap_post(
+            &addr_s,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#RequestConnection",
+            &format!("{}RequestConnection xmlns:u=\"{}\"/></s:Body></s:Envelope>", env, urn),
+        )
+        .await;
+        assert!(
+            r.contains("200 OK") && !r.contains("<errorCode>"),
+            "an up line answers RequestConnection with success: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // ForceTermination is refused: the facade does not own the WAN
+        // lifetime, and the v1 face would let any LAN device drop it
+        let r = soap_post(
+            &addr_s,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#ForceTermination",
+            &format!("{}ForceTermination xmlns:u=\"{}\"/></s:Body></s:Envelope>", env, urn),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>501</errorCode>"),
+            "the household line is not a LAN device's to drop: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // the same surface with no external tuple: RequestConnection now
+        // reports the provider-side failure the spec names for it
+        let mut f3 = UpnpFacade {
+            cfg: UpnpConfig {
+                lan_ip: Ipv4Addr::LOCALHOST,
+                upnp_port: 0,
+                bind_ip: Ipv4Addr::LOCALHOST,
+                state_dir: "/tmp/wip2-conn-down".into(),
+                servers: Vec::new(),
+                interval: Duration::from_secs(2),
+                name: "wip2-conn-down".into(),
+                grace_secs: 60,
+            },
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                4,
+                2,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::UNSPECIFIED).0,
+            )),
+            entries: Mutex::new(Vec::new()),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::UNSPECIFIED).1,
+            udn: String::from("wip2-conn-down"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+        };
+        f3.cfg.upnp_port = 0;
+        let down = Arc::new(f3);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_down = listener.local_addr().unwrap();
+        let f4 = down.clone();
+        tokio::spawn(async move {
+            let _ = http_serve(listener, f4).await;
+        });
+        let addr_down_s = format!("127.0.0.1:{}", addr_down.port());
+        let r = soap_post(
+            &addr_down_s,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#RequestConnection",
+            &format!("{}RequestConnection xmlns:u=\"{}\"/></s:Body></s:Envelope>", env, urn),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>704</errorCode>") && r.contains("ConnectionSetupFailed"),
+            "no tuple means the provider side is not up: {}",
+            &r[..r.len().min(400)]
+        );
     }
 }

@@ -132,26 +132,47 @@ does not re-initiate a mapping; the control point refreshes before expiry
 
 ## The actions (table 2-10, sections 2.5.1 to 2.5.21)
 
-Twenty-one actions. Every one is REQUIRED of the device in table 2-10. The
-argument tables below are transcribed from table 2-11 (common parameters) and
-each action's own table; every one is confirmed against the section 4
-`<scpd>` fragments where those are legible.
+The service defines twenty-one actions, and table 2-10's device column splits
+them: **fourteen are REQUIRED** of a device and **seven are OPTIONAL**. A
+device implements the required set and MAY omit an optional one, and the SCPD
+is the description of what the device implements, so the seven optional
+actions are neither advertised nor dispatched here. A control point that
+invokes one receives 401 Invalid Action, which is the UDA answer for an
+action outside the published service.
+
+The seven OMITTED actions, each marked `O` in table 2-10's device column:
+
+| Action | Why it is omitted here |
+|---|---|
+| RequestTermination | it would tear down the household line, which this device does not own |
+| SetAutoDisconnectTime | the disconnect timers act only on a connection the device manages |
+| SetIdleDisconnectTime | the same |
+| SetWarnDisconnectDelay | the same |
+| GetAutoDisconnectTime | it reads back a timer this device never sets |
+| GetIdleDisconnectTime | the same |
+| GetWarnDisconnectDelay | the same |
+
+Publishing a timer the device would not act on, or a termination it cannot
+perform, would be a promise the facade cannot keep. The required fourteen are
+all dispatched, and their argument tables below are transcribed from table
+2-11 (common parameters) and each action's own table, each confirmed against
+the section 4 `<scpd>` fragments where those are legible.
 
 | # | Action | Arguments (in / out) | Table |
 |---|---|---|---|
 | 1 | SetConnectionType | NewConnectionType in | 2-12 |
 | 2 | GetConnectionTypeInfo | NewConnectionType out, NewPossibleConnectionTypes out | 2-13 |
 | 3 | RequestConnection | (none) | 2.5.3.1 |
-| 4 | RequestTermination | (none) | 2.5.4.1 |
+| 4 | ~~RequestTermination~~ (optional, omitted) | (none) | 2.5.4.1 |
 | 5 | ForceTermination | (none) | 2.5.5.1 |
-| 6 | SetAutoDisconnectTime | NewAutoDisconnectTime in | 2-2x |
-| 7 | SetIdleDisconnectTime | NewIdleDisconnectTime in | 2-2x |
-| 8 | SetWarnDisconnectDelay | NewWarnDisconnectDelay in | 2-2x |
+| 6 | ~~SetAutoDisconnectTime~~ (optional, omitted) | NewAutoDisconnectTime in | 2-19 |
+| 7 | ~~SetIdleDisconnectTime~~ (optional, omitted) | NewIdleDisconnectTime in | 2-21 |
+| 8 | ~~SetWarnDisconnectDelay~~ (optional, omitted) | NewWarnDisconnectDelay in | 2-23 |
 | 9 | GetStatusInfo | NewConnectionStatus out, NewLastConnectionError out, NewUptime out | 2-2x |
-| 10 | GetAutoDisconnectTime | NewAutoDisconnectTime out | 2-2x |
-| 11 | GetIdleDisconnectTime | NewIdleDisconnectTime out | 2-2x |
-| 12 | GetWarnDisconnectDelay | NewWarnDisconnectDelay out | 2-2x |
-| 13 | GetNATRSIPStatus | NewRSIPAvailable out, NewNATEEnabled out | 2-2x |
+| 10 | ~~GetAutoDisconnectTime~~ (optional, omitted) | NewAutoDisconnectTime out | 2-26 |
+| 11 | ~~GetIdleDisconnectTime~~ (optional, omitted) | NewIdleDisconnectTime out | 2-28 |
+| 12 | ~~GetWarnDisconnectDelay~~ (optional, omitted) | NewWarnDisconnectDelay out | 2-30 |
+| 13 | GetNATRSIPStatus | NewRSIPAvailable out, NewNATEEnabled out | 2-32 |
 | 14 | GetGenericPortMappingEntry | NewPortMappingIndex in; NewRemoteHost, NewExternalPort, NewProtocol, NewInternalPort, NewInternalClient, NewEnabled, NewPortMappingDescription, NewLeaseDuration out | 2-32 |
 | 15 | GetSpecificPortMappingEntry | NewRemoteHost, NewExternalPort, NewProtocol in; NewInternalPort, NewInternalClient, NewEnabled, NewPortMappingDescription, NewLeaseDuration out | 2-34 |
 | 16 | AddPortMapping | NewRemoteHost, NewExternalPort, NewProtocol, NewInternalPort, NewInternalClient, NewEnabled, NewPortMappingDescription, NewLeaseDuration in | 2-36 |
@@ -166,6 +187,32 @@ each action's own table; every one is confirmed against the section 4
 (2.5.21.1). `NewStartPort` MUST be less than or equal to `NewEndPort`, and
 `NewEndPort` MUST be greater than or equal to `NewStartPort` (table 2-11); a
 violation is 733 `InconsistentParameters` (2.5.19.6, 2.5.21.7).
+
+### The connection-control actions
+
+The required group that acts on the connection rather than on the mapping
+table, and what this device answers, each with the section that decides it:
+
+- **SetConnectionType**: section 2.5.1 notes that `ConnectionType` may be
+  read-only "in cases where some form of auto configuration is employed", and
+  this line is auto-configured (the ISP owns the ds-lite WAN). The device
+  answers 731 `ReadOnly`, the code the error summary of 2.5.23 names for this
+  action.
+- **RequestConnection**: 2.5.3.4 requires a `ConnectionStatus` of
+  Disconnected, PendingDisconnect or Connected with an `IP_Routed` type, and
+  2.5.3.5 makes the effect Connected. When the facade holds an external tuple
+  both already hold, so the action succeeds with an empty response; when no
+  tuple is held the provider side is not up and the answer is 704
+  `ConnectionSetupFailed` (2.5.3.6).
+- **ForceTermination**: refused with 501 `Action Failed`. The facade does not
+  own the WAN lifetime (netifd and the ISP do), and the action is public on
+  the v1 face, so honouring it would hand every device on the LAN a lever
+  that drops the line for every client. The specification's table for the
+  action (2.5.5.6) has no code for a device that may not terminate, so the
+  UDA generic failure is the answer; a CP that requires termination needs a
+  device that manages its own connection.
+- **GetNATRSIPStatus**: `RSIPAvailable` 0 (`lo` has no RSIP server,
+  2.3.11) and `NATEEnabled` 1 (the facade performs the NAT, 2.3.12).
 
 ## The v2-only actions
 
@@ -335,6 +382,14 @@ reassembled from the clean argument tables of section 2.5 and the state
 variable definitions of section 2.3, with the fragments used as corroboration:
 the eventing attributes, the allowed value lists, the ranges and the argument
 directions each appear in the fragments and are reproduced here.
+
+The document below is the specification's, with all twenty-one actions. The
+SCPD this device publishes is the projection that table 2-10's device column
+licenses: the fourteen REQUIRED actions and the full state table, with the
+seven OPTIONAL actions absent (listed above). Three state variables,
+`AutoDisconnectTime`, `IdleDisconnectTime` and `WarnDisconnectDelay`, are read
+only by those seven and are declared here with their defaults, so the
+published state table is the service's own.
 
 ```xml
 <?xml version="1.0"?>
@@ -507,6 +562,16 @@ carried:
 5. A state table that marked every variable `sendEvents="no"`, which would have
    hidden the eventing of `SystemUpdateID` and `PortMappingNumberOfEntries` and
    contradicted the evented-together rule of 2.4.4 and 2.4.5.
+
+6. The action count. The first transcription carried the service's
+   twenty-one actions and asserted that every one is REQUIRED of the device.
+   Table 2-10 says otherwise: fourteen are REQUIRED and seven are OPTIONAL,
+   and the facade implemented neither group completely. The seven optional
+   actions are now omitted from the published SCPD as well as from the
+   dispatch (they are enumerated above), and the four required actions that
+   had no dispatch arm (SetConnectionType, RequestConnection,
+   ForceTermination, GetNATRSIPStatus) now have one, each with the section
+   cited in "The connection-control actions".
 
 The PortListing fragment emitted by `list_port_mappings` is corrected in the
 same pass: it produced `<NewPortListing>` elements named

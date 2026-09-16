@@ -564,6 +564,12 @@ pub enum SoapAction {
     GetExternalIpAddress,
     GetStatusInfo,
     GetConnectionTypeInfo,
+    // the rest of the WANIPConnection:2 required surface (table 2-10's
+    // R column): the connection control actions and the RSIP/NAT report
+    SetConnectionType,
+    RequestConnection,
+    ForceTermination,
+    GetNatRsipStatus,
     AddPortMapping,
     DeletePortMapping,
     GetSpecificPortMappingEntry,
@@ -594,6 +600,10 @@ pub fn soap_action_name(a: SoapAction) -> &'static [u8] {
         SoapAction::GetExternalIpAddress => b"GetExternalIPAddress",
         SoapAction::GetStatusInfo => b"GetStatusInfo",
         SoapAction::GetConnectionTypeInfo => b"GetConnectionTypeInfo",
+        SoapAction::SetConnectionType => b"SetConnectionType",
+        SoapAction::RequestConnection => b"RequestConnection",
+        SoapAction::ForceTermination => b"ForceTermination",
+        SoapAction::GetNatRsipStatus => b"GetNATRSIPStatus",
         SoapAction::AddPortMapping => b"AddPortMapping",
         SoapAction::DeletePortMapping => b"DeletePortMapping",
         SoapAction::GetSpecificPortMappingEntry => b"GetSpecificPortMappingEntry",
@@ -637,6 +647,10 @@ pub fn parse_soap_action(hdr: &[u8]) -> Option<SoapAction> {
         SoapAction::GetExternalIpAddress,
         SoapAction::GetStatusInfo,
         SoapAction::GetConnectionTypeInfo,
+        SoapAction::SetConnectionType,
+        SoapAction::RequestConnection,
+        SoapAction::ForceTermination,
+        SoapAction::GetNatRsipStatus,
         SoapAction::AddPortMapping,
         SoapAction::DeletePortMapping,
         SoapAction::GetSpecificPortMappingEntry,
@@ -888,6 +902,14 @@ pub enum UpnpErr {
     /// 733 InconsistentParameters (the range endpoints disagree, the same
     /// sections 2.5.19.6 and 2.5.21.7).
     InconsistentParameters,
+    /// 731 ReadOnly (the connection type is auto-configured, so
+    /// SetConnectionType cannot set it: 2.5.1's read-only note, and the
+    /// code the error summary of 2.5.23 names for that action).
+    ReadOnly,
+    /// 704 ConnectionSetupFailed (WANIPConnection's own reading of 704,
+    /// 2.5.3.6; the code is shared with DeviceProtection's Processing
+    /// Error, and the description is the service's).
+    ConnectionSetupFailed,
     /// 600 Argument Value Invalid (DeviceProtection: 2.6.15).
     InvalidValue,
     /// 606 Action not authorized (DeviceProtection: 2.6.5.10 and the
@@ -930,6 +952,14 @@ pub const FAULT_INCONSISTENT_PARAMETERS: UpnpFault = UpnpFault {
     code: 733,
     desc: "InconsistentParameters",
 };
+pub const FAULT_READ_ONLY: UpnpFault = UpnpFault {
+    code: 731,
+    desc: "ReadOnly",
+};
+pub const FAULT_CONNECTION_SETUP_FAILED: UpnpFault = UpnpFault {
+    code: 704,
+    desc: "ConnectionSetupFailed",
+};
 pub const FAULT_INVALID_VALUE: UpnpFault = UpnpFault {
     code: 600,
     desc: "Argument Value Invalid",
@@ -954,6 +984,8 @@ pub fn fault_of(e: UpnpErr) -> UpnpFault {
         UpnpErr::ActionFailed => FAULT_ACTION_FAILED,
         UpnpErr::PortMappingNotFound => FAULT_PORT_MAPPING_NOT_FOUND,
         UpnpErr::InconsistentParameters => FAULT_INCONSISTENT_PARAMETERS,
+        UpnpErr::ReadOnly => FAULT_READ_ONLY,
+        UpnpErr::ConnectionSetupFailed => FAULT_CONNECTION_SETUP_FAILED,
         UpnpErr::InvalidValue => FAULT_INVALID_VALUE,
         UpnpErr::NotAuthorized => FAULT_NOT_AUTHORIZED,
         UpnpErr::AuthFailure => FAULT_AUTH_FAILURE,
@@ -1473,6 +1505,9 @@ mod tests {
         // service's (sections 2.5.19.6 and 2.5.21.7)
         assert_eq!(fault_of(UpnpErr::PortMappingNotFound).code, 730);
         assert_eq!(fault_of(UpnpErr::InconsistentParameters).code, 733);
+        assert_eq!(fault_of(UpnpErr::ReadOnly).code, 731);
+        assert_eq!(fault_of(UpnpErr::ConnectionSetupFailed).code, 704);
+        assert_eq!(fault_of(UpnpErr::ConnectionSetupFailed).desc, "ConnectionSetupFailed");
     }
 
     #[test]
