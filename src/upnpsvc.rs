@@ -1479,23 +1479,22 @@ async fn handle_soap(
     };
     // plan/0008 section 26.22: the containment the spec recommends for
     // unauthenticated control points (2.5.16.2, 2.5.18.2, 2.5.14.2,
-    // 2.5.21.3), applied where the caller has a remedy. A live Basic (or
-    // Admin) DeviceProtection session is the lift, and only the v2 face can
-    // hold one, since the DP service is mounted there. So a request that
-    // names another host is refused on either face, while the port floor and
-    // the read containment bind the v2 face, where a control point can
-    // authenticate to lift them; the v1 face keeps whole reads so that
-    // anonymous LAN diagnostics (upnpc -l) still see the table.
+    // 2.5.21.3). One view serves reads and writes alike, because the
+    // address clause needs no remedy on either side of that line: a caller
+    // without the lift may name, see, enumerate and delete only its own
+    // host, and the port floor binds the v2 face, where the DP session that
+    // lifts it is established. A lift is a principal's roles rather than a
+    // face's, so a control point that authenticates over DeviceProtection
+    // reaches the whole table on either face; a caller that never
+    // authenticates sees only its own mappings.
     let lift = facade.dp_holds_lift(client_ip, Epoch::now());
-    let write_view = if lift {
+    let view = if lift {
         None
     } else {
-        Some(Contain { caller: client_ip, high_port: v2 })
-    };
-    let read_view = if v2 && !lift {
-        Some(Contain { caller: client_ip, high_port: true })
-    } else {
-        None
+        Some(Contain {
+            caller: client_ip,
+            high_port: v2,
+        })
     };
     let result: Result<String, UpnpErr> = match gated {
         Err(e) => Err(e),
@@ -1573,7 +1572,7 @@ async fn handle_soap(
                                 lifetime,
                                 desc: parse_desc(body),
                             },
-                            write_view,
+                            view,
                         )
                         .await
                 }
@@ -1583,21 +1582,21 @@ async fn handle_soap(
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::DeletePortMapping,
             ) => match parse_delete_args(body) {
-                Ok((ext, proto)) => facade.delete_mapping(ext, proto, write_view).await,
+                Ok((ext, proto)) => facade.delete_mapping(ext, proto, view).await,
                 Err(e) => Err(e),
             },
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetSpecificPortMappingEntry,
             ) => match parse_delete_args(body) {
-                Ok((ext, proto)) => facade.get_specific(ext, proto, read_view).await,
+                Ok((ext, proto)) => facade.get_specific(ext, proto, view).await,
                 Err(e) => Err(e),
             },
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetGenericPortMappingEntry,
             ) => match parse_index_arg(body) {
-                Ok(i) => facade.get_generic(i, read_view).await,
+                Ok(i) => facade.get_generic(i, view).await,
                 Err(e) => Err(e),
             },
             // WIP2-only surface (plan/0008 #v2-service-set). The engine is
@@ -1620,7 +1619,7 @@ async fn handle_soap(
                                     lifetime,
                                     desc: parse_desc(body),
                                 },
-                                write_view,
+                                view,
                             )
                             .await
                     }
@@ -1630,7 +1629,7 @@ async fn handle_soap(
             (SoapService::WanIpConnection, SoapAction::DeletePortMappingRange) => {
                 match parse_range_args(body) {
                     Ok((start, end, proto)) => {
-                        facade.delete_mapping_range(start, end, proto, write_view).await
+                        facade.delete_mapping_range(start, end, proto, view).await
                     }
                     Err(e) => Err(e),
                 }
@@ -1638,7 +1637,7 @@ async fn handle_soap(
             (SoapService::WanIpConnection, SoapAction::GetListOfPortMappings) => {
                 match parse_list_args(body) {
                     Ok((start, end, proto, max)) => {
-                        facade.list_port_mappings(start, end, proto, max, read_view).await
+                        facade.list_port_mappings(start, end, proto, max, view).await
                     }
                     Err(e) => Err(e),
                 }
@@ -5239,7 +5238,19 @@ mod ifindex_probe {
             cfg,
             table,
             publisher,
-            entries: Mutex::new(Vec::new()),
+            // one entry belonging to another host, so the read containment
+            // has something to hide. It sits outside every port range this
+            // test drives, which keeps the empty-range refusals empty.
+            entries: Mutex::new(vec![FacadeEntry {
+                req_ext: 20500,
+                proto: Proto::Udp,
+                client: Ipv4Addr::new(192, 168, 21, 50),
+                int_port: 20500,
+                bind_port: 30009,
+                granted_lifetime: 3600,
+                expires_at_unix: Epoch::now() + 600,
+                desc: String::from("other-host"),
+            }]),
             tasks: Mutex::new(HashMap::new()),
             gena: Mutex::new(GenaState::default()),
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
@@ -5352,6 +5363,43 @@ mod ifindex_probe {
             &r[..r.len().min(400)]
         );
 
+        // the containment covers reads as well as writes, on both faces
+        // (2.5.14.2, 2.5.21.3): another host's entry is forbidden rather
+        // than invisible-by-accident, and the enumeration's index space is
+        // what the caller may see, so its walk ends at index 0
+        for face in ["1", "2"] {
+            r = soap_post(
+                &addr,
+                "/ctl/IPConn",
+                &format!(
+                    "urn:schemas-upnp-org:service:WANIPConnection:{}#GetSpecificPortMappingEntry",
+                    face
+                ),
+                &format!(
+                    "{}GetSpecificPortMappingEntry xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:{}\"><NewRemoteHost></NewRemoteHost><NewExternalPort>20500</NewExternalPort><NewProtocol>UDP</NewProtocol></GetSpecificPortMappingEntry></s:Body></s:Envelope>",
+                    env, face
+                ),
+            )
+            .await;
+            assert!(
+                r.contains("<errorCode>606</errorCode>"),
+                "the :{} read of another host's entry is forbidden: {}",
+                face,
+                &r[..r.len().min(300)]
+            );
+        }
+        r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:1#GetGenericPortMappingEntry",
+            &format!("{}GetGenericPortMappingEntry xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewPortMappingIndex>0</NewPortMappingIndex></GetGenericPortMappingEntry></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>714</errorCode>"),
+            "the contained index space is empty for this caller: {}",
+            &r[..r.len().min(300)]
+        );
+
         // the full PKCS5 ceremony over the wire: challenge -> authenticator
         // -> UserLogin; then the protected actions open
         let r = soap_post(
@@ -5423,7 +5471,7 @@ mod ifindex_probe {
 
         // the v2 mapping boundary now passes: the gate yields to the
         // engine (which fails on nft here — but NOT with 606)
-        let r = soap_post(
+        let mut r = soap_post(
             &addr,
             "/ctl/IPConn",
             "urn:schemas-upnp-org:service:WANIPConnection:2#AddPortMapping",
@@ -5434,6 +5482,35 @@ mod ifindex_probe {
             "authorized v2 reaches the engine: {}",
             &r[..r.len().min(300)]
         );
+
+        // the lift is the principal's roles, not the face's: the same
+        // session that DeviceProtection established answers for the whole
+        // table, and it answers on either face
+        for face in ["1", "2"] {
+            r = soap_post(
+                &addr,
+                "/ctl/IPConn",
+                &format!(
+                    "urn:schemas-upnp-org:service:WANIPConnection:{}#GetSpecificPortMappingEntry",
+                    face
+                ),
+                &format!(
+                    "{}GetSpecificPortMappingEntry xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:{}\"><NewRemoteHost></NewRemoteHost><NewExternalPort>20500</NewExternalPort><NewProtocol>UDP</NewProtocol></GetSpecificPortMappingEntry></s:Body></s:Envelope>",
+                    env, face
+                ),
+            )
+            .await;
+            // GetSpecificPortMappingEntry's response carries the OUT
+            // arguments only, so the evidence is the entry's internal side
+            // and its label rather than the external port it was asked for
+            assert!(
+                r.contains("<NewInternalClient>192.168.21.50</NewInternalClient>")
+                    && r.contains("<NewPortMappingDescription>other-host</NewPortMappingDescription>"),
+                "the :{} read of another host's entry is lifted: {}",
+                face,
+                &r[..r.len().min(700)]
+            );
+        }
 
         // the v2 range actions answer the spec's own 7xx codes rather than
         // a generic failure: an empty range is 730 PortMappingNotFound

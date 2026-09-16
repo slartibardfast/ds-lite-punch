@@ -314,19 +314,24 @@ section 26.22 carries the reasoning; what the device applies is:
   where the floor applies, and it sees, enumerates, deletes and lists only its
   own entries at or above that floor. A read of another client's entry is 606
   rather than 714.
-- The address clause binds both faces, so the v1 service refuses a mapping that
-  names another host. The port floor and the read containment bind the v2 face,
-  where a control point can authenticate to lift them; the v1 reads stay whole,
-  because no authentication exists on that face and removing them would take
-  away the operator's own view of the table.
+- The address clause and the read containment bind both faces: the v1 service
+  refuses a mapping that names another host, and it answers a read of another
+  host's entry with 606 rather than 714. The port floor is the clause bound to
+  the v2 face alone, since it is the one a legacy client may legitimately
+  exceed.
+- A DeviceProtection session holding Basic lifts every clause, and the lift
+  belongs to the principal rather than to the face, so a control point that
+  authenticates over DeviceProtection reaches the whole table on either face.
+  The device's own view of the table needs no part of this: the entry index is
+  written to the daemon's state file, which is a local read.
 - The remaining WANIPConnection:2 actions remain public: connection status,
   the connection type, the external address, and the report of whether NAT and
   RSIP are in use.
 
-The one information surface left open deliberately is the v1 read: an
-unauthenticated v1 caller can still enumerate the table. That is recorded in
-plan/0008 section 26.22 as an accepted leak with its reason, not an
-oversight.
+No information surface is left open by choice: an unauthenticated caller sees
+its own mappings and nothing else, on either face. The reasoning, including
+why the anonymous read is the ingress map rather than a status page, is in
+plan/0008 section 26.22.
 
 ## Error codes (section 2.5.23)
 
