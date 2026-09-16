@@ -303,25 +303,30 @@ address (plan/0008 section 26.19).
 ### The policy this device enforces
 
 The specification leaves the enforced set to the device (1.2, 26.6 in
-plan/0008), so the applied set is stated here rather than inferred:
+plan/0008), so the applied set is stated here rather than inferred. Plan/0008
+section 26.22 carries the reasoning; what the device applies is:
 
 - `AddPortMapping`, `AddAnyPortMapping`, `DeletePortMapping` and
   `DeletePortMappingRange` require an authenticated session holding at least
-  `Basic` (plan/0008 sections 26.7 and 26.10). An unauthenticated invocation
-  receives 606 and no mapping changes.
-- The remaining WANIPConnection:2 actions, `GetListOfPortMappings` among them,
-  are public in this policy: an unauthenticated control point may read the
-  mapping table and the connection status.
+  `Basic`. An unauthenticated invocation receives 606 and no mapping changes.
+- A caller without that lift is contained, as 2.5.16.2, 2.5.18.2, 2.5.14.2 and
+  2.5.21.3 recommend: it may name only its own host, at ports at or above 1024
+  where the floor applies, and it sees, enumerates, deletes and lists only its
+  own entries at or above that floor. A read of another client's entry is 606
+  rather than 714.
+- The address clause binds both faces, so the v1 service refuses a mapping that
+  names another host. The port floor and the read containment bind the v2 face,
+  where a control point can authenticate to lift them; the v1 reads stay whole,
+  because no authentication exists on that face and removing them would take
+  away the operator's own view of the table.
+- The remaining WANIPConnection:2 actions remain public: connection status,
+  the connection type, the external address, and the RPCM-free report of
+  whether NAT and RSIP are in use.
 
-The consequence worth naming, because the specification's recommendation goes
-the other way: an unauthenticated `GetListOfPortMappings` is answered in full,
-where 2.5.21.3 recommends restricting it to the control point's own entries
-and to ports at or above 1024. The same recommendation would restrict
-`GetGenericPortMappingEntry` and `GetSpecificPortMappingEntry`, which the v1
-service already answers publicly. The restrictive reading of plan/0008 section
-26.10 is therefore applied to the mapping mutators and not to the reads, and
-tightening the reads is a policy change to be taken deliberately rather than a
-transcription detail.
+The one information surface left open deliberately is the v1 read: an
+unauthenticated v1 caller can still enumerate the table. That is recorded in
+plan/0008 section 26.22 as an accepted leak with its reason, not an
+oversight.
 
 ## Error codes (section 2.5.23)
 

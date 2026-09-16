@@ -839,7 +839,7 @@ impl UpnpFacade {
 
     /// Whether the caller holds the containment lift: a live session whose
     /// roles satisfy Basic, which Admin also satisfies (plan/0008 section
-    /// 26.20). The policy function is the same one the boundary uses, so
+    /// 26.22). The policy function is the same one the boundary uses, so
     /// the lift cannot drift from the gate.
     fn dp_holds_lift(&self, key: Ipv4Addr, now: u64) -> bool {
         let state = self.dp.lock().unwrap();
@@ -1477,7 +1477,7 @@ async fn handle_soap(
     } else {
         Ok(())
     };
-    // plan/0008 section 26.20: the containment the spec recommends for
+    // plan/0008 section 26.22: the containment the spec recommends for
     // unauthenticated control points (2.5.16.2, 2.5.18.2, 2.5.14.2,
     // 2.5.21.3), applied where the caller has a remedy. A live Basic (or
     // Admin) DeviceProtection session is the lift, and only the v2 face can
@@ -2190,7 +2190,7 @@ struct MappingReq {
 }
 
 /// The containment a caller without the lift is held to (plan/0008
-/// section 26.20). `caller` is the only address the caller may name;
+/// section 26.22). `caller` is the only address the caller may name;
 /// `high_port` adds the floor the spec recommends beside it (2.5.16.2,
 /// 2.5.18.2, 2.5.14.2, 2.5.21.3). The floor is a field rather than a rule
 /// because it binds only where a control point can authenticate to lift
@@ -3720,7 +3720,7 @@ mod tests {
         );
     }
 
-    /// plan/0008 section 26.20: the containment the spec recommends for
+    /// plan/0008 section 26.22: the containment the spec recommends for
     /// unauthenticated control points. The address clause needs no remedy
     /// and binds both faces; the port floor is a field, so one predicate
     /// serves the v2 face, where a control point can authenticate to lift
@@ -5324,7 +5324,7 @@ mod ifindex_probe {
         );
         // ... while the :1 face is not gated by DeviceProtection, its
         // containment still refuses a request that names another host
-        // (2.5.16.2, section 26.20): this is the door the plan's policy
+        // (2.5.16.2, section 26.22): this is the door the plan's policy
         // item closes on the compatibility face.
         r = soap_post(
             &addr,
