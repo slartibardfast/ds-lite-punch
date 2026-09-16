@@ -3599,6 +3599,27 @@ mod tests {
             assert!(!dp.contains(a), "DP SCPD must not carry {}", a);
         }
         assert!(dp.contains("SetupReady"), "DP SetupReady state var");
+        // the state table transcription (TRANSCRIPTION.md, section 4
+        // reassembly): exactly SetupReady is evented; A_ARG_TYPE_Base64
+        // is bin.base64; the other six variables are non-evented strings
+        assert!(
+            dp.contains(
+                "<stateVariable sendEvents=\"yes\"><name>SetupReady</name><dataType>boolean</dataType></stateVariable>"
+            ),
+            "SetupReady must be the evented boolean"
+        );
+        assert!(
+            dp.contains("<stateVariable sendEvents=\"no\"><name>SupportedProtocols</name>")
+                && dp.contains("<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_ACL</name>")
+                && dp.contains("<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_IdentityList</name>")
+                && dp.contains("<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Identity</name>")
+                && dp.contains("<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_String</name>"),
+            "the other variables must be non-evented"
+        );
+        assert!(
+            dp.contains("<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Base64</name><dataType>bin.base64</dataType></stateVariable>"),
+            "A_ARG_TYPE_Base64 data type"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

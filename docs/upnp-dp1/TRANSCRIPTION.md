@@ -139,6 +139,102 @@ specimen typo.
 - SetupReady is evented (2.5); after a SendSetupMessage that completes a
   setup operation, the device events SetupReady (2.6.1.8).
 
+## Section 4 XML Service Description (reassembled)
+
+The specification's section 4 is the normative `<scpd>` document. The OCR
+conversion of the PDF broke it into fragments (code blocks split by table
+cells, stray `<relatedStateVariable>` lines, and mis-rows such as a
+`GetUserLoginChallenge` name inside the GetRolesForAction row and a
+`ServiceID` casing that the clean 2.6.4 argument table disproves — the
+argument name is `ServiceId`). The clean document, reassembled against
+sections 2.4 (state variables) and 2.6 (argument tables), is exactly what
+the facade's `SCPD_DP` publishes:
+
+```xml
+<?xml version="1.0"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+<specVersion><major>1</major><minor>0</minor></specVersion>
+<actionList>
+<action><name>SendSetupMessage</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>InMessage</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>OutMessage</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetSupportedProtocols</name><argumentList>
+<argument><name>ProtocolList</name><direction>out</direction><relatedStateVariable>SupportedProtocols</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetAssignedRoles</name><argumentList>
+<argument><name>RoleList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetRolesForAction</name><argumentList>
+<argument><name>DeviceUDN</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>ServiceId</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>ActionName</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>RoleList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>RestrictedRoleList</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetUserLoginChallenge</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Name</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Salt</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>Challenge</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>UserLogin</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Challenge</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>Authenticator</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>UserLogout</name></action>
+<action><name>GetACLData</name><argumentList>
+<argument><name>ACL</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ACL</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>AddIdentityList</name><argumentList>
+<argument><name>IdentityList</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_IdentityList</relatedStateVariable></argument>
+<argument><name>IdentityListResult</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_IdentityList</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>RemoveIdentity</name><argumentList>
+<argument><name>Identity</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Identity</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>SetUserLoginPassword</name><argumentList>
+<argument><name>ProtocolType</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Name</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+<argument><name>Stored</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+<argument><name>Salt</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Base64</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>AddRolesForIdentity</name><argumentList>
+<argument><name>Identity</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Identity</relatedStateVariable></argument>
+<argument><name>RoleList</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>RemoveRolesForIdentity</name><argumentList>
+<argument><name>Identity</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Identity</relatedStateVariable></argument>
+<argument><name>RoleList</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_String</relatedStateVariable></argument>
+</argumentList></action>
+</actionList>
+<serviceStateTable>
+<stateVariable sendEvents="yes"><name>SetupReady</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>SupportedProtocols</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_ACL</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_IdentityList</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Identity</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Base64</name><dataType>bin.base64</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_String</name><dataType>string</dataType></stateVariable>
+</serviceStateTable>
+</scpd>
+```
+
+Verification notes ("you already have this" — the cleanup was done on the
+internalized conversion, no re-conversion needed):
+
+- Every argument table in the document above is confirmed twice: against
+  the clean per-action tables of section 2.6 and independently against the
+  recovered section 4 fragments.
+- The state table is confirmed against both section 2.4 and the section 4
+  fragments: seven variables; `A_ARG_TYPE_Base64` is `bin.base64`, the
+  rest are `string`; exactly one variable is evented (`SetupReady`, with
+  `sendEvents="yes"`), matching the eventing table of section 2.5.
+- The facade's `SCPD_DP` matches this document byte for byte modulo
+  whitespace; the transcription is closed.
+
 ## Corrections recorded against earlier work
 
 1. The SCPD action surface: wrong (miniupnpd-derived) names replaced by the
