@@ -820,6 +820,10 @@ impl UpnpFacade {
     /// GetListOfPortMappings: the entries whose requested port lies in
     /// [start, end] (protocol-filtered, capped at max when nonzero), as
     /// the NewPortListing XML (the A_ARG_TYPE_PortListing OUT value).
+    /// The fragment shape is the sample of the spec's section 2.3.25.2: a
+    /// PortMappingList of PortMappingEntry elements in the
+    /// urn:schemas-upnp-org:gw:WANIPConnection namespace. NewLeaseTime is
+    /// the remaining lease, as section 2.4.6 requires of a query.
     async fn list_port_mappings(
         &self,
         start: u16,
@@ -828,7 +832,8 @@ impl UpnpFacade {
         max: u16,
     ) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
-        let mut listing = String::from("<NewPortListing>");
+        let now = Epoch::now();
+        let mut listing = String::from(PORT_LISTING_OPEN);
         let mut count = 0u16;
         for e in es.iter() {
             if let Some(p) = proto {
@@ -846,15 +851,22 @@ impl UpnpFacade {
                 Proto::Tcp => "TCP",
                 Proto::Udp => "UDP",
             };
-            listing.push_str("<NewPortListingEntry>");
-            listing.push_str(&format!("<NewExternalPort>{}</NewExternalPort>", e.req_ext));
-            listing.push_str(&format!("<NewProtocol>{}</NewProtocol>", proto_txt));
-            listing.push_str(&format!("<NewInternalPort>{}</NewInternalPort>", e.int_port));
-            listing.push_str(&format!("<NewInternalClient>{}</NewInternalClient>", e.client));
-            listing.push_str("</NewPortListingEntry>");
+            listing.push_str("<p:PortMappingEntry>");
+            listing.push_str("<p:NewRemoteHost></p:NewRemoteHost>");
+            listing.push_str(&format!("<p:NewExternalPort>{}</p:NewExternalPort>", e.req_ext));
+            listing.push_str(&format!("<p:NewProtocol>{}</p:NewProtocol>", proto_txt));
+            listing.push_str(&format!("<p:NewInternalPort>{}</p:NewInternalPort>", e.int_port));
+            listing.push_str(&format!("<p:NewInternalClient>{}</p:NewInternalClient>", e.client));
+            listing.push_str("<p:NewEnabled>1</p:NewEnabled>");
+            listing.push_str("<p:NewDescription></p:NewDescription>");
+            listing.push_str(&format!(
+                "<p:NewLeaseTime>{}</p:NewLeaseTime>",
+                e.expires_at_unix.saturating_sub(now)
+            ));
+            listing.push_str("</p:PortMappingEntry>");
             count += 1;
         }
-        listing.push_str("</NewPortListing>");
+        listing.push_str("</p:PortMappingList>");
         Ok(listing)
     }
 
@@ -2593,6 +2605,13 @@ fn derived_udn(base: &str, tag: &[u8]) -> String {
     String::from_utf8_lossy(&upnp::uuid_hex(&raw)).into_owned()
 }
 
+/// The NewPortListing fragment prefix: the PortMappingList root of the
+/// WANIPConnection:2 PortListing datastructure, exactly as the sample of
+/// the spec's section 2.3.25.2 renders it (namespace and schema location
+/// included; the named schema URL no longer answers, so the sample is the
+/// shape authority).
+const PORT_LISTING_OPEN: &str = r#"<p:PortMappingList xmlns:p="urn:schemas-upnp-org:gw:WANIPConnection" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:schemas-upnp-org:gw:WANIPConnection http://www.upnp.org/schemas/gw/WANIPConnection-v2.xsd">"#;
+
 /// WANIPConnection:1 service description. Cribbed from miniupnpd (BSD
 /// license, `netfilter/upnp_desc.c`); the action/argument/state-variable
 /// shapes follow the UPnP IGDv1 spec. The PPP alias serves the same SCPD
@@ -2699,50 +2718,145 @@ const SCPD_WANCMN: &str = r#"<?xml version="1.0"?>
 </scpd>
 "#;
 
-/// plan/0008: the WANIPConnection:2 SCPD (gated route data). Pre-
-/// transcription: the authoritative argument tables are transcribed from
-/// the WANIPConnection:2 spec at the #v2-service-set task; this carries
-/// the standard action surface, mapping actions included.
+/// plan/0008: the WANIPConnection:2 SCPD (gated route data). The action
+/// surface, every argument table, and the state table are transcribed from
+/// the normative spec (docs/upnp-wip2/UPnP-gw-WANIPConnection-v2-Service.md,
+/// sections 2.3, 2.4, 2.5 and the section 4 XML Service Description
+/// reassembled in docs/upnp-wip2/TRANSCRIPTION.md): twenty-one actions,
+/// twenty-three state variables of which five are evented. The placeholder
+/// this replaces carried a bogus action (GetLinkLayerMaxBitRates, which
+/// belongs to WANCommonInterfaceConfig), argument-less action entries, five
+/// invented A_ARG_TYPE variables, and a state table that evented nothing.
 const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
 <actionList>
-<action><name>SetConnectionType</name></action>
-<action><name>GetConnectionTypeInfo</name></action>
+<action><name>SetConnectionType</name><argumentList>
+<argument><name>NewConnectionType</name><direction>in</direction><relatedStateVariable>ConnectionType</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetConnectionTypeInfo</name><argumentList>
+<argument><name>NewConnectionType</name><direction>out</direction><relatedStateVariable>ConnectionType</relatedStateVariable></argument>
+<argument><name>NewPossibleConnectionTypes</name><direction>out</direction><relatedStateVariable>PossibleConnectionTypes</relatedStateVariable></argument>
+</argumentList></action>
 <action><name>RequestConnection</name></action>
 <action><name>RequestTermination</name></action>
 <action><name>ForceTermination</name></action>
-<action><name>SetAutoDisconnectTime</name></action>
-<action><name>SetIdleDisconnectTime</name></action>
-<action><name>SetWarnDisconnectDelay</name></action>
-<action><name>GetStatusInfo</name></action>
-<action><name>GetAutoDisconnectTime</name></action>
-<action><name>GetIdleDisconnectTime</name></action>
-<action><name>GetWarnDisconnectDelay</name></action>
-<action><name>GetNATRSIPStatus</name></action>
-<action><name>GetGenericPortMappingEntry</name></action>
-<action><name>GetSpecificPortMappingEntry</name></action>
-<action><name>AddPortMapping</name></action>
-<action><name>DeletePortMapping</name></action>
-<action><name>GetExternalIPAddress</name></action>
-<action><name>DeletePortMappingRange</name></action>
-<action><name>GetListOfPortMappings</name></action>
-<action><name>AddAnyPortMapping</name></action>
-<action><name>GetLinkLayerMaxBitRates</name></action>
+<action><name>SetAutoDisconnectTime</name><argumentList>
+<argument><name>NewAutoDisconnectTime</name><direction>in</direction><relatedStateVariable>AutoDisconnectTime</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>SetIdleDisconnectTime</name><argumentList>
+<argument><name>NewIdleDisconnectTime</name><direction>in</direction><relatedStateVariable>IdleDisconnectTime</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>SetWarnDisconnectDelay</name><argumentList>
+<argument><name>NewWarnDisconnectDelay</name><direction>in</direction><relatedStateVariable>WarnDisconnectDelay</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetStatusInfo</name><argumentList>
+<argument><name>NewConnectionStatus</name><direction>out</direction><relatedStateVariable>ConnectionStatus</relatedStateVariable></argument>
+<argument><name>NewLastConnectionError</name><direction>out</direction><relatedStateVariable>LastConnectionError</relatedStateVariable></argument>
+<argument><name>NewUptime</name><direction>out</direction><relatedStateVariable>Uptime</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetAutoDisconnectTime</name><argumentList>
+<argument><name>NewAutoDisconnectTime</name><direction>out</direction><relatedStateVariable>AutoDisconnectTime</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetIdleDisconnectTime</name><argumentList>
+<argument><name>NewIdleDisconnectTime</name><direction>out</direction><relatedStateVariable>IdleDisconnectTime</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetWarnDisconnectDelay</name><argumentList>
+<argument><name>NewWarnDisconnectDelay</name><direction>out</direction><relatedStateVariable>WarnDisconnectDelay</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetNATRSIPStatus</name><argumentList>
+<argument><name>NewRSIPAvailable</name><direction>out</direction><relatedStateVariable>RSIPAvailable</relatedStateVariable></argument>
+<argument><name>NewNATEEnabled</name><direction>out</direction><relatedStateVariable>NATEEnabled</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetGenericPortMappingEntry</name><argumentList>
+<argument><name>NewPortMappingIndex</name><direction>in</direction><relatedStateVariable>PortMappingNumberOfEntries</relatedStateVariable></argument>
+<argument><name>NewRemoteHost</name><direction>out</direction><relatedStateVariable>RemoteHost</relatedStateVariable></argument>
+<argument><name>NewExternalPort</name><direction>out</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>out</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+<argument><name>NewInternalPort</name><direction>out</direction><relatedStateVariable>InternalPort</relatedStateVariable></argument>
+<argument><name>NewInternalClient</name><direction>out</direction><relatedStateVariable>InternalClient</relatedStateVariable></argument>
+<argument><name>NewEnabled</name><direction>out</direction><relatedStateVariable>PortMappingEnabled</relatedStateVariable></argument>
+<argument><name>NewPortMappingDescription</name><direction>out</direction><relatedStateVariable>PortMappingDescription</relatedStateVariable></argument>
+<argument><name>NewLeaseDuration</name><direction>out</direction><relatedStateVariable>PortMappingLeaseDuration</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetSpecificPortMappingEntry</name><argumentList>
+<argument><name>NewRemoteHost</name><direction>in</direction><relatedStateVariable>RemoteHost</relatedStateVariable></argument>
+<argument><name>NewExternalPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>in</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+<argument><name>NewInternalPort</name><direction>out</direction><relatedStateVariable>InternalPort</relatedStateVariable></argument>
+<argument><name>NewInternalClient</name><direction>out</direction><relatedStateVariable>InternalClient</relatedStateVariable></argument>
+<argument><name>NewEnabled</name><direction>out</direction><relatedStateVariable>PortMappingEnabled</relatedStateVariable></argument>
+<argument><name>NewPortMappingDescription</name><direction>out</direction><relatedStateVariable>PortMappingDescription</relatedStateVariable></argument>
+<argument><name>NewLeaseDuration</name><direction>out</direction><relatedStateVariable>PortMappingLeaseDuration</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>AddPortMapping</name><argumentList>
+<argument><name>NewRemoteHost</name><direction>in</direction><relatedStateVariable>RemoteHost</relatedStateVariable></argument>
+<argument><name>NewExternalPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>in</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+<argument><name>NewInternalPort</name><direction>in</direction><relatedStateVariable>InternalPort</relatedStateVariable></argument>
+<argument><name>NewInternalClient</name><direction>in</direction><relatedStateVariable>InternalClient</relatedStateVariable></argument>
+<argument><name>NewEnabled</name><direction>in</direction><relatedStateVariable>PortMappingEnabled</relatedStateVariable></argument>
+<argument><name>NewPortMappingDescription</name><direction>in</direction><relatedStateVariable>PortMappingDescription</relatedStateVariable></argument>
+<argument><name>NewLeaseDuration</name><direction>in</direction><relatedStateVariable>PortMappingLeaseDuration</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>AddAnyPortMapping</name><argumentList>
+<argument><name>NewRemoteHost</name><direction>in</direction><relatedStateVariable>RemoteHost</relatedStateVariable></argument>
+<argument><name>NewExternalPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>in</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+<argument><name>NewInternalPort</name><direction>in</direction><relatedStateVariable>InternalPort</relatedStateVariable></argument>
+<argument><name>NewInternalClient</name><direction>in</direction><relatedStateVariable>InternalClient</relatedStateVariable></argument>
+<argument><name>NewEnabled</name><direction>in</direction><relatedStateVariable>PortMappingEnabled</relatedStateVariable></argument>
+<argument><name>NewPortMappingDescription</name><direction>in</direction><relatedStateVariable>PortMappingDescription</relatedStateVariable></argument>
+<argument><name>NewLeaseDuration</name><direction>in</direction><relatedStateVariable>PortMappingLeaseDuration</relatedStateVariable></argument>
+<argument><name>NewReservedPort</name><direction>out</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>DeletePortMapping</name><argumentList>
+<argument><name>NewRemoteHost</name><direction>in</direction><relatedStateVariable>RemoteHost</relatedStateVariable></argument>
+<argument><name>NewExternalPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>in</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>DeletePortMappingRange</name><argumentList>
+<argument><name>NewStartPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewEndPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>in</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+<argument><name>NewManage</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Manage</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetExternalIPAddress</name><argumentList>
+<argument><name>NewExternalIPAddress</name><direction>out</direction><relatedStateVariable>ExternalIPAddress</relatedStateVariable></argument>
+</argumentList></action>
+<action><name>GetListOfPortMappings</name><argumentList>
+<argument><name>NewStartPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewEndPort</name><direction>in</direction><relatedStateVariable>ExternalPort</relatedStateVariable></argument>
+<argument><name>NewProtocol</name><direction>in</direction><relatedStateVariable>PortMappingProtocol</relatedStateVariable></argument>
+<argument><name>NewManage</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Manage</relatedStateVariable></argument>
+<argument><name>NewNumberOfPorts</name><direction>in</direction><relatedStateVariable>PortMappingNumberOfEntries</relatedStateVariable></argument>
+<argument><name>NewPortListing</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_PortListing</relatedStateVariable></argument>
+</argumentList></action>
 </actionList>
 <serviceStateTable>
-<stateVariable sendEvents="no"><name>ConnectionType</name><dataType>string</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>ConnectionStatus</name><dataType>string</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>ExternalIPAddress</name><dataType>string</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>PortMappingNumberOfEntries</name><dataType>ui2</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>ConnectionType</name><dataType>string</dataType><defaultValue>IP_Routed</defaultValue><allowedValueList><allowedValue>Unconfigured</allowedValue><allowedValue>IP_Routed</allowedValue><allowedValue>IP_Bridged</allowedValue></allowedValueList></stateVariable>
+<stateVariable sendEvents="yes"><name>PossibleConnectionTypes</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="yes"><name>ConnectionStatus</name><dataType>string</dataType><allowedValueList><allowedValue>Unconfigured</allowedValue><allowedValue>Connecting</allowedValue><allowedValue>Connected</allowedValue><allowedValue>PendingDisconnect</allowedValue><allowedValue>Disconnecting</allowedValue><allowedValue>Disconnected</allowedValue></allowedValueList></stateVariable>
 <stateVariable sendEvents="no"><name>Uptime</name><dataType>ui4</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>NATEnabled</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>LastConnectionError</name><dataType>string</dataType><allowedValueList><allowedValue>ERROR_NONE</allowedValue><allowedValue>ERROR_COMMAND_ABORTED</allowedValue><allowedValue>ERROR_NOT_ENABLED_FOR_INTERNET</allowedValue><allowedValue>ERROR_ISP_DISCONNECT</allowedValue><allowedValue>ERROR_USER_DISCONNECT</allowedValue><allowedValue>ERROR_IDLE_DISCONNECT</allowedValue><allowedValue>ERROR_FORCED_DISCONNECT</allowedValue><allowedValue>ERROR_NO_CARRIER</allowedValue><allowedValue>ERROR_IP_CONFIGURATION</allowedValue><allowedValue>ERROR_UNKNOWN</allowedValue></allowedValueList></stateVariable>
+<stateVariable sendEvents="no"><name>AutoDisconnectTime</name><dataType>ui4</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>IdleDisconnectTime</name><dataType>ui4</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>WarnDisconnectDelay</name><dataType>ui4</dataType></stateVariable>
 <stateVariable sendEvents="no"><name>RSIPAvailable</name><dataType>boolean</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>A_ARG_TYPE_ExternalPort</name><dataType>ui2</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>A_ARG_TYPE_InternalClient</name><dataType>string</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>A_ARG_TYPE_InternalPort</name><dataType>ui2</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>A_ARG_TYPE_Protocol</name><dataType>string</dataType></stateVariable>
-<stateVariable sendEvents="no"><name>A_ARG_TYPE_LeaseTime</name><dataType>ui4</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>NATEEnabled</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="yes"><name>ExternalIPAddress</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="yes"><name>PortMappingNumberOfEntries</name><dataType>ui2</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>PortMappingEnabled</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>PortMappingLeaseDuration</name><dataType>ui4</dataType><defaultValue>Vendor-defined</defaultValue><allowedValueRange><minimum>0</minimum><maximum>604800</maximum></allowedValueRange></stateVariable>
+<stateVariable sendEvents="no"><name>RemoteHost</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>ExternalPort</name><dataType>ui2</dataType><allowedValueRange><minimum>0</minimum><maximum>65535</maximum></allowedValueRange></stateVariable>
+<stateVariable sendEvents="no"><name>InternalPort</name><dataType>ui2</dataType><allowedValueRange><minimum>1</minimum><maximum>65535</maximum></allowedValueRange></stateVariable>
+<stateVariable sendEvents="no"><name>PortMappingProtocol</name><dataType>string</dataType><allowedValueList><allowedValue>TCP</allowedValue><allowedValue>UDP</allowedValue></allowedValueList></stateVariable>
+<stateVariable sendEvents="no"><name>InternalClient</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>PortMappingDescription</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="yes"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Manage</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_PortListing</name><dataType>string</dataType></stateVariable>
 </serviceStateTable>
 </scpd>
 "#;
@@ -3568,6 +3682,204 @@ mod tests {
         assert!(wip2.contains("AddAnyPortMapping"));
         assert!(wip2.contains("DeletePortMappingRange"));
         assert!(wip2.contains("GetListOfPortMappings"));
+        // the surface assertions compare against the line-wrapped document
+        // with its layout removed, so they test the XML structure rather
+        // than the literal's formatting
+        let wip2_flat: String = wip2.chars().filter(|c| !c.is_whitespace()).collect();
+        // the WIP2 transcription (docs/upnp-wip2/TRANSCRIPTION.md): the
+        // twenty-one actions of the spec's table 2-10, each with its
+        // argument table, so a published description that names an action
+        // without describing it fails here
+        for (action, args) in [
+            ("SetConnectionType", vec![("NewConnectionType", "in", "ConnectionType")]),
+            (
+                "GetConnectionTypeInfo",
+                vec![
+                    ("NewConnectionType", "out", "ConnectionType"),
+                    ("NewPossibleConnectionTypes", "out", "PossibleConnectionTypes"),
+                ],
+            ),
+            ("RequestConnection", vec![]),
+            ("RequestTermination", vec![]),
+            ("ForceTermination", vec![]),
+            ("SetAutoDisconnectTime", vec![("NewAutoDisconnectTime", "in", "AutoDisconnectTime")]),
+            ("SetIdleDisconnectTime", vec![("NewIdleDisconnectTime", "in", "IdleDisconnectTime")]),
+            ("SetWarnDisconnectDelay", vec![("NewWarnDisconnectDelay", "in", "WarnDisconnectDelay")]),
+            (
+                "GetStatusInfo",
+                vec![
+                    ("NewConnectionStatus", "out", "ConnectionStatus"),
+                    ("NewLastConnectionError", "out", "LastConnectionError"),
+                    ("NewUptime", "out", "Uptime"),
+                ],
+            ),
+            ("GetAutoDisconnectTime", vec![("NewAutoDisconnectTime", "out", "AutoDisconnectTime")]),
+            ("GetIdleDisconnectTime", vec![("NewIdleDisconnectTime", "out", "IdleDisconnectTime")]),
+            ("GetWarnDisconnectDelay", vec![("NewWarnDisconnectDelay", "out", "WarnDisconnectDelay")]),
+            (
+                "GetNATRSIPStatus",
+                vec![
+                    ("NewRSIPAvailable", "out", "RSIPAvailable"),
+                    ("NewNATEEnabled", "out", "NATEEnabled"),
+                ],
+            ),
+            (
+                "GetGenericPortMappingEntry",
+                vec![
+                    ("NewPortMappingIndex", "in", "PortMappingNumberOfEntries"),
+                    ("NewRemoteHost", "out", "RemoteHost"),
+                    ("NewExternalPort", "out", "ExternalPort"),
+                    ("NewProtocol", "out", "PortMappingProtocol"),
+                    ("NewInternalPort", "out", "InternalPort"),
+                    ("NewInternalClient", "out", "InternalClient"),
+                    ("NewEnabled", "out", "PortMappingEnabled"),
+                    ("NewPortMappingDescription", "out", "PortMappingDescription"),
+                    ("NewLeaseDuration", "out", "PortMappingLeaseDuration"),
+                ],
+            ),
+            (
+                "GetSpecificPortMappingEntry",
+                vec![
+                    ("NewRemoteHost", "in", "RemoteHost"),
+                    ("NewExternalPort", "in", "ExternalPort"),
+                    ("NewProtocol", "in", "PortMappingProtocol"),
+                    ("NewInternalPort", "out", "InternalPort"),
+                    ("NewInternalClient", "out", "InternalClient"),
+                    ("NewEnabled", "out", "PortMappingEnabled"),
+                    ("NewPortMappingDescription", "out", "PortMappingDescription"),
+                    ("NewLeaseDuration", "out", "PortMappingLeaseDuration"),
+                ],
+            ),
+            (
+                "AddPortMapping",
+                vec![
+                    ("NewRemoteHost", "in", "RemoteHost"),
+                    ("NewExternalPort", "in", "ExternalPort"),
+                    ("NewProtocol", "in", "PortMappingProtocol"),
+                    ("NewInternalPort", "in", "InternalPort"),
+                    ("NewInternalClient", "in", "InternalClient"),
+                    ("NewEnabled", "in", "PortMappingEnabled"),
+                    ("NewPortMappingDescription", "in", "PortMappingDescription"),
+                    ("NewLeaseDuration", "in", "PortMappingLeaseDuration"),
+                ],
+            ),
+            (
+                "AddAnyPortMapping",
+                vec![
+                    ("NewRemoteHost", "in", "RemoteHost"),
+                    ("NewExternalPort", "in", "ExternalPort"),
+                    ("NewProtocol", "in", "PortMappingProtocol"),
+                    ("NewInternalPort", "in", "InternalPort"),
+                    ("NewInternalClient", "in", "InternalClient"),
+                    ("NewEnabled", "in", "PortMappingEnabled"),
+                    ("NewPortMappingDescription", "in", "PortMappingDescription"),
+                    ("NewLeaseDuration", "in", "PortMappingLeaseDuration"),
+                    ("NewReservedPort", "out", "ExternalPort"),
+                ],
+            ),
+            (
+                "DeletePortMapping",
+                vec![
+                    ("NewRemoteHost", "in", "RemoteHost"),
+                    ("NewExternalPort", "in", "ExternalPort"),
+                    ("NewProtocol", "in", "PortMappingProtocol"),
+                ],
+            ),
+            (
+                "DeletePortMappingRange",
+                vec![
+                    ("NewStartPort", "in", "ExternalPort"),
+                    ("NewEndPort", "in", "ExternalPort"),
+                    ("NewProtocol", "in", "PortMappingProtocol"),
+                    ("NewManage", "in", "A_ARG_TYPE_Manage"),
+                ],
+            ),
+            ("GetExternalIPAddress", vec![("NewExternalIPAddress", "out", "ExternalIPAddress")]),
+            (
+                "GetListOfPortMappings",
+                vec![
+                    ("NewStartPort", "in", "ExternalPort"),
+                    ("NewEndPort", "in", "ExternalPort"),
+                    ("NewProtocol", "in", "PortMappingProtocol"),
+                    ("NewManage", "in", "A_ARG_TYPE_Manage"),
+                    ("NewNumberOfPorts", "in", "PortMappingNumberOfEntries"),
+                    ("NewPortListing", "out", "A_ARG_TYPE_PortListing"),
+                ],
+            ),
+        ] {
+            if args.is_empty() {
+                assert!(
+                    wip2_flat.contains(&format!("<action><name>{}</name></action>", action)),
+                    "WIP2 SCPD must declare {} with no arguments",
+                    action
+                );
+                continue;
+            }
+            let mut want = format!("<action><name>{}</name><argumentList>", action);
+            for (arg, dir, rel) in args {
+                want.push_str(&format!(
+                    "<argument><name>{}</name><direction>{}</direction><relatedStateVariable>{}</relatedStateVariable></argument>",
+                    arg, dir, rel
+                ));
+            }
+            want.push_str("</argumentList></action>");
+            assert!(
+                wip2_flat.contains(&want),
+                "WIP2 SCPD must carry {}'s argument table",
+                action
+            );
+        }
+        // the placeholder's bogus action and invented state variables
+        assert!(
+            !wip2.contains("GetLinkLayerMaxBitRates"),
+            "GetLinkLayerMaxBitRates belongs to WANCommonInterfaceConfig, not WANIPConnection"
+        );
+        for bogus in [
+            "A_ARG_TYPE_ExternalPort",
+            "A_ARG_TYPE_InternalClient",
+            "A_ARG_TYPE_InternalPort",
+            "A_ARG_TYPE_Protocol",
+            "A_ARG_TYPE_LeaseTime",
+            "<name>NATEnabled</name>",
+        ] {
+            assert!(!wip2.contains(bogus), "WIP2 SCPD must not carry {}", bogus);
+        }
+        // table 2-9: exactly five variables are evented, and the evented
+        // pair of 2.4.4/2.4.5 is among them
+        for v in [
+            "PossibleConnectionTypes",
+            "ConnectionStatus",
+            "ExternalIPAddress",
+            "PortMappingNumberOfEntries",
+            "SystemUpdateID",
+        ] {
+            assert!(
+                wip2.contains(&format!(
+                    "<stateVariable sendEvents=\"yes\"><name>{}</name>",
+                    v
+                )),
+                "{} must be evented",
+                v
+            );
+        }
+        assert!(
+            wip2.contains("<stateVariable sendEvents=\"no\"><name>NATEEnabled</name><dataType>boolean</dataType></stateVariable>"),
+            "NATEEnabled is the spec's spelling (table 2-2, 2.5.13)"
+        );
+        assert!(
+            wip2.contains("<stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_PortListing</name><dataType>string</dataType></stateVariable>"),
+            "A_ARG_TYPE_PortListing is a string (section 2.3.25)"
+        );
+        assert_eq!(
+            wip2.matches("<action>").count(),
+            21,
+            "the spec's table 2-10 lists twenty-one actions"
+        );
+        assert_eq!(
+            wip2.matches("<stateVariable ").count(),
+            23,
+            "twenty-three state variables: table 2-2 plus the two argument types"
+        );
         let dp = String::from_utf8_lossy(SCPD_DP.as_bytes());
         for a in [
             "SendSetupMessage",
