@@ -24,6 +24,7 @@ use tokio::sync::{watch, Mutex, Semaphore};
 
 use crate::mapping::State;
 use crate::nft;
+use crate::dp;
 use crate::persist::{self, DEFAULT_DIR};
 use crate::publish::Publisher;
 use crate::slot::{Epoch, Lease, LeaseTable, Proto, Slot, UpsertOutcome};
@@ -169,6 +170,9 @@ pub struct UpnpFacade {
     /// search is observed inside the window; entries live only while a
     /// response is deferred and are removed by the deferred task.
     bursts: Arc<StdMutex<HashMap<(Ipv4Addr, u16), watch::Sender<bool>>>>,
+    /// plan/0008 #v2-service-set: the DeviceProtection:1 service state
+    /// (users + ACL persisted, sessions transient per section 26.15).
+    dp: StdMutex<dp::DpState>,
 }
 
 impl UpnpFacade {
@@ -200,6 +204,8 @@ impl UpnpFacade {
 
         let ssdp = bind_ssdp(cfg.lan_ip)?;
         let started_unix = Epoch::now();
+        let device_id = dp_device_id(&udn);
+        let dp_state = dp_load(&cfg.state_dir, device_id);
         let facade = Arc::new(UpnpFacade {
             cfg,
             table,
@@ -212,6 +218,7 @@ impl UpnpFacade {
             started_unix,
             ssdp: Arc::new(ssdp),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(dp_state),
         });
 
         // Respawn-restored grants: main skipped their datapath spawn (its
@@ -757,6 +764,100 @@ impl UpnpFacade {
         Ok(entry_xml(e, true))
     }
 
+    // ---- plan/0008 #v2-service-set: DP boundary + WIP2-only actions ----
+
+    /// The DeviceProtection authorization decision for a control point
+    /// (section 26.7: the boundary sits in front of the engine).
+    fn dp_enforce(&self, key: Ipv4Addr, required: &dp::DpAuthz, now: u64) -> Result<(), UpnpErr> {
+        let state = self.dp.lock().unwrap();
+        state.enforce(key, required, now).map_err(map_dp_err)
+    }
+
+    /// Refresh a session's activity stamp after an authorized action.
+    fn dp_touch(&self, key: Ipv4Addr, now: u64) {
+        let mut state = self.dp.lock().unwrap();
+        state.touch(key, now);
+    }
+
+    /// AddAnyPortMapping: same engine path as AddPortMapping. Under the
+    /// report-requested premise the requested port is the key and the
+    /// granted external tuple stays underneath, so NewReservedPort
+    /// reports the requested port. An "any port" (0) request is refused
+    /// with 402 for now — the allocation path is recorded as deferred.
+    async fn add_mapping_any(
+        &self,
+        req_ext: u16,
+        proto: Proto,
+        client: Ipv4Addr,
+        int_port: u16,
+        lifetime: u32,
+    ) -> Result<String, UpnpErr> {
+        if req_ext == 0 {
+            return Err(UpnpErr::InvalidArgs);
+        }
+        self.add_mapping(req_ext, proto, client, int_port, lifetime)
+            .await?;
+        Ok(format!("<NewReservedPort>{}</NewReservedPort>", req_ext))
+    }
+
+    /// DeletePortMappingRange: delete every entry whose requested port
+    /// lies in [start, end] for the protocol. Bounded by the entries
+    /// table, never by the port span.
+    async fn delete_mapping_range(&self, start: u16, end: u16, proto: Proto) -> Result<String, UpnpErr> {
+        let targets: Vec<u16> = {
+            let es = self.entries.lock().await;
+            es.iter()
+                .filter(|e| e.proto == proto && e.req_ext >= start && e.req_ext <= end)
+                .map(|e| e.req_ext)
+                .collect()
+        };
+        for ext in targets {
+            let _ = self.delete_mapping(ext, proto).await;
+        }
+        Ok(String::new())
+    }
+
+    /// GetListOfPortMappings: the entries whose requested port lies in
+    /// [start, end] (protocol-filtered, capped at max when nonzero), as
+    /// the NewPortListing XML (the A_ARG_TYPE_PortListing OUT value).
+    async fn list_port_mappings(
+        &self,
+        start: u16,
+        end: u16,
+        proto: Option<Proto>,
+        max: u16,
+    ) -> Result<String, UpnpErr> {
+        let es = self.entries.lock().await;
+        let mut listing = String::from("<NewPortListing>");
+        let mut count = 0u16;
+        for e in es.iter() {
+            if let Some(p) = proto {
+                if e.proto != p {
+                    continue;
+                }
+            }
+            if e.req_ext < start || e.req_ext > end {
+                continue;
+            }
+            if max != 0 && count >= max {
+                break;
+            }
+            let proto_txt = match e.proto {
+                Proto::Tcp => "TCP",
+                Proto::Udp => "UDP",
+            };
+            listing.push_str("<NewPortListingEntry>");
+            listing.push_str(&format!("<NewExternalPort>{}</NewExternalPort>", e.req_ext));
+            listing.push_str(&format!("<NewProtocol>{}</NewProtocol>", proto_txt));
+            listing.push_str(&format!("<NewInternalPort>{}</NewInternalPort>", e.int_port));
+            listing.push_str(&format!("<NewInternalClient>{}</NewInternalClient>", e.client));
+            listing.push_str("</NewPortListingEntry>");
+            count += 1;
+        }
+        listing.push_str("</NewPortListing>");
+        Ok(listing)
+    }
+
     // ---- GENA ----
 
     async fn gena_subscribe(&self, callback: &[u8], timeout_secs: u32) -> Result<String, UpnpErr> {
@@ -1144,8 +1245,8 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 }
             }
         }
-        ReqClass::Soap { service, action } => {
-            handle_soap(&facade, service, action, &body, &mut stream).await;
+        ReqClass::Soap { service, action, v2 } => {
+            handle_soap(&facade, service, action, v2, client_ip, &body, &mut stream).await;
             // Client-presence stamp for the lease policy: any SOAP action
             // from this IP proves the client is alive. Stamp result
             // regardless of the action's own outcome (the client talked).
@@ -1207,69 +1308,498 @@ async fn handle_soap(
     facade: &Arc<UpnpFacade>,
     service: SoapService,
     action: SoapAction,
+    v2: bool,
+    client_ip: Ipv4Addr,
     body: &[u8],
     stream: &mut TcpStream,
 ) {
-    let result: Result<String, UpnpErr> = match (service, action) {
-        (SoapService::WanIpConnection | SoapService::WanPppConnection, SoapAction::GetExternalIpAddress) => {
-            facade.get_external_ip().await
+    // plan/0008 section 26.7: the DeviceProtection authorization boundary.
+    // A v2 WIP2 security-sensitive invocation flows through the session
+    // principal before the canonical mapping engine; there is no engine
+    // bypass for the v2 face. The v1 facade stays a legacy unauthenticated
+    // compatibility surface (section 26.12).
+    let gated: Result<(), UpnpErr> = if service == SoapService::WanIpConnection
+        && v2
+        && matches!(
+            action,
+            SoapAction::AddPortMapping
+                | SoapAction::AddAnyPortMapping
+                | SoapAction::DeletePortMapping
+                | SoapAction::DeletePortMappingRange
+        ) {
+        let name = String::from_utf8_lossy(upnp::soap_action_name(action)).into_owned();
+        let required = dp::required_role(dp::DpTarget::WanIpConnection, &name);
+        let now = Epoch::now();
+        let r = facade.dp_enforce(client_ip, &required, now);
+        if r.is_ok() {
+            facade.dp_touch(client_ip, now);
         }
-        (SoapService::WanIpConnection | SoapService::WanPppConnection, SoapAction::GetStatusInfo) => {
-            Ok(facade.get_status_info().await)
-        }
-        (
-            SoapService::WanIpConnection | SoapService::WanPppConnection,
-            SoapAction::GetConnectionTypeInfo,
-        ) => Ok(facade.get_connection_type_info()),
-        (SoapService::WanIpConnection | SoapService::WanPppConnection, SoapAction::AddPortMapping) => {
-            match parse_add_args(body) {
+        r
+    } else {
+        Ok(())
+    };
+    let result: Result<String, UpnpErr> = match gated {
+        Err(e) => Err(e),
+        Ok(()) => match (service, action) {
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::GetExternalIpAddress,
+            ) => facade.get_external_ip().await,
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::GetStatusInfo,
+            ) => Ok(facade.get_status_info().await),
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::GetConnectionTypeInfo,
+            ) => Ok(facade.get_connection_type_info()),
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::AddPortMapping,
+            ) => match parse_add_args(body) {
                 Ok((ext, proto, int_port, client, lifetime)) => {
                     facade.add_mapping(ext, proto, client, int_port, lifetime).await
                 }
                 Err(e) => Err(e),
+            },
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::DeletePortMapping,
+            ) => match parse_delete_args(body) {
+                Ok((ext, proto)) => facade.delete_mapping(ext, proto).await,
+                Err(e) => Err(e),
+            },
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::GetSpecificPortMappingEntry,
+            ) => match parse_delete_args(body) {
+                Ok((ext, proto)) => facade.get_specific(ext, proto).await,
+                Err(e) => Err(e),
+            },
+            (
+                SoapService::WanIpConnection | SoapService::WanPppConnection,
+                SoapAction::GetGenericPortMappingEntry,
+            ) => match parse_index_arg(body) {
+                Ok(i) => facade.get_generic(i).await,
+                Err(e) => Err(e),
+            },
+            // WIP2-only surface (plan/0008 #v2-service-set). The engine is
+            // report-requested: the granted bind port IS the external
+            // port, so AddAnyPortMapping answers NewReservedPort with the
+            // granted port and the entries key follows it.
+            (SoapService::WanIpConnection, SoapAction::AddAnyPortMapping) => {
+                match parse_add_args_any(body) {
+                    Ok((ext, proto, int_port, client, lifetime)) => {
+                        facade.add_mapping_any(ext, proto, client, int_port, lifetime).await
+                    }
+                    Err(e) => Err(e),
+                }
             }
-        }
-        (
-            SoapService::WanIpConnection | SoapService::WanPppConnection,
-            SoapAction::DeletePortMapping,
-        ) => match parse_delete_args(body) {
-            Ok((ext, proto)) => facade.delete_mapping(ext, proto).await,
-            Err(e) => Err(e),
+            (SoapService::WanIpConnection, SoapAction::DeletePortMappingRange) => {
+                match parse_range_args(body) {
+                    Ok((start, end, proto)) => {
+                        facade.delete_mapping_range(start, end, proto).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            (SoapService::WanIpConnection, SoapAction::GetListOfPortMappings) => {
+                match parse_list_args(body) {
+                    Ok((start, end, proto, max)) => {
+                        facade.list_port_mappings(start, end, proto, max).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            (SoapService::WanCommonIfaceCfg, SoapAction::GetCommonLinkProperties) => {
+                Ok(facade.common_link_properties())
+            }
+            // DeviceProtection:1 (the authoritative 13 actions,
+            // docs/upnp-dp1/TRANSCRIPTION.md). The admin-gated actions
+            // enforce through dp::required_role inside each handler.
+            (SoapService::DeviceProtection, SoapAction::SendSetupMessage) => {
+                dp_send_setup(facade, body)
+            }
+            (SoapService::DeviceProtection, SoapAction::GetSupportedProtocols) => {
+                Ok(dp::supported_protocols_xml())
+            }
+            (SoapService::DeviceProtection, SoapAction::GetAssignedRoles) => {
+                Ok(dp_assigned_roles(facade, client_ip))
+            }
+            (SoapService::DeviceProtection, SoapAction::GetRolesForAction) => {
+                dp_roles_for_action(body)
+            }
+            (SoapService::DeviceProtection, SoapAction::GetUserLoginChallenge) => {
+                dp_challenge(facade, client_ip, body)
+            }
+            (SoapService::DeviceProtection, SoapAction::UserLogin) => {
+                dp_login(facade, client_ip, body)
+            }
+            (SoapService::DeviceProtection, SoapAction::UserLogout) => {
+                dp_logout(facade, client_ip)
+            }
+            (SoapService::DeviceProtection, SoapAction::GetAclData) => {
+                dp_get_acl(facade, client_ip)
+            }
+            (SoapService::DeviceProtection, SoapAction::AddIdentityList) => {
+                dp_add_identities(facade, client_ip, body)
+            }
+            (SoapService::DeviceProtection, SoapAction::RemoveIdentity) => {
+                dp_remove_identity(facade, client_ip, body)
+            }
+            (SoapService::DeviceProtection, SoapAction::SetUserLoginPassword) => {
+                dp_set_password(facade, client_ip, body)
+            }
+            (SoapService::DeviceProtection, SoapAction::AddRolesForIdentity) => {
+                dp_add_roles(facade, client_ip, body, true)
+            }
+            (SoapService::DeviceProtection, SoapAction::RemoveRolesForIdentity) => {
+                dp_add_roles(facade, client_ip, body, false)
+            }
+            _ => Err(UpnpErr::InvalidAction),
         },
-        (
-            SoapService::WanIpConnection | SoapService::WanPppConnection,
-            SoapAction::GetSpecificPortMappingEntry,
-        ) => match parse_delete_args(body) {
-            Ok((ext, proto)) => facade.get_specific(ext, proto).await,
-            Err(e) => Err(e),
-        },
-        (
-            SoapService::WanIpConnection | SoapService::WanPppConnection,
-            SoapAction::GetGenericPortMappingEntry,
-        ) => match parse_index_arg(body) {
-            Ok(i) => facade.get_generic(i).await,
-            Err(e) => Err(e),
-        },
-        (SoapService::WanCommonIfaceCfg, SoapAction::GetCommonLinkProperties) => {
-            Ok(facade.common_link_properties())
-        }
-        _ => Err(UpnpErr::InvalidAction),
     };
     match result {
         Ok(inner) => {
             let action_name = String::from_utf8_lossy(upnp::soap_action_name(action));
-            let xml = upnp::soap_success(service, &action_name, &inner);
+            let xml = upnp::soap_success_v(service, v2, &action_name, &inner);
             let _ = write_response(stream, "200 OK", &xml, "").await;
             println!(
                 "{{\"event\":\"upnp\",\"action\":\"{}\",\"service\":\"{}\"}}",
                 action_name,
-                String::from_utf8_lossy(upnp::service_urn(service))
+                String::from_utf8_lossy(upnp::service_urn_v(service, v2))
             );
         }
         Err(e) => {
             let _ = write_soap_fault(stream, &fault_of(e)).await;
         }
     }
+}
+
+// ---- plan/0008 #v2-service-set: the DeviceProtection dispatch ----
+
+/// GetUserLoginChallenge (DP 2.6.5): ProtocolType MUST be PKCS5 (the one
+/// Login protocol this device speaks); Name MUST be a known user; the
+/// response carries the user's Salt and a fresh Challenge (Base64). The
+/// challenge replaces the session's previous one (2.6.5.9).
+fn dp_challenge(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
+    let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
+    if !eq_ia(proto, b"PKCS5") {
+        return Err(UpnpErr::InvalidValue);
+    }
+    let name = dp_str_tag(body, b"Name")?;
+    let mut state = facade.dp.lock().unwrap();
+    let (salt, challenge) = state
+        .begin_login(client_ip, &name, dp_random_16(), Epoch::now())
+        .map_err(map_dp_err)?;
+    Ok(format!(
+        "<Salt>{}</Salt><Challenge>{}</Challenge>",
+        dp::base64_encode(&salt),
+        dp::base64_encode(&challenge)
+    ))
+}
+
+/// UserLogin (DP 2.6.6): verify the Authenticator for the session's
+/// pending Challenge (2.6.6.4). UserLogin has no OUT arguments.
+fn dp_login(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
+    let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
+    if !eq_ia(proto, b"PKCS5") {
+        return Err(UpnpErr::InvalidValue);
+    }
+    let challenge = dp_b64_tag16(body, b"Challenge")?;
+    let auth = xml_tag(body, b"Authenticator")
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(dp::base64_decode)
+        .ok_or(UpnpErr::InvalidValue)?;
+    let mut state = facade.dp.lock().unwrap();
+    state
+        .login(client_ip, challenge, &auth, Epoch::now())
+        .map(|_| String::new())
+        .map_err(map_dp_err)
+}
+
+/// UserLogout (DP 2.6.7): drop the session principal. No arguments.
+fn dp_logout(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr> {
+    let mut state = facade.dp.lock().unwrap();
+    state.logout(client_ip, Epoch::now());
+    Ok(String::new())
+}
+
+/// GetAssignedRoles (DP 2.6.3): the session's role set, space-separated.
+/// Per 2.6.3.2, an unauthenticated session sees only "Public".
+fn dp_assigned_roles(facade: &UpnpFacade, client_ip: Ipv4Addr) -> String {
+    let state = facade.dp.lock().unwrap();
+    let roles = state.session_roles(client_ip, Epoch::now());
+    if roles.is_empty() {
+        "<RoleList>Public</RoleList>".to_string()
+    } else {
+        format!("<RoleList>{}</RoleList>", roles.join(" "))
+    }
+}
+
+/// GetRolesForAction (DP 2.6.4): answer the device's role policy for the
+/// named (DeviceUDN, ServiceId, ActionName): RoleList = the roles that
+/// grant access unconditionally, RestrictedRoleList empty (no role is
+/// conditional in this policy). The policy itself is dp::required_role.
+fn dp_roles_for_action(body: &[u8]) -> Result<String, UpnpErr> {
+    let service_id = dp_str_tag(body, b"ServiceId")?;
+    let action = dp_str_tag(body, b"ActionName")?;
+    let target = if service_id.contains("DeviceProtection") {
+        dp::DpTarget::DeviceProtection
+    } else if service_id.contains("WANIPConnection") || service_id.contains("WANPPPConnection") {
+        dp::DpTarget::WanIpConnection
+    } else {
+        return Err(UpnpErr::InvalidValue);
+    };
+    let (role_list, restricted) = match dp::required_role(target, &action) {
+        dp::DpAuthz::Public => ("Public".to_string(), String::new()),
+        dp::DpAuthz::Roles(needed) => (needed.join(" "), String::new()),
+    };
+    Ok(format!(
+        "<RoleList>{}</RoleList><RestrictedRoleList>{}</RestrictedRoleList>",
+        role_list, restricted
+    ))
+}
+
+/// SendSetupMessage (DP 2.6.1): the generic transport for introduction
+/// protocols. This device speaks exactly one Introduction protocol
+/// (WPS, per the mandated SupportedProtocols) but runs no WPS registrar
+/// (it is an IGD on a wired line, not an enrolment point), so a WPS
+/// in-message cannot be processed: 600 for an unsupported ProtocolType
+/// (2.6.1.9), 704 Processing Error for a WPS message (2.6.1.9: "an error
+/// was encountered in processing InMessage").
+fn dp_send_setup(facade: &UpnpFacade, body: &[u8]) -> Result<String, UpnpErr> {
+    let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
+    if !eq_ia(proto, b"WPS") {
+        return Err(UpnpErr::InvalidValue);
+    }
+    // No setup operation is pending or possible: SetupReady stays
+    // unchanged (2.4.2 semantics; the evented variable never moves).
+    let _state = facade.dp.lock().unwrap();
+    let _ = _state.setup_ready();
+    Err(map_dp_err(dp::DpErr::Processing))
+}
+
+/// GetACLData (DP 2.6.8), Admin-gated: the ACL document as the OUT
+/// value (an XML document embedded per 2.6.8.2).
+fn dp_get_acl(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr> {
+    let now = Epoch::now();
+    let required = dp::required_role(dp::DpTarget::DeviceProtection, "GetACLData");
+    let state = facade.dp.lock().unwrap();
+    state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
+    Ok(dp::acl_xml(state.acl()))
+}
+
+/// AddIdentityList (DP 2.6.9), Admin-gated: union-add the incoming User
+/// identities; IdentityListResult carries the identities actually added
+/// (2.6.9.3).
+fn dp_add_identities(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
+    let now = Epoch::now();
+    let required = dp::required_role(dp::DpTarget::DeviceProtection, "AddIdentityList");
+    let mut state = facade.dp.lock().unwrap();
+    state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
+    let incoming = dp::DpAcl {
+        identities: dp_identity_names(body)
+            .into_iter()
+            .map(|name| dp::DpIdentity {
+                name,
+                alias: None,
+                id: [0u8; 16],
+                roles: Vec::new(),
+            })
+            .collect(),
+    };
+    let added = state.add_identities(&incoming);
+    dp_save(&facade.cfg.state_dir, &state);
+    Ok(dp::identity_list_xml(&added))
+}
+
+/// RemoveIdentity (DP 2.6.10), Admin-gated: remove by Name
+/// (case-sensitive); an unknown Identity is 600 (2.6.10.7).
+fn dp_remove_identity(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
+    let now = Epoch::now();
+    let required = dp::required_role(dp::DpTarget::DeviceProtection, "RemoveIdentity");
+    let mut state = facade.dp.lock().unwrap();
+    state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
+    let name = dp_identity_names(body)
+        .into_iter()
+        .next()
+        .ok_or(UpnpErr::InvalidValue)?;
+    if !state.remove_identity(&name) {
+        return Err(UpnpErr::InvalidValue);
+    }
+    dp_save(&facade.cfg.state_dir, &state);
+    Ok(String::new())
+}
+
+/// SetUserLoginPassword (DP 2.6.11): Admin, or the session logged in AS
+/// the Name (2.6.11.6). Sets/creates the user's Stored + Salt.
+fn dp_set_password(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
+    let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
+    if !eq_ia(proto, b"PKCS5") {
+        return Err(UpnpErr::InvalidValue);
+    }
+    let name = dp_str_tag(body, b"Name")?;
+    let stored = dp_b64_tag16(body, b"Stored")?;
+    let salt = dp_b64_tag16(body, b"Salt")?;
+    let now = Epoch::now();
+    let mut state = facade.dp.lock().unwrap();
+    let admin = dp::required_role(dp::DpTarget::DeviceProtection, "SetUserLoginPassword");
+    let self_ok = state.session_user(client_ip, now) == Some(name.as_str());
+    if !self_ok {
+        state.enforce(client_ip, &admin, now).map_err(map_dp_err)?;
+    }
+    if !state.set_user_password(&name, stored, salt) {
+        return Err(UpnpErr::InvalidValue);
+    }
+    dp_save(&facade.cfg.state_dir, &state);
+    Ok(String::new())
+}
+
+/// AddRolesForIdentity / RemoveRolesForIdentity (DP 2.6.12 / 2.6.13),
+/// Admin-gated. Unknown role names are rejected with 600 (2.6.12.3); an
+/// unknown identity is 600.
+fn dp_add_roles(
+    facade: &UpnpFacade,
+    client_ip: Ipv4Addr,
+    body: &[u8],
+    add: bool,
+) -> Result<String, UpnpErr> {
+    let now = Epoch::now();
+    let action = if add {
+        "AddRolesForIdentity"
+    } else {
+        "RemoveRolesForIdentity"
+    };
+    let required = dp::required_role(dp::DpTarget::DeviceProtection, action);
+    let mut state = facade.dp.lock().unwrap();
+    state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
+    let identity = dp_identity_names(body)
+        .into_iter()
+        .next()
+        .ok_or(UpnpErr::InvalidValue)?;
+    let roles = dp_role_list(body)?;
+    let ok = if add {
+        state.add_roles(&identity, &roles)
+    } else {
+        state.remove_roles(&identity, &roles)
+    };
+    if !ok {
+        return Err(UpnpErr::InvalidValue);
+    }
+    dp_save(&facade.cfg.state_dir, &state);
+    Ok(String::new())
+}
+
+fn dp_str_tag(body: &[u8], tag: &[u8]) -> Result<String, UpnpErr> {
+    xml_tag(body, tag)
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .map(|s| s.trim().to_string())
+        .ok_or(UpnpErr::InvalidValue)
+}
+
+fn dp_b64_tag16(body: &[u8], tag: &[u8]) -> Result<[u8; 16], UpnpErr> {
+    let v = xml_tag(body, tag)
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(dp::base64_decode)
+        .ok_or(UpnpErr::InvalidValue)?;
+    if v.len() != 16 {
+        return Err(UpnpErr::InvalidValue);
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&v);
+    Ok(out)
+}
+
+/// A space-separated RoleList argument; every role must be one the
+/// device understands (2.6.12.3: unknown roles -> 600).
+fn dp_role_list(body: &[u8]) -> Result<Vec<String>, UpnpErr> {
+    let s = dp_str_tag(body, b"RoleList")?;
+    let roles: Vec<String> = s.split_whitespace().map(str::to_string).collect();
+    if roles.iter().any(|r| !dp::valid_role(r)) {
+        return Err(UpnpErr::InvalidValue);
+    }
+    Ok(roles)
+}
+
+/// Every `<Name>` inside the request's `<Identity>` elements (the minimal
+/// scanner; the upnp.rs scope note applies — a real XML parser is the
+/// escalation a CP actually needs it).
+fn dp_identity_names(body: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = substring(&body[search_from..], b"<Identity") else {
+            break;
+        };
+        let start = search_from + rel;
+        let Some(gt) = substring(&body[start..], b">") else {
+            break;
+        };
+        let block_start = start + gt + 1;
+        let Some(end_rel) = substring(&body[block_start..], b"</Identity>") else {
+            break;
+        };
+        let block = &body[block_start..block_start + end_rel];
+        if let Some(name) = xml_tag(block, b"Name") {
+            if let Ok(s) = std::str::from_utf8(name) {
+                out.push(s.trim().to_string());
+            }
+        }
+        search_from = block_start + end_rel + b"</Identity>".len();
+    }
+    out
+}
+
+fn substring(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+// ---- WIP2-only action argument parsing (plan/0008 #v2-service-set) ----
+
+/// AddAnyPortMapping: like AddPortMapping but the requested external port
+/// is a preference (0 = "any" is rejected explicitly for now; the engine
+/// allocates the granted port and NewReservedPort answers it).
+fn parse_add_args_any(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
+    parse_add_args(body)
+}
+
+/// DeletePortMappingRange: NewStartPort/NewEndPort/NewProtocol. The range
+/// endpoints are honored as an entry filter — no scan over the port span.
+fn parse_range_args(body: &[u8]) -> Result<(u16, u16, Proto), UpnpErr> {
+    let start = tag_u16(body, b"NewStartPort").ok_or(UpnpErr::InvalidArgs)?;
+    let end = tag_u16(body, b"NewEndPort").ok_or(UpnpErr::InvalidArgs)?;
+    if end < start {
+        return Err(UpnpErr::InvalidArgs);
+    }
+    let proto = match xml_tag(body, b"NewProtocol") {
+        Some(p) if eq_ia(p, b"TCP") => Proto::Tcp,
+        Some(p) if eq_ia(p, b"UDP") => Proto::Udp,
+        _ => return Err(UpnpErr::InvalidArgs),
+    };
+    Ok((start, end, proto))
+}
+
+/// GetListOfPortMappings: NewStartPort/NewEndPort/NewProtocol
+/// (TCP|UDP|ALL)/NewNumberOfPorts. NewManage is accepted and ignored
+/// (managed entries are not a concept this facade exposes).
+fn parse_list_args(body: &[u8]) -> Result<(u16, u16, Option<Proto>, u16), UpnpErr> {
+    let start = tag_u16(body, b"NewStartPort").ok_or(UpnpErr::InvalidArgs)?;
+    let end = tag_u16(body, b"NewEndPort").ok_or(UpnpErr::InvalidArgs)?;
+    if end < start {
+        return Err(UpnpErr::InvalidArgs);
+    }
+    let proto = match xml_tag(body, b"NewProtocol") {
+        Some(p) if eq_ia(p, b"TCP") => Some(Proto::Tcp),
+        Some(p) if eq_ia(p, b"UDP") => Some(Proto::Udp),
+        Some(p) if eq_ia(p, b"ALL") => None,
+        _ => return Err(UpnpErr::InvalidArgs),
+    };
+    let max = tag_u16(body, b"NewNumberOfPorts").unwrap_or(0);
+    Ok((start, end, proto, max))
 }
 
 /// Fire one GENA NOTIFY at a callback (bounded by the caller's timeout).
@@ -1741,6 +2271,82 @@ const NOTIFY_STS: [SearchTarget; 6] = [
 ];
 
 // ---- identity (stable UDN from the br-lan MAC; bootid persists) ----
+
+// ---- plan/0008 #v2-service-set: DeviceProtection helpers ----
+
+/// The device's 16-octet identity (the DeviceID in the PKCS5
+/// authenticator computation, spec 2.6.6.4). Derived from the stable
+/// root UDN: the dashed-hex UUID's bytes when the UDN is dashed hex,
+/// else a stable fnv projection. Both the device and a control point
+/// derive the same value from the same UDN, so the ceremony binds.
+fn dp_device_id(udn: &str) -> [u8; 16] {
+    let core = udn.strip_prefix("uuid:").unwrap_or(udn);
+    let mut hex = String::with_capacity(32);
+    for c in core.chars() {
+        if c != '-' {
+            hex.push(c);
+        }
+    }
+    if let Some(id) = dp::unhex16(&hex) {
+        return id;
+    }
+    let mut data = Vec::new();
+    data.extend_from_slice(b"dp-device-id");
+    data.extend_from_slice(udn.as_bytes());
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&fnv1a(&data, 0xcbf29ce484222325).to_be_bytes());
+    raw[8..].copy_from_slice(&fnv1a(&data, 0x9e3779b97f4a7c15).to_be_bytes());
+    raw
+}
+
+/// Load the persistent DP security configuration (users + ACL, plan/0008
+/// section 26.15) from `dp.tsv`; absent or unreadable config yields the
+/// restrictive default: an empty ACL, so every protected action is denied
+/// until the operator provisions `dp.tsv` out-of-band.
+fn dp_load(dir: &str, device_id: [u8; 16]) -> dp::DpState {
+    let path = format!("{}/dp.tsv", dir);
+    let (users, acl) = match std::fs::read_to_string(&path) {
+        Ok(text) => dp::config_from_tsv(&text),
+        Err(_) => (Vec::new(), dp::DpAcl::default()),
+    };
+    dp::DpState::new(device_id, users, acl)
+}
+
+/// Atomically persist the DP security configuration (tmpfile + rename,
+/// the same discipline as leases.tsv).
+fn dp_save(dir: &str, state: &dp::DpState) {
+    let _ = std::fs::create_dir_all(dir);
+    let text = dp::config_tsv(&state.users, &state.acl);
+    let tmp = format!("{}/dp.tsv.tmp", dir);
+    let final_path = format!("{}/dp.tsv", dir);
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, final_path);
+    }
+}
+
+/// A fresh 16-octet random nonce (challenge/Salt source). Bounded read:
+/// exactly 16 bytes from /dev/urandom (the facade's earlier unbounded
+/// urandom read is the recorded OOM root cause; never read unbounded).
+fn dp_random_16() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if let Ok(f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let mut cap = f.take(16);
+        let _ = cap.read_exact(&mut out);
+    }
+    out
+}
+
+/// Map a DeviceProtection error onto the facade error surface (the SOAP
+/// fault codes of spec 2.6.15).
+fn map_dp_err(e: dp::DpErr) -> UpnpErr {
+    match e {
+        dp::DpErr::InvalidValue => UpnpErr::InvalidValue,
+        dp::DpErr::NotAuthorized => UpnpErr::NotAuthorized,
+        dp::DpErr::AuthFailure => UpnpErr::AuthFailure,
+        dp::DpErr::Processing => UpnpErr::Processing,
+    }
+}
 
 fn load_identity(state_dir: &str, lan_ip: Ipv4Addr, bind_ip: Ipv4Addr) -> (String, u32) {
     let path = format!("{}/upnp-ident", state_dir);
@@ -2389,6 +2995,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2510,6 +3117,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
 
         let bind_port = 41001;
@@ -2649,6 +3257,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
 
         facade.spawn_restored_grants().await;
@@ -2716,6 +3325,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
 
         let cb = format!("<http://127.0.0.1:{}/evt>", port);
@@ -2805,6 +3415,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         })
     }
 
@@ -3024,6 +3635,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3095,6 +3707,7 @@ mod tests {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
         let addr = facade.ssdp.local_addr().unwrap();
         let f = facade.clone();
@@ -3222,6 +3835,7 @@ mod ifindex_probe {
             started_unix: 0,
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
         });
 
         // Dump the generated rootDesc for the external miniupnpc parser.
@@ -3277,5 +3891,372 @@ mod ifindex_probe {
             "upnpc must accept the device: {}",
             text
         );
+    }
+
+    /// A seeded DeviceProtection state for the wire tests: device id, one
+    /// Admin user, one Admin CP identity in the ACL.
+    fn dp_seeded() -> std::sync::Mutex<crate::dp::DpState> {
+        let device_id: [u8; 16] = [0xdd; 16];
+        let salt = [11u8; 16];
+        let users = vec![crate::dp::DpUser {
+            name: "admin".into(),
+            salt,
+            stored: crate::dp::stored_for(b"admin-pw", b"admin", &salt),
+            roles: vec!["Admin".into()],
+        }];
+        let acl = crate::dp::DpAcl {
+            identities: vec![crate::dp::DpIdentity {
+                name: "admin-cp".into(),
+                alias: None,
+                id: [0xca; 16],
+                roles: vec!["Admin".into()],
+            }],
+        };
+        std::sync::Mutex::new(crate::dp::DpState::new(device_id, users, acl))
+    }
+
+    /// One SOAP POST; returns the raw response.
+    async fn soap_post(addr: &str, path: &str, soapaction: &str, body: &str) -> String {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nSOAPACTION: \"{}\"\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            path,
+            addr,
+            soapaction,
+            body.len(),
+            body
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// The DeviceProtection 26.19 boundary at the wire: the v2 WIP2 face
+    /// is gated behind the PKCS5 session; the v1 face is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dp_boundary_wire() {
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/dp-wire".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "dp-wire".into(),
+            grace_secs: 60,
+        };
+        let table = Arc::new(Mutex::new(LeaseTable::new(
+            PortAllocator::new(30000, 30009).unwrap(),
+            4,
+            2,
+        )));
+        let publisher =
+            Arc::new(Publisher::with_watch("/tmp/none", watch::channel(Ipv4Addr::LOCALHOST).0));
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table,
+            publisher,
+            entries: Mutex::new(Vec::new()),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("dp-wire"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: dp_seeded(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let f2 = facade.clone();
+        tokio::spawn(async move {
+            let _ = http_serve(listener, f2).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let env = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:";
+
+        // the v2 SCPD carries the authoritative 13, not the superseded names
+        // (the R5 mount gate keeps /igd/v2/* unserved until the complete
+        // service set lands, so the document itself is asserted here; the
+        // wired GET check lives with the gate-off integration harness)
+        let scpd = String::from_utf8_lossy(SCPD_DP.as_bytes());
+        for name in [
+            "SendSetupMessage",
+            "GetSupportedProtocols",
+            "GetAssignedRoles",
+            "GetRolesForAction",
+            "GetUserLoginChallenge",
+            "UserLogin",
+            "UserLogout",
+            "GetACLData",
+            "AddIdentityList",
+            "RemoveIdentity",
+            "SetUserLoginPassword",
+            "AddRolesForIdentity",
+            "RemoveRolesForIdentity",
+        ] {
+            assert!(scpd.contains(name), "SCPD must declare {}", name);
+        }
+        assert!(!scpd.contains("RequestUserLogin"), "superseded name gone");
+
+        // GetSupportedProtocols: public, no session
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetSupportedProtocols",
+            &format!(
+                "{}GetSupportedProtocols xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"/></s:Body></s:Envelope>",
+                env
+            ),
+        )
+        .await;
+        assert!(r.contains("200 OK") && r.contains("PKCS5"), "public action: {}", &r[..r.len().min(200)]);
+
+        // GetACLData without a session: the DP-defined 606 fault, not a stub
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetACLData",
+            &format!(
+                "{}GetACLData xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"/></s:Body></s:Envelope>",
+                env
+            ),
+        )
+        .await;
+        assert!(r.contains("<errorCode>606</errorCode>"), "unauth 606: {}", &r[..r.len().min(300)]);
+
+        // the v2 WIP2 boundary: AddPortMapping with the :2 URN is denied
+        // without a session ...
+        let mut r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#AddPortMapping",
+            &format!("{}AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewRemoteHost></NewRemoteHost><NewExternalPort>12345</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>12345</NewInternalPort><NewInternalClient>192.168.21.50</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>dp-wire</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration></AddPortMapping></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            r.contains("<errorCode>606</errorCode>"),
+            "v2 boundary denies unauth: {}",
+            &r[..r.len().min(300)]
+        );
+        // ... while the same request against the :1 face is NOT gated (it
+        // reaches the engine, which fails on nft here, but not with 606)
+        r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping",
+            &format!("{}AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewRemoteHost></NewRemoteHost><NewExternalPort>12346</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>12346</NewInternalPort><NewInternalClient>192.168.21.50</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>dp-wire</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration></AddPortMapping></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            !r.contains("</errorCode>606") && !r.contains("<errorCode>606</errorCode>"),
+            "v1 face un-gated: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // the full PKCS5 ceremony over the wire: challenge -> authenticator
+        // -> UserLogin; then the protected actions open
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetUserLoginChallenge",
+            &format!("{}GetUserLoginChallenge xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"><ProtocolType>PKCS5</ProtocolType><Name>admin</Name></GetUserLoginChallenge></s:Body></s:Envelope>", env),
+        )
+        .await;
+        assert!(r.contains("200 OK"), "challenge: {}", &r[..r.len().min(200)]);
+        let salt_b64 = String::from_utf8_lossy(upnp::xml_tag(r.as_bytes(), b"Salt").unwrap()).into_owned();
+        let challenge_b64 =
+            String::from_utf8_lossy(upnp::xml_tag(r.as_bytes(), b"Challenge").unwrap()).into_owned();
+        let salt = crate::dp::base64_decode(salt_b64.trim()).unwrap();
+        let challenge = crate::dp::base64_decode(challenge_b64.trim()).unwrap();
+        let mut salt16 = [0u8; 16];
+        salt16.copy_from_slice(&salt);
+        let stored = crate::dp::stored_for(b"admin-pw", b"admin", &salt16);
+        let mut mac_in = Vec::new();
+        mac_in.extend_from_slice(&challenge);
+        mac_in.extend_from_slice(&[0xdd; 16]); // device id
+        mac_in.extend_from_slice(&[0xca; 16]); // the CP identity
+        let mac = crate::dp::hmac_sha256(&stored, &mac_in);
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#UserLogin",
+            &format!(
+                "{}UserLogin xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"><ProtocolType>PKCS5</ProtocolType><Challenge>{}</Challenge><Authenticator>{}</Authenticator></UserLogin></s:Body></s:Envelope>",
+                env,
+                crate::dp::base64_encode(&challenge),
+                crate::dp::base64_encode(&mac[..16])
+            ),
+        )
+        .await;
+        assert!(r.contains("200 OK"), "UserLogin: {}", &r[..r.len().min(300)]);
+
+        // the session now carries Admin: GetACLData opens, roles show Admin
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetACLData",
+            &format!(
+                "{}GetACLData xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"/></s:Body></s:Envelope>",
+                env
+            ),
+        )
+        .await;
+        assert!(
+            r.contains("admin-cp") && r.contains("<Role>Admin</Role>"),
+            "ACL after login: {}",
+            &r[..r.len().min(400)]
+        );
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetAssignedRoles",
+            &format!(
+                "{}GetAssignedRoles xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"/></s:Body></s:Envelope>",
+                env
+            ),
+        )
+        .await;
+        assert!(
+            r.contains("<RoleList>Admin</RoleList>"),
+            "assigned roles: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // the v2 mapping boundary now passes: the gate yields to the
+        // engine (which fails on nft here — but NOT with 606)
+        let r = soap_post(
+            &addr,
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#AddPortMapping",
+            &format!("{}AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewRemoteHost></NewRemoteHost><NewExternalPort>12345</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>12345</NewInternalPort><NewInternalClient>192.168.21.50</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>dp-wire</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration></AddPortMapping></s:Body></s:Envelope>", env))
+        .await;
+        assert!(
+            !r.contains("<errorCode>606</errorCode>"),
+            "authorized v2 reaches the engine: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // UserLogout closes the session: GetACLData is 606 again
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#UserLogout",
+            &format!(
+                "{}UserLogout xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"/></s:Body></s:Envelope>",
+                env
+            ),
+        )
+        .await;
+        assert!(r.contains("200 OK"), "logout: {}", &r[..r.len().min(200)]);
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetACLData",
+            &format!(
+                "{}GetACLData xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"/></s:Body></s:Envelope>",
+                env
+            ),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>606</errorCode>"),
+            "logout closes the session: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // a wrong password on the verifier core: bad Authenticator -> 701
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#GetUserLoginChallenge",
+            &format!("{}GetUserLoginChallenge xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"><ProtocolType>PKCS5</ProtocolType><Name>admin</Name></GetUserLoginChallenge></s:Body></s:Envelope>", env),
+        )
+        .await;
+        let challenge_b64 =
+            String::from_utf8_lossy(upnp::xml_tag(r.as_bytes(), b"Challenge").unwrap()).into_owned();
+        let challenge = crate::dp::base64_decode(challenge_b64.trim()).unwrap();
+        let mut mac_in = Vec::new();
+        mac_in.extend_from_slice(&challenge);
+        mac_in.extend_from_slice(&[0xdd; 16]);
+        mac_in.extend_from_slice(&[0xca; 16]);
+        let wrong = crate::dp::hmac_sha256(&[7u8; 16], &mac_in);
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#UserLogin",
+            &format!(
+                "{}UserLogin xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"><ProtocolType>PKCS5</ProtocolType><Challenge>{}</Challenge><Authenticator>{}</Authenticator></UserLogin></s:Body></s:Envelope>",
+                env,
+                crate::dp::base64_encode(&challenge),
+                crate::dp::base64_encode(&wrong[..16])
+            ),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>701</errorCode>"),
+            "bad authenticator -> 701: {}",
+            &r[..r.len().min(300)]
+        );
+
+        // SendSetupMessage: unsupported ProtocolType 600; WPS 704 (no
+        // registrar on a wired IGD)
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#SendSetupMessage",
+            &format!("{}SendSetupMessage xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"><ProtocolType>BOGUS</ProtocolType><InMessage>AA==</InMessage></SendSetupMessage></s:Body></s:Envelope>", env),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>600</errorCode>"),
+            "unknown protocol -> 600: {}",
+            &r[..r.len().min(300)]
+        );
+        let r = soap_post(
+            &addr,
+            "/ctl/DP",
+            "urn:schemas-upnp-org:service:DeviceProtection:1#SendSetupMessage",
+            &format!("{}SendSetupMessage xmlns:u=\"urn:schemas-upnp-org:service:DeviceProtection:1\"><ProtocolType>WPS</ProtocolType><InMessage>AA==</InMessage></SendSetupMessage></s:Body></s:Envelope>", env),
+        )
+        .await;
+        assert!(
+            r.contains("<errorCode>704</errorCode>"),
+            "WPS without a registrar -> 704: {}",
+            &r[..r.len().min(300)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dp_config_persistence_wire() {
+        // 26.15: users + ACL persist across a restart; sessions do not.
+        let dir = "/tmp/dp-wire-state";
+        let _ = std::fs::remove_dir_all(dir);
+        let device_id: [u8; 16] = [0xee; 16];
+        let salt = [21u8; 16];
+        let users = vec![crate::dp::DpUser {
+            name: "admin".into(),
+            salt,
+            stored: crate::dp::stored_for(b"pw", b"admin", &salt),
+            roles: vec!["Admin".into()],
+        }];
+        let acl = crate::dp::DpAcl {
+            identities: vec![crate::dp::DpIdentity {
+                name: "admin-cp".into(),
+                alias: None,
+                id: [0xca; 16],
+                roles: vec!["Admin".into()],
+            }],
+        };
+        let mut st = crate::dp::DpState::new(device_id, users, acl);
+        st.begin_login("192.168.21.5".parse().unwrap(), "admin", [3u8; 16], 1000)
+            .unwrap();
+        dp_save(dir, &st);
+        let reloaded = dp_load(dir, device_id);
+        // the config (users + ACL) survived; the session did not
+        assert_eq!(reloaded.users.len(), 1);
+        assert_eq!(reloaded.acl.identities.len(), 1);
+        assert_eq!(reloaded.session_roles("192.168.21.5".parse().unwrap(), 2000).len(), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

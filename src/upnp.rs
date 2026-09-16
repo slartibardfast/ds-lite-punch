@@ -493,33 +493,50 @@ impl Default for SidSet {
 
 // ---- SOAP (E3) ----
 
-/// The three services the facade answers: the two WAN connection services
-/// (the PPP alias answers identically to IP) and the
+/// The services the facade answers: the two WAN connection services
+/// (the PPP alias answers identically to IP), the
 /// WANCommonInterfaceConfig service every IGD control point requires the
 /// root device to advertise before it validates the device (miniupnpc's
 /// GetValidIGD marks a device as an IGD only when its rootDesc carries
-/// `urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1`).
+/// `urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1`), and
+/// DeviceProtection:1 (plan/0008 #v2-service-set).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoapService {
     WanIpConnection,
     WanPppConnection,
     WanCommonIfaceCfg,
+    DeviceProtection,
 }
 
-/// The service URN for SOAP responses and SCPD references.
+/// The service URN for SOAP responses and SCPD references. For the
+/// connection service the URN's version follows the invocation's own
+/// version attribution (a `:2` SOAPACTION gets a `:2` envelope): use
+/// [`service_urn_v`].
+#[allow(dead_code)] // the v1 envelope builder, exercised by the test suite
 pub fn service_urn(s: SoapService) -> &'static [u8] {
+    service_urn_v(s, false)
+}
+
+/// The response-envelope service URN for an invocation, honouring the
+/// version attribution carried in the SOAPACTION (`v2` picks the
+/// WANIPConnection:2 URN; plan/0008 section 17 version-specific SOAP
+/// semantics).
+pub fn service_urn_v(s: SoapService, v2: bool) -> &'static [u8] {
     match s {
+        SoapService::WanIpConnection if v2 => b"urn:schemas-upnp-org:service:WANIPConnection:2",
         SoapService::WanIpConnection => b"urn:schemas-upnp-org:service:WANIPConnection:1",
         SoapService::WanPppConnection => b"urn:schemas-upnp-org:service:WANPPPConnection:1",
         SoapService::WanCommonIfaceCfg => {
             b"urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1"
         }
+        SoapService::DeviceProtection => b"urn:schemas-upnp-org:service:DeviceProtection:1",
     }
 }
 
 pub const CTL_IPCONN: &[u8] = b"/ctl/IPConn";
 pub const CTL_PPPCONN: &[u8] = b"/ctl/PPPConn";
 pub const CTL_CMNIFCFG: &[u8] = b"/ctl/CmnIfCfg";
+pub const CTL_DP: &[u8] = b"/ctl/DP";
 
 pub fn service_of_path(path: &[u8]) -> Option<SoapService> {
     if eq_ia(path, CTL_IPCONN) {
@@ -531,11 +548,17 @@ pub fn service_of_path(path: &[u8]) -> Option<SoapService> {
     if eq_ia(path, CTL_CMNIFCFG) {
         return Some(SoapService::WanCommonIfaceCfg);
     }
+    if eq_ia(path, CTL_DP) {
+        return Some(SoapService::DeviceProtection);
+    }
     None
 }
 
 /// The IGDv1 actions the facade honours (E3): the WANIPConnection:1 set,
 /// plus GetCommonLinkProperties on the WANCommonInterfaceConfig:1 service.
+/// DeviceProtection:1's thirteen actions (the authoritative surface,
+/// docs/upnp-dp1/TRANSCRIPTION.md) and the WANIPConnection:2-only actions
+/// ride the same table (plan/0008 #v2-service-set).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoapAction {
     GetExternalIpAddress,
@@ -546,6 +569,24 @@ pub enum SoapAction {
     GetSpecificPortMappingEntry,
     GetGenericPortMappingEntry,
     GetCommonLinkProperties,
+    // WANIPConnection:2-only surface
+    AddAnyPortMapping,
+    DeletePortMappingRange,
+    GetListOfPortMappings,
+    // DeviceProtection:1 (the authoritative 13; 2.6.1-2.6.13)
+    SendSetupMessage,
+    GetSupportedProtocols,
+    GetAssignedRoles,
+    GetRolesForAction,
+    GetUserLoginChallenge,
+    UserLogin,
+    UserLogout,
+    GetAclData,
+    AddIdentityList,
+    RemoveIdentity,
+    SetUserLoginPassword,
+    AddRolesForIdentity,
+    RemoveRolesForIdentity,
 }
 
 pub fn soap_action_name(a: SoapAction) -> &'static [u8] {
@@ -558,6 +599,22 @@ pub fn soap_action_name(a: SoapAction) -> &'static [u8] {
         SoapAction::GetSpecificPortMappingEntry => b"GetSpecificPortMappingEntry",
         SoapAction::GetGenericPortMappingEntry => b"GetGenericPortMappingEntry",
         SoapAction::GetCommonLinkProperties => b"GetCommonLinkProperties",
+        SoapAction::AddAnyPortMapping => b"AddAnyPortMapping",
+        SoapAction::DeletePortMappingRange => b"DeletePortMappingRange",
+        SoapAction::GetListOfPortMappings => b"GetListOfPortMappings",
+        SoapAction::SendSetupMessage => b"SendSetupMessage",
+        SoapAction::GetSupportedProtocols => b"GetSupportedProtocols",
+        SoapAction::GetAssignedRoles => b"GetAssignedRoles",
+        SoapAction::GetRolesForAction => b"GetRolesForAction",
+        SoapAction::GetUserLoginChallenge => b"GetUserLoginChallenge",
+        SoapAction::UserLogin => b"UserLogin",
+        SoapAction::UserLogout => b"UserLogout",
+        SoapAction::GetAclData => b"GetACLData",
+        SoapAction::AddIdentityList => b"AddIdentityList",
+        SoapAction::RemoveIdentity => b"RemoveIdentity",
+        SoapAction::SetUserLoginPassword => b"SetUserLoginPassword",
+        SoapAction::AddRolesForIdentity => b"AddRolesForIdentity",
+        SoapAction::RemoveRolesForIdentity => b"RemoveRolesForIdentity",
     }
 }
 
@@ -585,12 +642,48 @@ pub fn parse_soap_action(hdr: &[u8]) -> Option<SoapAction> {
         SoapAction::GetSpecificPortMappingEntry,
         SoapAction::GetGenericPortMappingEntry,
         SoapAction::GetCommonLinkProperties,
+        SoapAction::AddAnyPortMapping,
+        SoapAction::DeletePortMappingRange,
+        SoapAction::GetListOfPortMappings,
+        SoapAction::SendSetupMessage,
+        SoapAction::GetSupportedProtocols,
+        SoapAction::GetAssignedRoles,
+        SoapAction::GetRolesForAction,
+        SoapAction::GetUserLoginChallenge,
+        SoapAction::UserLogin,
+        SoapAction::UserLogout,
+        SoapAction::GetAclData,
+        SoapAction::AddIdentityList,
+        SoapAction::RemoveIdentity,
+        SoapAction::SetUserLoginPassword,
+        SoapAction::AddRolesForIdentity,
+        SoapAction::RemoveRolesForIdentity,
     ] {
         if eq_ia(soap_action_name(a), name) {
             return Some(a);
         }
     }
     None
+}
+
+/// The version attribution of a SOAPACTION value: true when the service
+/// URN before the `#` names WANIPConnection:2 (plan/0008 section 17: the
+/// version lives in the invocation's service type, since the v1 and v2
+/// control URLs are shared).
+pub fn soapaction_is_v2(v: &[u8]) -> bool {
+    let v = strip_quotes(trim(v));
+    let mut hash: Option<usize> = None;
+    for i in (0..v.len()).rev() {
+        if v[i] == b'#' {
+            hash = Some(i);
+            break;
+        }
+    }
+    let (urn, _) = match hash {
+        Some(h) => (&v[..h], &v[h + 1..]),
+        None => return false,
+    };
+    eq_ia(urn, b"urn:schemas-upnp-org:service:WANIPConnection:2")
 }
 
 /// The envelope-namespace prefix (the `ns=NN` token) of an M-POST MAN
@@ -656,10 +749,13 @@ pub enum ReqClass {
     /// A description-document GET.
     Get,
     /// A SOAP invocation; the action table is shared between the two
-    /// services (the alias answers identically).
+    /// services (the alias answers identically). `v2` is the service
+    /// version attribution from the SOAPACTION URN (plan/0008 section
+    /// 17: the v1/v2 control URLs are shared, so the URN decides).
     Soap {
         service: SoapService,
         action: SoapAction,
+        v2: bool,
     },
     /// GENA control messages (E5).
     GenaSubscribe,
@@ -761,8 +857,12 @@ pub fn classify(head: &[u8]) -> ReqClass {
     let Some(action) = parse_soap_action(soapaction) else {
         return ReqClass::SoapInvalidAction;
     };
+    // The version attribution is read from the SAME soapaction value in
+    // both transports, so the POST/M-POST parity property holds for the
+    // new field exactly as for the action.
+    let v2 = soapaction_is_v2(soapaction);
     match service_of_path(path) {
-        Some(service) => ReqClass::Soap { service, action },
+        Some(service) => ReqClass::Soap { service, action, v2 },
         None => ReqClass::SoapInvalidAction,
     }
 }
@@ -781,6 +881,16 @@ pub enum UpnpErr {
     NoSuchEntry,
     /// 501 Action Failed (quota, table full, datapath failure).
     ActionFailed,
+    /// 600 Argument Value Invalid (DeviceProtection: 2.6.15).
+    InvalidValue,
+    /// 606 Action not authorized (DeviceProtection: 2.6.5.10 and the
+    /// admin-action error tables; the DP-defined authorization fault per
+    /// plan/0008 section 26.13).
+    NotAuthorized,
+    /// 701 Authentication Failure (DeviceProtection: 2.6.6.9).
+    AuthFailure,
+    /// 704 Processing Error (DeviceProtection: 2.6.1.9).
+    Processing,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -805,13 +915,32 @@ pub const FAULT_NO_SUCH_ENTRY: UpnpFault = UpnpFault {
     code: 714,
     desc: "NoSuchEntryInArray",
 };
-
+pub const FAULT_INVALID_VALUE: UpnpFault = UpnpFault {
+    code: 600,
+    desc: "Argument Value Invalid",
+};
+pub const FAULT_NOT_AUTHORIZED: UpnpFault = UpnpFault {
+    code: 606,
+    desc: "Action not authorized",
+};
+pub const FAULT_AUTH_FAILURE: UpnpFault = UpnpFault {
+    code: 701,
+    desc: "Authentication Failure",
+};
+pub const FAULT_PROCESSING: UpnpFault = UpnpFault {
+    code: 704,
+    desc: "Processing Error",
+};
 pub fn fault_of(e: UpnpErr) -> UpnpFault {
     match e {
         UpnpErr::InvalidAction => FAULT_INVALID_ACTION,
         UpnpErr::InvalidArgs => FAULT_INVALID_ARGS,
         UpnpErr::NoSuchEntry => FAULT_NO_SUCH_ENTRY,
         UpnpErr::ActionFailed => FAULT_ACTION_FAILED,
+        UpnpErr::InvalidValue => FAULT_INVALID_VALUE,
+        UpnpErr::NotAuthorized => FAULT_NOT_AUTHORIZED,
+        UpnpErr::AuthFailure => FAULT_AUTH_FAILURE,
+        UpnpErr::Processing => FAULT_PROCESSING,
     }
 }
 
@@ -1057,8 +1186,16 @@ pub fn notify_payload(
 /// A 200 OK SOAP envelope carrying `inner` (the action-specific response
 /// element text, without the envelope). The response namespace matches the
 /// service the request addressed (IP or PPP alias).
+#[allow(dead_code)] // the v1 envelope builder, exercised by the test suite
 pub fn soap_success(service: SoapService, action: &str, inner: &str) -> Vec<u8> {
-    let urn = String::from_utf8_lossy(service_urn(service));
+    soap_success_v(service, false, action, inner)
+}
+
+/// [`soap_success`] honouring the invocation's version attribution: a v2
+/// WANIPConnection invocation is answered from the `:2` namespace
+/// (plan/0008 section 17).
+pub fn soap_success_v(service: SoapService, v2: bool, action: &str, inner: &str) -> Vec<u8> {
+    let urn = String::from_utf8_lossy(service_urn_v(service, v2));
     format!(
         "<?xml version=\"1.0\"?>\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
          s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
@@ -1179,7 +1316,8 @@ mod tests {
             classify(post),
             ReqClass::Soap {
                 service: SoapService::WanIpConnection,
-                action: SoapAction::AddPortMapping
+                action: SoapAction::AddPortMapping,
+                v2: false
             }
         );
         let ppp = b"POST /ctl/PPPConn HTTP/1.1\r\nSOAPACTION: urn:schemas-upnp-org:service:WANPPPConnection:1#GetStatusInfo\r\n\r\n";
@@ -1187,7 +1325,8 @@ mod tests {
             classify(ppp),
             ReqClass::Soap {
                 service: SoapService::WanPppConnection,
-                action: SoapAction::GetStatusInfo
+                action: SoapAction::GetStatusInfo,
+                v2: false
             }
         );
         let bad = b"POST /ctl/IPConn HTTP/1.1\r\nSOAPACTION: \"urn:...#Nope\"\r\n\r\n";
@@ -1198,7 +1337,8 @@ mod tests {
             classify(cif),
             ReqClass::Soap {
                 service: SoapService::WanCommonIfaceCfg,
-                action: SoapAction::GetCommonLinkProperties
+                action: SoapAction::GetCommonLinkProperties,
+                v2: false
             }
         );
     }
@@ -1212,7 +1352,8 @@ mod tests {
             classify(mpost),
             ReqClass::Soap {
                 service: SoapService::WanIpConnection,
-                action: SoapAction::GetExternalIpAddress
+                action: SoapAction::GetExternalIpAddress,
+                v2: false
             }
         );
         // foreign MAN -> invalid

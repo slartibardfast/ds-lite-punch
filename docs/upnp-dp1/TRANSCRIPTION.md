@@ -84,7 +84,7 @@ specimen typo.
   (case-sensitive identity, the certificate CN), optional `<Alias>`, and a
   `<RoleList>` of `<Role>` names.
 - Identities are identified by their 16-octet binary ID (the CP's UUID).
-- Role names are case-sensitive strings; e.g. `Administrator`, `Basic`.
+- Role names are case-sensitive strings; the standard roles are `Public`, `Basic` and `Admin` (section 0).
 - The ACL is local to a device; DeviceProtection defines no network-wide
   ACL (2.6.8).
 
@@ -126,9 +126,9 @@ specimen typo.
   role requirement; the device answers an unauthorized invocation with
   `606 Action Not Authorized` (UPnP architecture; the DP error tables cite
   600-699 as TBD where unspecified).
-- Recommended roles are named per action (e.g. GetRolesForAction is
-  recommended Public (2.6.4.8), AddIdentityList Basic or Admin (2.6.9.5),
-  UserLogout Public (2.6.7.2)); the device decides the enforced set.
+- Recommended roles are named per action (e.g. SendSetupMessage Public (2.6.1.6), AddIdentityList Basic or Admin
+  (2.6.9.5), UserLogout Public (2.6.7.2)); the device decides the enforced
+  set (plan/0008 section 26.6).
 - **Source-IP independence:** the authorization decision in this
   implementation is a pure function of the CP identity's roles and the
   action's requirement; the transport address plays no part. (This is a
