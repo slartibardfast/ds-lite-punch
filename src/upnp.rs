@@ -519,7 +519,7 @@ pub fn service_urn(s: SoapService) -> &'static [u8] {
 
 /// The response-envelope service URN for an invocation, honouring the
 /// version attribution carried in the SOAPACTION (`v2` picks the
-/// WANIPConnection:2 URN; plan/0008 section 17 version-specific SOAP
+/// WANIPConnection:2 URN; plan/0008's version-specific SOAP semantics version-specific SOAP
 /// semantics).
 pub fn service_urn_v(s: SoapService, v2: bool) -> &'static [u8] {
     match s {
@@ -681,7 +681,7 @@ pub fn parse_soap_action(hdr: &[u8]) -> Option<SoapAction> {
 }
 
 /// The version attribution of a SOAPACTION value: true when the service
-/// URN before the `#` names WANIPConnection:2 (plan/0008 section 17: the
+/// URN before the `#` names WANIPConnection:2 (plan/0008's version-specific SOAP semantics: the
 /// version lives in the invocation's service type, since the v1 and v2
 /// control URLs are shared).
 pub fn soapaction_is_v2(v: &[u8]) -> bool {
@@ -764,8 +764,8 @@ pub enum ReqClass {
     Get,
     /// A SOAP invocation; the action table is shared between the two
     /// services (the alias answers identically). `v2` is the service
-    /// version attribution from the SOAPACTION URN (plan/0008 section
-    /// 17: the v1/v2 control URLs are shared, so the URN decides).
+    /// version attribution from the SOAPACTION URN (the version-specific
+    /// SOAP semantics: the v1/v2 control URLs are shared, so the URN decides).
     Soap {
         service: SoapService,
         action: SoapAction,
@@ -808,7 +808,7 @@ pub fn classify(head: &[u8]) -> ReqClass {
         if eq_ia(path, b"/") || eq_ia(path, b"/rootDesc.xml")
             || eq_ia(path, b"/WANIPC.xml") || eq_ia(path, b"/WANPPP.xml")
             || eq_ia(path, b"/WANCfg.xml")
-            // plan/0008 section 21: the deterministic versioned URLs
+            // plan/0008's LOCATION design: the deterministic versioned URLs
             // (the v2 prefix is recognized even while the mount gate is
             // off; the per-route 404 then comes from the router's None
             // arm, so a gated path is a clean not-offered response)
@@ -914,7 +914,7 @@ pub enum UpnpErr {
     InvalidValue,
     /// 606 Action not authorized (DeviceProtection: 2.6.5.10 and the
     /// admin-action error tables; the DP-defined authorization fault per
-    /// plan/0008 section 26.13).
+    /// plan/0008's error handling).
     NotAuthorized,
     /// 701 Authentication Failure (DeviceProtection: 2.6.6.9).
     AuthFailure,
@@ -1179,7 +1179,7 @@ pub fn http_date(unix: u64) -> String {
 }
 
 /// One SSDP M-SEARCH response (unicast to the requester). `loc_path`
-/// is the versioned description URL path (plan/0008 section 21), e.g.
+/// is the versioned description URL path (plan/0008's LOCATION design), e.g.
 /// `/igd/v1/rootDesc.xml` for the v1 presentation.
 pub fn msearch_response(
     st: SearchTarget,
@@ -1205,7 +1205,7 @@ pub fn msearch_response(
 }
 
 /// One SSDP NOTIFY advertisement (alive or byebye), multicast. `loc_path`
-/// is the versioned description URL path (plan/0008 section 21).
+/// is the versioned description URL path (plan/0008's LOCATION design).
 pub fn notify_payload(
     st: SearchTarget,
     nts: &[u8],
@@ -1242,7 +1242,7 @@ pub fn soap_success(service: SoapService, action: &str, inner: &str) -> Vec<u8> 
 
 /// [`soap_success`] honouring the invocation's version attribution: a v2
 /// WANIPConnection invocation is answered from the `:2` namespace
-/// (plan/0008 section 17).
+/// (plan/0008's version-specific SOAP semantics).
 pub fn soap_success_v(service: SoapService, v2: bool, action: &str, inner: &str) -> Vec<u8> {
     let urn = String::from_utf8_lossy(service_urn_v(service, v2));
     format!(

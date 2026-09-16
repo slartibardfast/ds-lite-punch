@@ -356,7 +356,7 @@ pub enum DpErr {
 /// a session. The principal (user + CP identity + roles) is established
 /// by the PKCS5 challenge-response; the address keys the session the same
 /// way the TLS connection handle does and is never the authorization
-/// input itself (plan/0008 section 26.8).
+/// input itself (plan/0008's security context).
 #[derive(Clone, Debug)]
 struct DpSession {
     /// the most recent challenge issued (2.6.5.9: only the most recent is
@@ -389,7 +389,7 @@ impl DpSession {
 }
 
 /// Session idle ceiling for a plain-HTTP login session (the "session
-/// validity / expiry" of plan/0008 section 26.8; the spec's sessions die
+/// validity / expiry" of plan/0008's security context; the spec's sessions die
 /// with the TLS connection, which this facade does not offer).
 pub const DP_SESSION_TTL_SECS: u64 = 1800;
 
@@ -399,7 +399,7 @@ pub const DP_SESSION_TTL_SECS: u64 = 1800;
 pub const DP_LOGIN_FAILURE_LIMIT: u8 = 5;
 
 /// The full DP:1 service state: the persistent security configuration
-/// (users + ACL, per plan/0008 section 26.15) and the transient sessions.
+/// (users + ACL, per plan/0008's persistence rules) and the transient sessions.
 /// Pure and io-free: the clock is injected so the conformance tests are
 /// deterministic, and the caller persists through `config_tsv` /
 /// `config_from_tsv`.
@@ -593,7 +593,7 @@ impl DpState {
         }
     }
 
-    /// The authorization decision (plan/0008 section 26.8): a pure
+    /// The authorization decision (plan/0008's security context): a pure
     /// function of the session principal's roles and the action's
     /// requirement. The address keys the session store only; the decision
     /// never consults it, so the outcome is source-IP independent for a
@@ -711,15 +711,15 @@ impl DpState {
     }
 }
 
-/// The services whose actions the DP boundary gates (plan/0008 section
-/// 26.7: the mapping service flows through the authorization layer).
+/// The services whose actions the DP boundary gates (the WANIPConnection
+/// integration: the mapping service flows through the authorization layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpTarget {
     DeviceProtection,
     WanIpConnection,
 }
 
-/// The device's role policy (plan/0008 sections 26.6-26.10): which role
+/// The device's role policy (plan/0008's public-versus-protected operations through its default security posture): which role
 /// each action requires. Public actions need no session; the WIP2
 /// mapping mutators require an authenticated session holding at least
 /// "Basic"; the security-administration DP actions require
@@ -749,7 +749,7 @@ pub fn valid_role(role: &str) -> bool {
     matches!(role, "Admin" | "Basic")
 }
 
-// ---- persistence projection (plan/0008 section 26.15) ----
+// ---- persistence projection (plan/0008's persistence rules) ----
 //
 // users + ACL are the persistent security configuration; sessions are
 // transient. The TSV shapes:
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn dp19_conformance_suite() {
-        // plan/0008 section 26.19: the anti-stub gate. A stub that answers
+        // plan/0008's conformance suite: the anti-stub gate. A stub that answers
         // names but never enforces fails every one of these by
         // construction.
         let device_id: [u8; 16] = [0xdd; 16];

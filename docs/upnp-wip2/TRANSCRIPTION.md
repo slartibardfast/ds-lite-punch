@@ -241,7 +241,7 @@ port algorithm is vendor-defined and this implementation's engine supplies it.
   `NewReservedPort != NewExternalPort`; an identical remote host, external
   port, protocol and internal client is an overwrite.
 - The distinction is why the mapping engine is reached through two entry
-  points (plan/0008 section 17): `allocate_exact` for `AddPortMapping`, where
+  points (plan/0008's version-specific SOAP semantics): `allocate_exact` for `AddPortMapping`, where
   the requested port is authoritative and a different requester on a held port
   takes it over, and `allocate_preferred` for this action, where a port another
   client holds moves the request to a free one and leaves that client's
@@ -295,10 +295,10 @@ mandated inside any policy that is chosen:
   authentication and authorization are recommended in the three-box model
   (1.2).
 
-The facade enforces this boundary at plan/0008 section 26.7 through the
+The facade enforces this boundary at plan/0008's WANIPConnection integration through the
 DeviceProtection session principal, and the enforcement is a pure function of
 the principal's roles and the action's requirement, never of the transport
-address (plan/0008 section 26.19).
+address (plan/0008's conformance suite).
 
 ### The policy this device enforces
 
@@ -331,7 +331,7 @@ section 26.22 carries the reasoning; what the device applies is:
 No information surface is left open by choice: an unauthenticated caller sees
 its own mappings and nothing else, on either face. The reasoning, including
 why the anonymous read is the ingress map rather than a status page, is in
-plan/0008 section 26.22.
+plan/0008's containment for callers without the lift.
 
 ## Error codes (section 2.5.23)
 

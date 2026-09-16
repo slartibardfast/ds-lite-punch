@@ -146,11 +146,11 @@ in [host call/0021](https://github.com/slartibardfast/agentic-ds-lite-punch/blob
   600-699 as TBD where unspecified).
 - Recommended roles are named per action (e.g. SendSetupMessage Public (2.6.1.6), AddIdentityList Basic or Admin
   (2.6.9.5), UserLogout Public (2.6.7.2)); the device decides the enforced
-  set (plan/0008 section 26.6).
+  set (plan/0008's public versus protected operations).
 - **Source-IP independence:** the authorization decision in this
   implementation is a pure function of the CP identity's roles and the
   action's requirement; the transport address plays no part. (This is a
-  design invariant of the facade, tested at plan/0008 section 26.19.)
+  design invariant of the facade, tested at plan/0008's conformance suite.)
 
 ## Eventing
 

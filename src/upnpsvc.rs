@@ -47,7 +47,7 @@ const IGD_V2_ENABLED: bool = true;
 /// default for a missing MX, so a deferred ssdp:all response always
 /// lands inside its own allowed response window.
 const DISCOVERY_DEBOUNCE_MS: u64 = 1000;
-/// The versioned description URLs (plan/0008 section 21).
+/// The versioned description URLs (plan/0008's LOCATION design).
 const DOC_V1: &str = "/igd/v1/rootDesc.xml";
 const DOC_V2: &str = "/igd/v2/rootDesc.xml";
 /// The WANIPConnection:2 maximum lease (table 2-6): the version 2 reading
@@ -125,7 +125,7 @@ struct GenaState {
     sids: SidSet,
 }
 
-/// plan/0008 sections 9.3 and 19: what the responder does with one
+/// plan/0008's ssdp:all rule and its state machine: what the responder does with one
 /// M-SEARCH target. `v2_enabled` is the IGD_V2_ENABLED mount gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryAction {
@@ -157,7 +157,7 @@ fn discovery_action(st: SearchTarget, v2_enabled: bool) -> DiscoveryAction {
 
 /// Resolve a deferred ssdp:all burst: true when an IGD:2 search flipped
 /// the watch before the debounce elapsed, false on the default
-/// (plan/0008 section 12: seen_v2 ? v2 : v1).
+/// (plan/0008's bounded burst debounce: seen_v2 ? v2 : v1).
 async fn burst_resolves_v2(mut rx: watch::Receiver<bool>, debounce: Duration) -> bool {
     tokio::select! {
         changed = rx.changed() => {
@@ -543,7 +543,7 @@ impl UpnpFacade {
         )
     }
 
-    /// allocate_exact (plan/0008 section 17): the requested external port
+    /// allocate_exact (plan/0008's version-specific SOAP semantics): the requested external port
     /// is authoritative, which is what WANIPConnection's AddPortMapping
     /// means at either version. A re-Add pivots the requester's mapping to
     /// the requested port, and a different requester on a held port takes
@@ -838,8 +838,8 @@ impl UpnpFacade {
     }
 
     /// Whether the caller holds the containment lift: a live session whose
-    /// roles satisfy Basic, which Admin also satisfies (plan/0008 section
-    /// 26.22). The policy function is the same one the boundary uses, so
+    /// roles satisfy Basic, which Admin also satisfies (the containment for
+    /// callers without the lift). The policy function is the same one the boundary uses, so
     /// the lift cannot drift from the gate.
     fn dp_holds_lift(&self, key: Ipv4Addr, now: u64) -> bool {
         let state = self.dp.lock().unwrap();
@@ -853,7 +853,7 @@ impl UpnpFacade {
         state.touch(key, now);
     }
 
-    /// allocate_preferred (plan/0008 section 17): WANIPConnection:2's
+    /// allocate_preferred (plan/0008's version-specific SOAP semantics): WANIPConnection:2's
     /// AddAnyPortMapping, where the requested port is a preference and the
     /// answer is the port actually reserved. The engine underneath is the
     /// same one allocate_exact drives, so a preferred request resolves to
@@ -1343,7 +1343,7 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 p if eq_ia(p, b"/WANIPC.xml") => Some(SCPD_WANIP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/WANPPP.xml") => Some(SCPD_WANPPP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/WANCfg.xml") => Some(SCPD_WANCMN.as_bytes().to_vec()),
-                // plan/0008 section 21: the deterministic versioned URLs.
+                // plan/0008's LOCATION design: the deterministic versioned URLs.
                 // The v1 prefixes are the canonical v1 presentation; the
                 // legacy paths above remain served for backward
                 // compatibility with existing descriptions/control points.
@@ -1452,7 +1452,7 @@ async fn handle_soap(
     body: &[u8],
     stream: &mut TcpStream,
 ) {
-    // plan/0008 section 26.7: the DeviceProtection authorization boundary.
+    // plan/0008's WANIPConnection integration: the DeviceProtection authorization boundary.
     // A v2 WIP2 security-sensitive invocation flows through the session
     // principal before the canonical mapping engine; there is no engine
     // bypass for the v2 face. The v1 facade stays a legacy unauthenticated
@@ -1477,7 +1477,7 @@ async fn handle_soap(
     } else {
         Ok(())
     };
-    // plan/0008 section 26.22: the containment the spec recommends for
+    // plan/0008's containment for callers without the lift: the containment the spec recommends for
     // unauthenticated control points (2.5.16.2, 2.5.18.2, 2.5.14.2,
     // 2.5.21.3). One view serves reads and writes alike, because the
     // address clause needs no remedy on either side of that line: a caller
@@ -2921,7 +2921,7 @@ fn root_desc(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// plan/0008 section 21: the IGD:2 root description (gated route data).
+/// plan/0008's LOCATION design: the IGD:2 root description (gated route data).
 /// DeviceProtection:1 sits directly under InternetGatewayDevice:2 per
 /// section 26.4; WANIPConnection:2 under WANConnectionDevice:2. This is
 /// the v2 surface definition; it is not served until the
@@ -3719,7 +3719,7 @@ mod tests {
         );
     }
 
-    /// plan/0008 section 26.22: the containment the spec recommends for
+    /// plan/0008's containment for callers without the lift: the containment the spec recommends for
     /// unauthenticated control points. The address clause needs no remedy
     /// and binds both faces; the port floor is a field, so one predicate
     /// serves the v2 face, where a control point can authenticate to lift
@@ -3891,7 +3891,7 @@ mod tests {
         );
     }
 
-    /// plan/0008 section 17: allocate_exact and allocate_preferred resolve
+    /// plan/0008's version-specific SOAP semantics: allocate_exact and allocate_preferred resolve
     /// the same request differently over one engine. Exact honours the
     /// requested port and takes it over from whoever holds it; preferred
     /// moves to a free port and leaves the other client's mapping standing.
