@@ -320,8 +320,8 @@ section 26.22 carries the reasoning; what the device applies is:
   because no authentication exists on that face and removing them would take
   away the operator's own view of the table.
 - The remaining WANIPConnection:2 actions remain public: connection status,
-  the connection type, the external address, and the RPCM-free report of
-  whether NAT and RSIP are in use.
+  the connection type, the external address, and the report of whether NAT and
+  RSIP are in use.
 
 The one information surface left open deliberately is the v1 read: an
 unauthenticated v1 caller can still enumerate the table. That is recorded in
