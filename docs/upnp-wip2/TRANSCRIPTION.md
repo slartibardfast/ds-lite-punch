@@ -9,6 +9,23 @@ claim below cites the specification section it transcribes; where the
 transcription corrects the placeholder SCPD the facade carried, the correction
 is named.
 
+### Figures
+
+The conversion carried its diagrams as signed crop URLs pointing at the
+converter's object store, and those signatures expire. The five crops are
+re-hosted in `images/` and the document references them relatively:
+
+| Figure | File | Section |
+|---|---|---|
+| Figure 2-1, IGD terminology for NAT rules | `images/fig-2-1.jpg` | 2.3 |
+| Figure 2-2, AddPortMapping and port triggering | `images/fig-2-2.jpg` | 2.5.16 |
+| Figure 2-5, state diagram for IP connection | `images/fig-2-5.jpg` | 2.6.1 |
+| Figure 3-1, NAT is an IP address translator | `images/fig-3-1.jpg` | 3.2 |
+| Figure 3-2, NAT with bundled session applications | `images/fig-3-2.jpg` | 3.2 |
+
+Figures 2-3 and 2-4 are the result tables of 2.5.16 and 2.5.17, rendered as
+tables in the conversion rather than as images, so no crop exists for them.
+
 ## The service identity
 
 - Service type: `urn:schemas-upnp-org:service:WANIPConnection:2` (section 2.1).

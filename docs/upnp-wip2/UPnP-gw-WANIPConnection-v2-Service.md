@@ -530,7 +530,7 @@ Table 2-1: Abbreviations
 
 ## 2.2.2 Terms
 
-<div style='text-align: center;'><img src='https://maas-watermark-prod-new.cn-wlcb.ufileos.com/ocr%2Fcrop%2F202609161751038b7cd83a124d4957%2Fcrop_1_1789552339309.png?UCloudPublicKey=TOKEN_6df395df-5d8c-4f69-90f8-a4fe46088958&Signature=rG%2BKPlwYkqHS3nQi%2FrWsaaJmYm4%3D&Expires=1790157139' alt='OCR图片'/></div>
+![fig-2-1.jpg](images/fig-2-1.jpg)
 
 <div align="center">
 
@@ -1750,7 +1750,7 @@ This action creates a new port mapping or overwrites an existing mapping with th
 
 When a control point creates a port forwarding rule with AddPortMapping() action for inbound traffic, this rule MUST also be applied when NAT port triggering occurs for outbound traffic (cf. example in Figure 2-2).
 
-<div style='text-align: center;'><img src='https://maas-watermark-prod-new.cn-wlcb.ufileos.com/ocr%2Fcrop%2F202609161751038b7cd83a124d4957%2Fcrop_1_1789552339362.png?UCloudPublicKey=TOKEN_6df395df-5d8c-4f69-90f8-a4fe46088958&Signature=ZsMTLthS0eUa%2BThSOCdbdozr3%2BQ%3D&Expires=1790157139' alt='OCR图片'/></div>
+![fig-2-2.jpg](images/fig-2-2.jpg)
 
 <div align="center">
 
@@ -2207,7 +2207,7 @@ A UPnP client sends the RequestConnection() action to a specific instance of the
 
 When a client sends a RequestConnection() command to a Disconnected connection, the WANConnectionDevice initiates the connection to ISP and MAY set ConnectionStatus to Connecting. Depending on whether the connection is successful, ConnectionStatus is changed to Connected or Disconnected.
 
-<div style='text-align: center;'><img src='https://maas-watermark-prod-new.cn-wlcb.ufileos.com/ocr%2Fcrop%2F202609161751038b7cd83a124d4957%2Fcrop_1_1789552339376.png?UCloudPublicKey=TOKEN_6df395df-5d8c-4f69-90f8-a4fe46088958&Signature=EOF%2F92uouoQjHUu5CxOvz897WFM%3D&Expires=1790157139' alt='OCR图片'/></div>
+![fig-2-5.jpg](images/fig-2-5.jpg)
 
 ## Figure 2-5: State diagram for IP connection
 
@@ -2377,7 +2377,7 @@ NAT (Network Address Translation) is a popular tool for alleviating the IPv4 add
 
 NAT involves re-writing the source and/or destination IP addresses, and usually also the TCP/UDP port numbers of IP packets as they pass through the NAT. Checksums (both IP and TCP/UDP) MUST also be rewritten to take into account the changes. A NAT which also rewrites the ports is called a NAPT (Network Address Port Translation). NAPT is the most widely used NAT mechanism in residential gateways.
 
-<div style='text-align: center;'><img src='https://maas-watermark-prod-new.cn-wlcb.ufileos.com/ocr%2Fcrop%2F202609161751038b7cd83a124d4957%2Fcrop_1_1789552339383.png?UCloudPublicKey=TOKEN_6df395df-5d8c-4f69-90f8-a4fe46088958&Signature=rfuRQY5Rxzf5oY6ksN2JILpBF7w%3D&Expires=1790157139' alt='OCR图片'/></div>
+![fig-3-1.jpg](images/fig-3-1.jpg)
 
 <div align="center">
 
@@ -2395,7 +2395,7 @@ Even if this solution is largely used in the residential gateways which access t
 
 - Issues with bundled session applications: Bundled session applications are applications which use a control connection to establish a media stream (cf. FTP (in passive mode), H.323, SIP and RTSP for example). In the example below, the device contacts a host on the WAN, and this remote host is responsible for establishing the session on another port. It does not work because there is no NAT binding for the requested session.
 
-<div style='text-align: center;'><img src='https://maas-watermark-prod-new.cn-wlcb.ufileos.com/ocr%2Fcrop%2F202609161751038b7cd83a124d4957%2Fcrop_2_1789552339390.png?UCloudPublicKey=TOKEN_6df395df-5d8c-4f69-90f8-a4fe46088958&Signature=8fW%2B11o86hT%2Bj7Coeboi8GgYSGQ%3D&Expires=1790157139' alt='OCR图片'/></div>
+![fig-3-2.jpg](images/fig-3-2.jpg)
 
 <div align="center">
 
