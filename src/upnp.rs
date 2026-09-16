@@ -153,10 +153,13 @@ fn contains_ia(hay: &[u8], needle: &[u8]) -> bool {
 pub enum SearchTarget {
     RootDevice,
     InternetGatewayDevice,
+    InternetGatewayDevice2,
     WanDevice,
     WanConnectionDevice,
     WanIpConnection,
+    WanIpConnection2,
     WanPppConnection,
+    WanPppConnection2,
     All,
 }
 
@@ -165,6 +168,10 @@ pub const ST_NAMES: &[(&[u8], SearchTarget)] = &[
     (
         b"urn:schemas-upnp-org:device:InternetGatewayDevice:1",
         SearchTarget::InternetGatewayDevice,
+    ),
+    (
+        b"urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+        SearchTarget::InternetGatewayDevice2,
     ),
     (
         b"urn:schemas-upnp-org:device:WANDevice:1",
@@ -179,8 +186,16 @@ pub const ST_NAMES: &[(&[u8], SearchTarget)] = &[
         SearchTarget::WanIpConnection,
     ),
     (
+        b"urn:schemas-upnp-org:service:WANIPConnection:2",
+        SearchTarget::WanIpConnection2,
+    ),
+    (
         b"urn:schemas-upnp-org:service:WANPPPConnection:1",
         SearchTarget::WanPppConnection,
+    ),
+    (
+        b"urn:schemas-upnp-org:service:WANPPPConnection:2",
+        SearchTarget::WanPppConnection2,
     ),
     (b"ssdp:all", SearchTarget::All),
 ];
@@ -203,12 +218,17 @@ pub fn st_name(st: SearchTarget) -> &'static [u8] {
         SearchTarget::InternetGatewayDevice => {
             b"urn:schemas-upnp-org:device:InternetGatewayDevice:1"
         }
+        SearchTarget::InternetGatewayDevice2 => {
+            b"urn:schemas-upnp-org:device:InternetGatewayDevice:2"
+        }
         SearchTarget::WanDevice => b"urn:schemas-upnp-org:device:WANDevice:1",
         SearchTarget::WanConnectionDevice => {
             b"urn:schemas-upnp-org:device:WANConnectionDevice:1"
         }
         SearchTarget::WanIpConnection => b"urn:schemas-upnp-org:service:WANIPConnection:1",
+        SearchTarget::WanIpConnection2 => b"urn:schemas-upnp-org:service:WANIPConnection:2",
         SearchTarget::WanPppConnection => b"urn:schemas-upnp-org:service:WANPPPConnection:1",
+        SearchTarget::WanPppConnection2 => b"urn:schemas-upnp-org:service:WANPPPConnection:2",
     }
 }
 
@@ -678,6 +698,12 @@ pub fn classify(head: &[u8]) -> ReqClass {
         if eq_ia(path, b"/") || eq_ia(path, b"/rootDesc.xml")
             || eq_ia(path, b"/WANIPC.xml") || eq_ia(path, b"/WANPPP.xml")
             || eq_ia(path, b"/WANCfg.xml")
+            // plan/0008 section 21: the deterministic versioned URLs
+            // (the v2 prefix is recognized even while the mount gate is
+            // off; the per-route 404 then comes from the router's None
+            // arm, so a gated path is a clean not-offered response)
+            || starts_with_ia(path, b"/igd/v1/")
+            || starts_with_ia(path, b"/igd/v2/")
         {
             return ReqClass::Get;
         }
@@ -974,13 +1000,16 @@ pub fn http_date(unix: u64) -> String {
     )
 }
 
-/// One SSDP M-SEARCH response (unicast to the requester).
+/// One SSDP M-SEARCH response (unicast to the requester). `loc_path`
+/// is the versioned description URL path (plan/0008 section 21), e.g.
+/// `/igd/v1/rootDesc.xml` for the v1 presentation.
 pub fn msearch_response(
     st: SearchTarget,
     udn: &str,
     lan_ip: Ipv4Addr,
     port: u16,
     now_unix: u64,
+    loc_path: &str,
 ) -> Vec<u8> {
     let st_bytes = st_name(st);
     let st_text = String::from_utf8_lossy(st_bytes);
@@ -989,7 +1018,7 @@ pub fn msearch_response(
     out.push_str(&format!("CACHE-CONTROL: max-age={}\r\n", SSDP_MAX_AGE));
     out.push_str(&format!("DATE: {}\r\n", http_date(now_unix)));
     out.push_str("EXT:\r\n");
-    out.push_str(&format!("LOCATION: http://{}:{}/rootDesc.xml\r\n", lan_ip, port));
+    out.push_str(&format!("LOCATION: http://{}:{}{}\r\n", lan_ip, port, loc_path));
     out.push_str(&format!("SERVER: {}\r\n", SERVER_LINE));
     out.push_str(&format!("ST: {}\r\n", st_text));
     out.push_str(&format!("USN: uuid:{}::{}\r\n", udn, st_text));
@@ -997,7 +1026,8 @@ pub fn msearch_response(
     out.into_bytes()
 }
 
-/// One SSDP NOTIFY advertisement (alive or byebye), multicast.
+/// One SSDP NOTIFY advertisement (alive or byebye), multicast. `loc_path`
+/// is the versioned description URL path (plan/0008 section 21).
 pub fn notify_payload(
     st: SearchTarget,
     nts: &[u8],
@@ -1005,6 +1035,7 @@ pub fn notify_payload(
     lan_ip: Ipv4Addr,
     port: u16,
     now_unix: u64,
+    loc_path: &str,
 ) -> Vec<u8> {
     let st_bytes = st_name(st);
     let st_text = String::from_utf8_lossy(st_bytes);
@@ -1014,7 +1045,7 @@ pub fn notify_payload(
     out.push_str(&format!("HOST: {}:{}\r\n", SSDP_MCAST, SSDP_PORT));
     out.push_str(&format!("CACHE-CONTROL: max-age={}\r\n", SSDP_MAX_AGE));
     out.push_str(&format!("DATE: {}\r\n", http_date(now_unix)));
-    out.push_str(&format!("LOCATION: http://{}:{}/rootDesc.xml\r\n", lan_ip, port));
+    out.push_str(&format!("LOCATION: http://{}:{}{}\r\n", lan_ip, port, loc_path));
     out.push_str(&format!("SERVER: {}\r\n", SERVER_LINE));
     out.push_str(&format!("NT: {}\r\n", st_text));
     out.push_str(&format!("NTS: ssdp:{}\r\n", nts_text));
@@ -1066,6 +1097,32 @@ mod tests {
         assert_eq!(parse_st(b"SSDP:ALL"), Some(SearchTarget::All));
         assert_eq!(parse_st(b"\"upnp:rootdevice\""), Some(SearchTarget::RootDevice));
         assert_eq!(parse_st(b"urn:unknown:1"), None);
+    }
+
+    #[test]
+    fn st_v2_targets_parse_and_roundtrip() {
+        // plan/0008 R3: explicit IGD:2/WIP2 searches must parse and echo
+        // their version (the kani round-trip invariant holds for these)
+        assert_eq!(
+            parse_st(b"urn:schemas-upnp-org:device:InternetGatewayDevice:2"),
+            Some(SearchTarget::InternetGatewayDevice2)
+        );
+        assert_eq!(
+            parse_st(b"urn:schemas-upnp-org:service:WANIPConnection:2"),
+            Some(SearchTarget::WanIpConnection2)
+        );
+        assert_eq!(
+            parse_st(b"urn:schemas-upnp-org:service:WANPPPConnection:2"),
+            Some(SearchTarget::WanPppConnection2)
+        );
+        assert_eq!(
+            parse_st(st_name(SearchTarget::InternetGatewayDevice2)),
+            Some(SearchTarget::InternetGatewayDevice2)
+        );
+        assert_eq!(
+            parse_st(st_name(SearchTarget::WanIpConnection2)),
+            Some(SearchTarget::WanIpConnection2)
+        );
     }
 
     #[test]
@@ -1341,10 +1398,11 @@ mod tests {
             Ipv4Addr::new(192, 168, 21, 1),
             49152,
             0,
+            "/igd/v1/rootDesc.xml",
         );
         let text = String::from_utf8_lossy(&r);
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("LOCATION: http://192.168.21.1:49152/rootDesc.xml\r\n"));
+        assert!(text.contains("LOCATION: http://192.168.21.1:49152/igd/v1/rootDesc.xml\r\n"));
         assert!(text.contains("ST: upnp:rootdevice\r\n"));
         assert!(text.contains("USN: uuid:abcdef::upnp:rootdevice\r\n"));
         assert!(text.contains("CACHE-CONTROL: max-age=1800\r\n"));
@@ -1356,6 +1414,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 21, 1),
             49152,
             0,
+            "/igd/v1/rootDesc.xml",
         );
         let t = String::from_utf8_lossy(&n);
         assert!(t.starts_with("NOTIFY * HTTP/1.1\r\n"));

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +34,18 @@ use crate::vote::VoteState;
 
 /// Concurrency cap for the HTTP service (E8: bounded connections).
 const HTTP_CONN_CAP: usize = 16;
+/// plan/0008 R6 mount gate: the IGD:2 facade is served only when its
+/// complete service set (WIP2 + DeviceProtection:1) is real. Flipped by
+/// the plan/0008 #v2-service-set task; until then the device presents
+/// the v1 compatibility facade only.
+const IGD_V2_ENABLED: bool = false;
+/// plan/0008 R6: the per-control-point discovery window. 1 s is the UDA
+/// default for a missing MX, so a deferred ssdp:all response always
+/// lands inside its own allowed response window.
+const DISCOVERY_DEBOUNCE_MS: u64 = 1000;
+/// The versioned description URLs (plan/0008 section 21).
+const DOC_V1: &str = "/igd/v1/rootDesc.xml";
+const DOC_V2: &str = "/igd/v2/rootDesc.xml";
 /// Lease policy (2026-09-15): the granted lease appears infinite
 /// (U32_MAX wire/index) while the effective lifetime is managed
 /// underneath. A UDP grant becomes a reap candidate when its client has
@@ -96,6 +108,51 @@ struct GenaState {
     sids: SidSet,
 }
 
+/// plan/0008 sections 9.3 and 19: what the responder does with one
+/// M-SEARCH target. `v2_enabled` is the IGD_V2_ENABLED mount gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryAction {
+    /// answer immediately from the v1 compatibility facade
+    ReplyV1(SearchTarget),
+    /// answer immediately from the v2 facade (gate on only)
+    ReplyV2(SearchTarget),
+    /// the target is not offered (a v2 target while the gate is off,
+    /// or anything unknown)
+    Ignore,
+    /// ssdp:all with v2 mounted: open or join the per-control-point
+    /// burst and defer the response (R6)
+    DeferAll,
+}
+
+fn discovery_action(st: SearchTarget, v2_enabled: bool) -> DiscoveryAction {
+    use SearchTarget::*;
+    match st {
+        All if v2_enabled => DiscoveryAction::DeferAll,
+        All => DiscoveryAction::ReplyV1(All),
+        RootDevice | InternetGatewayDevice | WanDevice | WanConnectionDevice
+        | WanIpConnection | WanPppConnection => DiscoveryAction::ReplyV1(st),
+        InternetGatewayDevice2 | WanIpConnection2 | WanPppConnection2 if v2_enabled => {
+            DiscoveryAction::ReplyV2(st)
+        }
+        _ => DiscoveryAction::Ignore,
+    }
+}
+
+/// Resolve a deferred ssdp:all burst: true when an IGD:2 search flipped
+/// the watch before the debounce elapsed, false on the default
+/// (plan/0008 section 12: seen_v2 ? v2 : v1).
+async fn burst_resolves_v2(mut rx: watch::Receiver<bool>, debounce: Duration) -> bool {
+    tokio::select! {
+        changed = rx.changed() => {
+            // changed() errors only if the sender dropped (cleanup); the
+            // last value still decides
+            let _ = changed;
+            *rx.borrow()
+        }
+        _ = tokio::time::sleep(debounce) => false,
+    }
+}
+
 pub struct UpnpFacade {
     cfg: UpnpConfig,
     table: Arc<Mutex<LeaseTable>>,
@@ -106,7 +163,12 @@ pub struct UpnpFacade {
     ip_rx: watch::Receiver<Ipv4Addr>,
     udn: String,
     started_unix: u64,
-    ssdp: UdpSocket,
+    ssdp: Arc<UdpSocket>,
+    /// plan/0008 R6: pending ssdp:all bursts, keyed by control point
+    /// (src addr + port). The sender's value flips true when an IGD:2
+    /// search is observed inside the window; entries live only while a
+    /// response is deferred and are removed by the deferred task.
+    bursts: Arc<StdMutex<HashMap<(Ipv4Addr, u16), watch::Sender<bool>>>>,
 }
 
 impl UpnpFacade {
@@ -148,7 +210,8 @@ impl UpnpFacade {
             ip_rx,
             udn,
             started_unix,
-            ssdp,
+            ssdp: Arc::new(ssdp),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         });
 
         // Respawn-restored grants: main skipped their datapath spawn (its
@@ -277,6 +340,7 @@ impl UpnpFacade {
                 self.cfg.lan_ip,
                 self.cfg.upnp_port,
                 now,
+                DOC_V1,
             );
             let _ = self.ssdp.send_to(&pkt, (SSDP_MCAST, SSDP_PORT)).await;
         }
@@ -307,6 +371,7 @@ impl UpnpFacade {
                     self.cfg.lan_ip,
                     self.cfg.upnp_port,
                     now,
+                    DOC_V1,
                 );
                 let _ = self.ssdp.send_to(&pkt, (SSDP_MCAST, SSDP_PORT)).await;
             }
@@ -325,27 +390,94 @@ impl UpnpFacade {
                 MSearchParse::Answer { st, mx } => (st, mx),
                 _ => continue,
             };
-            // respond within a random delay inside MX (capped 5 s by the
-            // grammar); jitter avoids reply storms on a broadcast query
-            let delay_ms = if mx == 0 {
-                0u64
-            } else {
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(1);
-                (seed % (u64::from(mx) * 1000)).max(1)
+            let key = match src {
+                SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+                _ => continue, // SSDP is IPv4-only on this surface
             };
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            let resp = msearch_response(
-                st,
-                &self.udn,
-                self.cfg.lan_ip,
-                self.cfg.upnp_port,
-                Epoch::now(),
-            );
-            let _ = self.ssdp.send_to(&resp, src).await;
+            match discovery_action(st, IGD_V2_ENABLED) {
+                DiscoveryAction::Ignore => continue,
+                DiscoveryAction::ReplyV1(t) => {
+                    self.send_discovery(t, src, mx, DOC_V1).await;
+                }
+                DiscoveryAction::ReplyV2(t) => {
+                    // an explicit IGD:2 search inside a pending burst flips
+                    // the deferred ssdp:all response to v2 (R6)
+                    if let Some(tx) = self.bursts.lock().unwrap().get(&key) {
+                        let _ = tx.send(true);
+                    }
+                    self.send_discovery(t, src, mx, DOC_V2).await;
+                }
+                DiscoveryAction::DeferAll => {
+                    self.defer_all(key, src).await;
+                }
+            }
         }
+    }
+
+    /// Jitter within MX (capped 5 s by the grammar) then answer with the
+    /// given presentation's LOCATION.
+    async fn send_discovery(&self, st: SearchTarget, src: SocketAddr, mx: u8, loc: &str) {
+        let delay_ms = if mx == 0 {
+            0u64
+        } else {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1);
+            (seed % (u64::from(mx) * 1000)).max(1)
+        };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let resp = upnp::msearch_response(
+            st,
+            &self.udn,
+            self.cfg.lan_ip,
+            self.cfg.upnp_port,
+            Epoch::now(),
+            loc,
+        );
+        let _ = self.ssdp.send_to(&resp, src).await;
+    }
+
+    /// plan/0008 R6: hold the ssdp:all response for the discovery
+    /// window, releasing early with the v2 presentation when an IGD:2
+    /// search flips the burst, or at the deadline with the v1
+    /// compatibility default. Duplicate :all retransmissions from the
+    /// same control point coalesce onto the existing burst.
+    async fn defer_all(&self, key: (Ipv4Addr, u16), src: SocketAddr) {
+        {
+            let m = self.bursts.lock().unwrap();
+            if m.contains_key(&key) {
+                return; // already deferred; the pending task answers
+            }
+        }
+        let (tx, rx) = watch::channel(false);
+        {
+            let mut m = self.bursts.lock().unwrap();
+            if m.insert(key, tx).is_some() {
+                return; // raced: a concurrent defer won the slot
+            }
+        }
+        let ssdp = self.ssdp.clone();
+        let udn = self.udn.clone();
+        let lan_ip = self.cfg.lan_ip;
+        let port = self.cfg.upnp_port;
+        let bursts = self.bursts.clone();
+        tokio::spawn(async move {
+            let v2 = burst_resolves_v2(rx, Duration::from_millis(DISCOVERY_DEBOUNCE_MS)).await;
+            let loc = if v2 { DOC_V2 } else { DOC_V1 };
+            // the deferred answer lands at the window deadline, which is
+            // at most the assumed MX floor (1 s); no extra jitter needed
+            let resp = upnp::msearch_response(
+                SearchTarget::All,
+                &udn,
+                lan_ip,
+                port,
+                Epoch::now(),
+                loc,
+            );
+            let _ = ssdp.send_to(&resp, src).await;
+            bursts.lock().unwrap().remove(&key);
+        });
     }
 
     // ---- SOAP actions ----
@@ -971,6 +1103,36 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 p if eq_ia(p, b"/WANIPC.xml") => Some(SCPD_WANIP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/WANPPP.xml") => Some(SCPD_WANPPP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/WANCfg.xml") => Some(SCPD_WANCMN.as_bytes().to_vec()),
+                // plan/0008 section 21: the deterministic versioned URLs.
+                // The v1 prefixes are the canonical v1 presentation; the
+                // legacy paths above remain served for backward
+                // compatibility with existing descriptions/control points.
+                p if eq_ia(p, b"/igd/v1/rootDesc.xml") => Some(root_desc(
+                    facade.cfg.lan_ip,
+                    facade.cfg.upnp_port,
+                    &facade.cfg.name,
+                    &facade.udn,
+                )),
+                p if eq_ia(p, b"/igd/v1/WANIPC.xml") => Some(SCPD_WANIP.as_bytes().to_vec()),
+                p if eq_ia(p, b"/igd/v1/WANPPP.xml") => Some(SCPD_WANPPP.as_bytes().to_vec()),
+                p if eq_ia(p, b"/igd/v1/WANCfg.xml") => Some(SCPD_WANCMN.as_bytes().to_vec()),
+                // The v2 surface mounts only with its complete service set
+                // (plan/0008 R5, R6 gate); until then the URLs are not
+                // offered and answer 404.
+                p if IGD_V2_ENABLED && eq_ia(p, b"/igd/v2/rootDesc.xml") => {
+                    Some(root_desc_v2(
+                        facade.cfg.lan_ip,
+                        facade.cfg.upnp_port,
+                        &facade.cfg.name,
+                        &facade.udn,
+                    ))
+                }
+                p if IGD_V2_ENABLED && eq_ia(p, b"/igd/v2/WANIPCn.xml") => {
+                    Some(SCPD_WIP2.as_bytes().to_vec())
+                }
+                p if IGD_V2_ENABLED && eq_ia(p, b"/igd/v2/DP.xml") => {
+                    Some(SCPD_DP.as_bytes().to_vec())
+                }
                 _ => None,
             };
             match doc {
@@ -1760,6 +1922,59 @@ fn root_desc(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// plan/0008 section 21: the IGD:2 root description (gated route data).
+/// DeviceProtection:1 sits directly under InternetGatewayDevice:2 per
+/// section 26.4; WANIPConnection:2 under WANConnectionDevice:2. This is
+/// the v2 surface definition; it is not served until the
+/// #v2-service-set task flips IGD_V2_ENABLED (R6 mount gate).
+fn root_desc_v2(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\"?>\n<root xmlns=\"urn:schemas-upnp-org:device-1-0\">\
+         <specVersion><major>1</major><minor>0</minor></specVersion>\
+         <URLBase>http://{}:{}/</URLBase>\
+         <device>\
+         <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:2</deviceType>\
+         <friendlyName>{}</friendlyName>\
+         <manufacturer>ds-lite-punch</manufacturer>\
+         <modelDescription>CGNAT-aware IGD facade for the Virgin Media ds-lite line</modelDescription>\
+         <modelName>ds-lite-punch</modelName>\
+         <modelNumber>0.1</modelNumber>\
+         <UDN>uuid:{}</UDN>\
+         <serviceList>\
+         <service><serviceType>urn:schemas-upnp-org:service:DeviceProtection:1</serviceType>\
+         <serviceId>urn:upnp-org:serviceId:DeviceProtection1</serviceId>\
+         <SCPDURL>/igd/v2/DP.xml</SCPDURL><controlURL>/ctl/DP</controlURL>\
+         <eventSubURL>/ctl/DP</eventSubURL></service>\
+         <service><serviceType>urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1</serviceType>\
+         <serviceId>urn:upnp-org:serviceId:WANCommonIFC1</serviceId>\
+         <SCPDURL>/igd/v1/WANCfg.xml</SCPDURL><controlURL>/ctl/CmnIfCfg</controlURL>\
+         <eventSubURL>/ctl/CmnIfCfg</eventSubURL></service>\
+         </serviceList>\
+         <deviceList><device>\
+         <deviceType>urn:schemas-upnp-org:device:WANDevice:2</deviceType>\
+         <friendlyName>WANDevice</friendlyName>\
+         <manufacturer>ds-lite-punch</manufacturer>\
+         <modelName>ds-lite-punch</modelName>\
+         <UDN>uuid:{}</UDN>\
+         <deviceList><device>\
+         <deviceType>urn:schemas-upnp-org:device:WANConnectionDevice:2</deviceType>\
+         <friendlyName>WANConnectionDevice</friendlyName>\
+         <manufacturer>ds-lite-punch</manufacturer>\
+         <modelName>ds-lite-punch</modelName>\
+         <UDN>uuid:{}</UDN>\
+         <serviceList>\
+         <service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType>\
+         <serviceId>urn:upnp-org:serviceId:WANIPConn2</serviceId>\
+         <SCPDURL>/igd/v2/WANIPCn.xml</SCPDURL><controlURL>/ctl/IPConn</controlURL>\
+         <eventSubURL>/ctl/IPConn</eventSubURL></service>\
+         </serviceList></device></deviceList></device></deviceList></device></root>\n",
+        lan_ip, port, name, udn,
+        derived_udn(udn, b"WANDevice"),
+        derived_udn(udn, b"WANConn"),
+    )
+    .into_bytes()
+}
+
 fn derived_udn(base: &str, tag: &[u8]) -> String {
     let mut data = Vec::new();
     data.extend_from_slice(base.as_bytes());
@@ -1874,6 +2089,91 @@ const SCPD_WANCMN: &str = r#"<?xml version="1.0"?>
 <stateVariable sendEvents="no"><name>Layer1UpstreamMaxBitRate</name><dataType>ui4</dataType></stateVariable>
 <stateVariable sendEvents="no"><name>Layer1DownstreamMaxBitRate</name><dataType>ui4</dataType></stateVariable>
 <stateVariable sendEvents="yes"><name>PhysicalLinkStatus</name><dataType>string</dataType><allowedValueList><allowedValue>Up</allowedValue><allowedValue>Down</allowedValue></allowedValueList></stateVariable>
+</serviceStateTable>
+</scpd>
+"#;
+
+/// plan/0008: the WANIPConnection:2 SCPD (gated route data). Pre-
+/// transcription: the authoritative argument tables are transcribed from
+/// the WANIPConnection:2 spec at the #v2-service-set task; this carries
+/// the standard action surface, mapping actions included.
+const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+<specVersion><major>1</major><minor>0</minor></specVersion>
+<actionList>
+<action><name>SetConnectionType</name></action>
+<action><name>GetConnectionTypeInfo</name></action>
+<action><name>RequestConnection</name></action>
+<action><name>RequestTermination</name></action>
+<action><name>ForceTermination</name></action>
+<action><name>SetAutoDisconnectTime</name></action>
+<action><name>SetIdleDisconnectTime</name></action>
+<action><name>SetWarnDisconnectDelay</name></action>
+<action><name>GetStatusInfo</name></action>
+<action><name>GetAutoDisconnectTime</name></action>
+<action><name>GetIdleDisconnectTime</name></action>
+<action><name>GetWarnDisconnectDelay</name></action>
+<action><name>GetNATRSIPStatus</name></action>
+<action><name>GetGenericPortMappingEntry</name></action>
+<action><name>GetSpecificPortMappingEntry</name></action>
+<action><name>AddPortMapping</name></action>
+<action><name>DeletePortMapping</name></action>
+<action><name>GetExternalIPAddress</name></action>
+<action><name>DeletePortMappingRange</name></action>
+<action><name>GetListOfPortMappings</name></action>
+<action><name>AddAnyPortMapping</name></action>
+<action><name>GetLinkLayerMaxBitRates</name></action>
+</actionList>
+<serviceStateTable>
+<stateVariable sendEvents="no"><name>ConnectionType</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>ConnectionStatus</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>ExternalIPAddress</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>PortMappingNumberOfEntries</name><dataType>ui2</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>Uptime</name><dataType>ui4</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>NATEnabled</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>RSIPAvailable</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_ExternalPort</name><dataType>ui2</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_InternalClient</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_InternalPort</name><dataType>ui2</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Protocol</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_LeaseTime</name><dataType>ui4</dataType></stateVariable>
+</serviceStateTable>
+</scpd>
+"#;
+
+/// plan/0008: the DeviceProtection:1 SCPD (gated route data). The
+/// service is exercised only once its complete implementation lands at
+/// the #v2-service-set task (R5: no carve-outs); this carries the
+/// specification's full action surface and the state variables declared
+/// per the field research annex. Argument tables are transcribed from
+/// the normative DeviceProtection:1 spec at that task's gate.
+const SCPD_DP: &str = r#"<?xml version="1.0"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+<specVersion><major>1</major><minor>0</minor></specVersion>
+<actionList>
+<action><name>GetSupportedProtocols</name></action>
+<action><name>GetAssignedRoles</name></action>
+<action><name>RequestUserLogin</name></action>
+<action><name>ValidateIdentity</name></action>
+<action><name>SendSetupMessage</name></action>
+<action><name>GetACLData</name></action>
+<action><name>AddACLEntry</name></action>
+<action><name>RemoveACLEntry</name></action>
+<action><name>GetListOfRoles</name></action>
+<action><name>RevokeRole</name></action>
+<action><name>GetRolesForAction</name></action>
+<action><name>GetUserLoginChallenge</name></action>
+<action><name>LoginWithPIN</name></action>
+<action><name>LoginWithThirdParty</name></action>
+</actionList>
+<serviceStateTable>
+<stateVariable sendEvents="yes"><name>SetupReady</name><dataType>boolean</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>SupportedProtocols</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_ACL</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_IdentityList</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Identity</name><dataType>string</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_Base64</name><dataType>bin.base64</dataType></stateVariable>
+<stateVariable sendEvents="no"><name>A_ARG_TYPE_String</name><dataType>string</dataType></stateVariable>
 </serviceStateTable>
 </scpd>
 "#;
@@ -2046,7 +2346,8 @@ mod tests {
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
             udn: String::from("hammer"),
             started_unix: 0,
-            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2166,7 +2467,8 @@ mod tests {
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
             udn: String::from("slot-revoke"),
             started_unix: 0,
-            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         });
 
         let bind_port = 41001;
@@ -2304,7 +2606,8 @@ mod tests {
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
             udn: String::from("restored-grant"),
             started_unix: 0,
-            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         });
 
         facade.spawn_restored_grants().await;
@@ -2370,7 +2673,8 @@ mod tests {
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1, // seeded: external_ip = Some
             udn: String::from("gena-seq"),
             started_unix: 0,
-            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         });
 
         let cb = format!("<http://127.0.0.1:{}/evt>", port);
@@ -2458,7 +2762,8 @@ mod tests {
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
             udn: String::from("lease-policy"),
             started_unix: 0,
-            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -2536,6 +2841,244 @@ mod tests {
             facade.evict_candidate(requester).await,
             None,
             "never evict the requesting client's own grants"
+        );
+    }
+
+    // ---- plan/0008 discovery layer (R6 burst + versioned structure) ----
+
+    #[test]
+    fn discovery_action_matrix() {
+        use SearchTarget::*;
+        // gate off: the device presents the v1 facade only; v2 targets
+        // are not offered (an honest v1-only device)
+        assert_eq!(discovery_action(All, false), DiscoveryAction::ReplyV1(All));
+        assert_eq!(
+            discovery_action(InternetGatewayDevice, false),
+            DiscoveryAction::ReplyV1(InternetGatewayDevice)
+        );
+        assert_eq!(
+            discovery_action(WanIpConnection, false),
+            DiscoveryAction::ReplyV1(WanIpConnection)
+        );
+        assert_eq!(discovery_action(InternetGatewayDevice2, false), DiscoveryAction::Ignore);
+        assert_eq!(discovery_action(WanIpConnection2, false), DiscoveryAction::Ignore);
+        // gate on: ssdp:all defers into the burst (R6); v2 targets answer
+        // v2; v1 targets still answer v1 (R4)
+        assert_eq!(discovery_action(All, true), DiscoveryAction::DeferAll);
+        assert_eq!(
+            discovery_action(InternetGatewayDevice2, true),
+            DiscoveryAction::ReplyV2(InternetGatewayDevice2)
+        );
+        assert_eq!(
+            discovery_action(WanIpConnection2, true),
+            DiscoveryAction::ReplyV2(WanIpConnection2)
+        );
+        assert_eq!(
+            discovery_action(InternetGatewayDevice, true),
+            DiscoveryAction::ReplyV1(InternetGatewayDevice)
+        );
+        assert_eq!(
+            discovery_action(WanIpConnection, true),
+            DiscoveryAction::ReplyV1(WanIpConnection)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn burst_resolves_v2_deadline_and_flip() {
+        // no :2 in the window: the v1 compatibility default answers at
+        // the deadline (seen_v2 ? v2 : v1, section 12). Short windows
+        // stand in for DISCOVERY_DEBOUNCE_MS to keep the test fast; the
+        // resolver is duration-parametric by design.
+        let (_tx, rx) = watch::channel(false);
+        let h = tokio::spawn(burst_resolves_v2(rx, Duration::from_millis(40)));
+        assert!(!h.await.unwrap(), "no :2 -> v1 at the deadline");
+        // a :2 inside the window flips the pending :all to v2 early
+        let (tx, rx) = watch::channel(false);
+        let h = tokio::spawn(burst_resolves_v2(rx, Duration::from_millis(200)));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(true).unwrap();
+        assert!(h.await.unwrap(), ":2 inside the window -> v2");
+    }
+
+    #[test]
+    fn v2_builders_carry_the_surface() {
+        // the v2 surface is real data (section 26.4 places DP under the
+        // root device; WIP2 under WANConnectionDevice:2), served only
+        // when the gate flips at #v2-service-set
+        let doc = root_desc_v2(Ipv4Addr::new(192, 168, 21, 1), 49152, "t", "udn-x");
+        let s = String::from_utf8_lossy(&doc);
+        assert!(s.contains("InternetGatewayDevice:2"));
+        assert!(s.contains("DeviceProtection:1"));
+        assert!(s.contains("/igd/v2/DP.xml"));
+        assert!(s.contains("WANIPConnection:2"));
+        assert!(s.contains("/igd/v2/WANIPCn.xml"));
+        let wip2 = String::from_utf8_lossy(SCPD_WIP2.as_bytes());
+        assert!(wip2.contains("AddAnyPortMapping"));
+        assert!(wip2.contains("DeletePortMappingRange"));
+        assert!(wip2.contains("GetListOfPortMappings"));
+        let dp = String::from_utf8_lossy(SCPD_DP.as_bytes());
+        for a in [
+            "GetSupportedProtocols",
+            "GetAssignedRoles",
+            "RequestUserLogin",
+            "ValidateIdentity",
+            "SendSetupMessage",
+            "GetACLData",
+            "AddACLEntry",
+            "RemoveACLEntry",
+            "GetListOfRoles",
+            "RevokeRole",
+            "GetRolesForAction",
+            "GetUserLoginChallenge",
+            "LoginWithPIN",
+            "LoginWithThirdParty",
+        ] {
+            assert!(dp.contains(a), "DP SCPD must declare {}", a);
+        }
+        assert!(dp.contains("SetupReady"), "DP SetupReady state var");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn versioned_doc_routing() {
+        // section 21: /igd/v1/* serves the v1 presentation, the legacy
+        // paths stay served, and the gated /igd/v2/* is not offered
+        // until the #v2-service-set task (404 while gated off).
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/none".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "routing".into(),
+            grace_secs: 60,
+        };
+        let table = Arc::new(Mutex::new(LeaseTable::new(
+            PortAllocator::new(30000, 30009).unwrap(),
+            4,
+            2,
+        )));
+        let publisher =
+            Arc::new(Publisher::with_watch("/tmp/none", watch::channel(Ipv4Addr::LOCALHOST).0));
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table,
+            publisher,
+            entries: Mutex::new(Vec::new()),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("routing"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let f2 = facade.clone();
+        tokio::spawn(async move {
+            let _ = http_serve(listener, f2).await;
+        });
+        let get = |path: &'static str| {
+            async move {
+                let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let req = format!("GET {} HTTP/1.0\r\n\r\n", path);
+                s.write_all(req.as_bytes()).await.unwrap();
+                let mut buf = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+                    .await
+                    .expect("response within 5s");
+                (buf.starts_with(b"HTTP/1.1 200"), String::from_utf8_lossy(&buf).to_string())
+            }
+        };
+        let (ok, body) = get("/rootDesc.xml").await;
+        assert!(
+            ok,
+            "legacy rootDesc stays served; head={:?}",
+            &body[..body.len().min(120)]
+        );
+        let (ok, body) = get("/igd/v1/rootDesc.xml").await;
+        assert!(
+            ok && body.contains("InternetGatewayDevice:1"),
+            "v1 canonical URL serves the v1 doc; ok={} head={:?}",
+            ok,
+            &body[..body.len().min(220)]
+        );
+        let (ok, body) = get("/igd/v2/rootDesc.xml").await;
+        assert!(!ok && body.contains("404"), "the v2 surface is not offered while the gate is off");
+        let (ok, _) = get("/igd/v2/DP.xml").await;
+        assert!(!ok, "DP is not offered while the gate is off");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ssdp_loop_answers_v1_search_only() {
+        // the rewired M-SEARCH responder answers v1 targets immediately
+        // and stays silent for v2 targets while the gate is off
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/none".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "ssdp-loop".into(),
+            grace_secs: 60,
+        };
+        let table = Arc::new(Mutex::new(LeaseTable::new(
+            PortAllocator::new(30000, 30009).unwrap(),
+            4,
+            2,
+        )));
+        let publisher =
+            Arc::new(Publisher::with_watch("/tmp/none", watch::channel(Ipv4Addr::LOCALHOST).0));
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table,
+            publisher,
+            entries: Mutex::new(Vec::new()),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("ssdp-loop"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+        });
+        let addr = facade.ssdp.local_addr().unwrap();
+        let f = facade.clone();
+        tokio::spawn(async move {
+            f.ssdp_recv_loop().await;
+        });
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let msearch = |st: &str, mx: &str| {
+            format!(
+                "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: {}\r\nST: {}\r\n\r\n",
+                mx, st
+            )
+        };
+        probe
+            .send_to(msearch("urn:schemas-upnp-org:device:InternetGatewayDevice:1", "2").as_bytes(), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 600];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), probe.recv_from(&mut buf))
+            .await
+            .expect("v1 answer within 3 s")
+            .expect("recv ok");
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"));
+        assert!(resp.contains("/igd/v1/rootDesc.xml"));
+        // an IGD:2 search gets no answer while the gate is off
+        probe
+            .send_to(msearch("urn:schemas-upnp-org:device:InternetGatewayDevice:2", "1").as_bytes(), addr)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), probe.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "no v2 answer while the gate is off"
         );
     }
 }
@@ -2625,7 +3168,8 @@ mod ifindex_probe {
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
             udn: String::from("interop"),
             started_unix: 0,
-            ssdp: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
         });
 
         // Dump the generated rootDesc for the external miniupnpc parser.
