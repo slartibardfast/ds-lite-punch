@@ -788,8 +788,13 @@ impl UpnpFacade {
             }
         }
         {
+            // Only the caller's own entry goes. This retained on
+            // (req_ext, proto) alone, which was the one-holder rule: deleting
+            // one holder drained every client's entry at that port (the
+            // deployed bench found it, the router's delete taking the
+            // workstation's mapping with it).
             let mut es = self.entries.lock().await;
-            es.retain(|e| !(e.req_ext == req_ext && e.proto == proto));
+            es.retain(|e| !(e.req_ext == req_ext && e.proto == proto && e.owner == caller));
         }
         self.persist().await;
         Ok(String::new())
@@ -4005,6 +4010,21 @@ mod tests {
             holders.iter().any(|x| x.contains("a-owns-1024"))
                 && holders.iter().any(|x| x.contains("b-owns-1024")),
             "each index renders its own holder, not the first one twice"
+        );
+
+        // and a delete of one holder leaves the other standing
+        assert!(
+            facade.delete_mapping(1024, Proto::Udp, a, None).await.is_ok(),
+            "A deletes the mapping it made"
+        );
+        assert!(
+            facade
+                .entries
+                .lock()
+                .await
+                .iter()
+                .any(|x| x.req_ext == 1024 && x.owner == b),
+            "B's mapping at the same port is untouched by A's delete"
         );
 
         // a delete of another client's mapping is refused
