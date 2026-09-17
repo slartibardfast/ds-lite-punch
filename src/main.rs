@@ -53,12 +53,13 @@ fn fmt_static_err(e: StaticMapErr, lo: u16, hi: u16) -> String {
 
 /// One static mapping R=ip:port (UDP). P1's `--bind`/`--target` pair is sugar
 /// for a single entry; `--static-map` is the repeatable form (B3).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct StaticMap {
     bind_port: u16,
     target: SocketAddrV4,
 }
 
+#[derive(Debug)]
 struct Config {
     bind: SocketAddr,
     target: SocketAddrV4,
@@ -83,6 +84,13 @@ struct Config {
 }
 
 fn parse_args() -> Result<Config, String> {
+    parse_args_from(std::env::args().collect())
+}
+
+/// The parser, with its argv supplied. Kept separate so the multi-instance
+/// form can be tested: `--static-map` is repeatable, and until this split the
+/// only way to exercise it was to run the binary.
+fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut bind: Option<SocketAddr> = None;
     let mut target: Option<SocketAddrV4> = None;
     let mut static_maps: Vec<StaticMap> = Vec::new();
@@ -104,7 +112,6 @@ fn parse_args() -> Result<Config, String> {
     // /proc stays reachable as the fallback (--cdc proc).
     let mut cdc_kind = CdcKind::Nft;
 
-    let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         let k = args[i].as_str();
@@ -868,6 +875,57 @@ fn seed_external_ip(state_dir: &str, primary: u16) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        let mut v = vec!["ds-lite-punch".to_string()];
+        v.extend(rest.iter().map(|s| s.to_string()));
+        v
+    }
+
+    /// The multi-instance CLI contract (plan/0004 B3): `--static-map` is
+    /// repeatable and order-preserving, the legacy pair is sugar for one entry
+    /// and cannot be combined with it, and every malformed shape names itself.
+    #[test]
+    fn static_map_parse_is_repeatable_and_exclusive() {
+        // the repeatable form, in order
+        let c = parse_args_from(argv(&[
+            "--static-map", "40000=192.168.0.21:40001",
+            "--static-map", "41000=192.168.0.22:41001",
+        ]))
+        .expect("two static maps parse");
+        assert_eq!(c.static_maps.len(), 2, "both maps are kept");
+        assert_eq!(c.static_maps[0].bind_port, 40000);
+        assert_eq!(c.static_maps[0].target.to_string(), "192.168.0.21:40001");
+        assert_eq!(c.static_maps[1].bind_port, 41000);
+        assert_eq!(c.static_maps[1].target.to_string(), "192.168.0.22:41001");
+
+        // the legacy pair is one entry, and its bind port is the key
+        let c = parse_args_from(argv(&["--bind", "192.168.0.21:40000", "--target", "192.168.0.21:40001"]))
+            .expect("the legacy pair parses");
+        assert_eq!(c.static_maps.len(), 1);
+        assert_eq!(c.static_maps[0].bind_port, 40000);
+
+        // ... and cannot be combined with the repeatable form
+        let e = parse_args_from(argv(&[
+            "--bind", "192.168.0.21:40000", "--target", "192.168.0.21:40001",
+            "--static-map", "41000=192.168.0.22:41001",
+        ]))
+        .expect_err("combining the forms is refused");
+        assert!(e.contains("cannot be combined"), "{}", e);
+
+        // each malformed shape is named, not swallowed
+        for (args, want) in [
+            (vec!["--static-map", "40000"], "expected R=ip:port"),
+            (vec!["--static-map", "nope=192.168.0.21:40001"], "bad port"),
+            (vec!["--static-map", "40000=not-an-addr"], "bad target"),
+            (vec!["--bind", "192.168.0.21:40000"], "--bind requires --target"),
+            (vec!["--target", "192.168.0.21:40001"], "--target requires --bind"),
+            (vec![], "no mappings"),
+        ] {
+            let e = parse_args_from(argv(&args)).expect_err("a malformed form is refused");
+            assert!(e.contains(want), "for {:?} expected {:?}, got {:?}", args, want, e);
+        }
+    }
 
     #[test]
     fn seed_external_ip_prefers_slot_over_aggregate() {
