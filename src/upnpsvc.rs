@@ -25,6 +25,7 @@ use tokio::sync::{watch, Mutex, Semaphore};
 use crate::mapping::State;
 use crate::nft;
 use crate::dp;
+use crate::pcp;
 use crate::persist::{self, DEFAULT_DIR};
 use crate::publish::Publisher;
 use crate::slot::{Epoch, Lease, LeaseTable, Proto, Slot, UpsertOutcome};
@@ -123,12 +124,24 @@ struct Sub {
     timeout_secs: u32,
     expires_at_unix: u64,
     seq: u32,
+    /// The control point that subscribed, captured at SUBSCRIBE: containment
+    /// keys on the caller, and the callback address is not the caller.
+    caller: Ipv4Addr,
+    /// The face it subscribed on. The port floor binds the v2 face only, so
+    /// the subscriber's own count is scoped the way its reads are.
+    v2: bool,
+    /// The declared evented variables as this subscriber last saw them, so a
+    /// NOTIFY carries exactly what moved (call/0025).
+    sent: Option<EventView>,
 }
 
 #[derive(Default)]
 struct GenaState {
     subs: Vec<Sub>,
     sids: SidSet,
+    /// SystemUpdateID: bumped when a mapping appears or goes, so a subscriber
+    /// that only reads the evented surface still sees the table move.
+    update_id: u32,
 }
 
 /// plan/0008's ssdp:all rule and its state machine: what the responder does with one
@@ -195,6 +208,10 @@ pub struct UpnpFacade {
     /// plan/0008 #v2-service-set: the DeviceProtection:1 service state
     /// (users + ACL persisted, sessions transient per section 26.15).
     dp: StdMutex<dp::DpState>,
+    /// PCP mappings whose discovery has not completed yet: bind port -> the
+    /// second the wait began. A request that cannot be answered yet is
+    /// dropped; past DISCOVERY_GRACE_S the answer is the network error.
+    pcp_wait: StdMutex<HashMap<u16, u64>>,
 }
 
 impl UpnpFacade {
@@ -241,6 +258,7 @@ impl UpnpFacade {
             ssdp: Arc::new(ssdp),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(dp_state),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
 
         // Respawn-restored grants: main skipped their datapath spawn (its
@@ -562,6 +580,18 @@ impl UpnpFacade {
         owner: Ipv4Addr,
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
+        self.grant_mapping(req, owner, view).await.map(|_| String::new())
+    }
+
+    /// The grant itself, returning the admission outcome so a dialect that
+    /// reports result codes can answer precisely (PCP's quota and resource
+    /// errors are different messages to its clients).
+    async fn grant_mapping(
+        &self,
+        req: MappingReq,
+        owner: Ipv4Addr,
+        view: Option<Contain>,
+    ) -> Result<UpsertOutcome, UpnpErr> {
         let MappingReq {
             ext: req_ext,
             proto,
@@ -659,8 +689,387 @@ impl UpnpFacade {
                 }
             }
         }
+        // A grant, and any stray it left behind, is a change to what a
+        // subscriber can see: say so before the index is persisted.
+        self.signal_change().await;
         self.persist().await;
-        Ok(String::new())
+        Ok(outcome)
+    }
+
+    // ---- PCP and NAT-PMP admission (call/0025, plan/0009 #pcp) ----
+
+    /// The PCP epoch: seconds since this facade's state was created. A reboot
+    /// resets it near zero, which is what tells a PCP client its mappings are
+    /// gone (RFC 6887 section 8.5).
+    fn pcp_epoch(&self) -> u32 {
+        Epoch::now().saturating_sub(self.started_unix).min(u32::MAX as u64) as u32
+    }
+
+    /// The tuple a slot's discovery learned, from the per-slot file the
+    /// publisher writes. `None` means discovery has not completed, which is
+    /// the drop rule: the client's own retransmission brings it back.
+    fn external_tuple(&self, bind_port: u16) -> Option<(Ipv4Addr, u16)> {
+        let path = format!("{}/tuple-{}", self.cfg.state_dir, bind_port);
+        let s = std::fs::read_to_string(path).ok()?;
+        let (ip, port) = s.trim().split_once(':')?;
+        Some((ip.parse().ok()?, port.parse().ok()?))
+    }
+
+    /// Bind port of a mapping, by the key its dialect addresses it with.
+    async fn bind_port_of(&self, proto: Proto, owner: Ipv4Addr, int_port: u16) -> Option<u16> {
+        let es = self.entries.lock().await;
+        es.iter()
+            .find(|e| e.proto == proto && e.owner == owner && e.int_port == int_port)
+            .map(|e| e.bind_port)
+    }
+
+    /// The answer for a mapping whose tuple is not known yet, with the wait
+    /// recorded against the slot so a request that never discovers stops
+    /// being answered with silence.
+    fn discovery_answer(
+        &self,
+        bind_port: u16,
+        sug_ext: u16,
+        sug_ip: Ipv4Addr,
+    ) -> crate::pcp::MapAnswer {
+        let now = Epoch::now();
+        let mut w = self.pcp_wait.lock().unwrap();
+        let started = *w.entry(bind_port).or_insert(now);
+        match discovery_verdict(now.saturating_sub(started), false) {
+            Some(code) => {
+                w.remove(&bind_port);
+                pcp_error(code, sug_ext, sug_ip)
+            }
+            None => crate::pcp::MapAnswer::Drop,
+        }
+    }
+
+    /// One MAP admission, shared by PCP and NAT-PMP: the same slot engine and
+    /// the same per-client key as the other three paths, so a mapping made
+    /// here is indistinguishable in the datapath from an `AddPortMapping`
+    /// grant. `cap` is the dialect's longest grantable lifetime.
+    #[allow(clippy::too_many_arguments)] // one flat admission over the request's fields
+    async fn admit_map(
+        &self,
+        owner: Ipv4Addr,
+        target: Ipv4Addr,
+        view: Option<Contain>,
+        proto_u8: u8,
+        int_port: u16,
+        sug_ext: u16,
+        sug_ip: Ipv4Addr,
+        lifetime: u32,
+        cap: u32,
+        filters: &[crate::pcp::Filter],
+    ) -> crate::pcp::MapAnswer {
+        let Some(proto) = proto_of(proto_u8) else {
+            return pcp_error(crate::pcp::rc::UNSUPP_PROTOCOL, sug_ext, sug_ip);
+        };
+        // The datapath this daemon installs is endpoint-independent by
+        // design, so a filter it cannot install is refused with the code the
+        // RFC names for exactly that case, rather than answered with a claim
+        // of filtering that does not happen.
+        if !filters.is_empty() {
+            self.publisher.log_transition(
+                "pcp-filter",
+                &format!(
+                    "{} {} refused: the datapath is endpoint-independent",
+                    owner, int_port
+                ),
+            );
+            return pcp_error(crate::pcp::rc::EXCESSIVE_REMOTE_PEERS, sug_ext, sug_ip);
+        }
+        if lifetime == 0 {
+            // the delete form: the mapping goes, and the answer says so
+            let entry = {
+                let es = self.entries.lock().await;
+                es.iter()
+                    .find(|e| e.proto == proto && e.owner == owner && e.int_port == int_port)
+                    .map(|e| e.req_ext)
+            };
+            if let Some(req_ext) = entry {
+                if self.delete_mapping(req_ext, proto, owner, None).await.is_err() {
+                    return pcp_error(crate::pcp::rc::NOT_AUTHORIZED, sug_ext, sug_ip);
+                }
+            }
+            return crate::pcp::MapAnswer::Answer {
+                code: crate::pcp::rc::SUCCESS,
+                lifetime: 0,
+                ext_port: sug_ext,
+                ext_ip: sug_ip,
+            };
+        }
+        let granted = pcp::lifetime_cap(lifetime, cap);
+        let req = MappingReq {
+            ext: sug_ext,
+            proto,
+            client: target,
+            int_port,
+            lifetime: granted,
+            desc: "pcp".to_string(),
+        };
+        let outcome = match self.grant_mapping(req, owner, view).await {
+            Ok(o) => o,
+            Err(UpnpErr::NotAuthorized) => {
+                return pcp_error(crate::pcp::rc::NOT_AUTHORIZED, sug_ext, sug_ip)
+            }
+            Err(UpnpErr::InvalidArgs) => {
+                return pcp_error(crate::pcp::rc::MALFORMED_REQUEST, sug_ext, sug_ip)
+            }
+            Err(_) => return pcp_error(crate::pcp::rc::NO_RESOURCES, sug_ext, sug_ip),
+        };
+        let code = pcp::outcome_code(&outcome);
+        if code != crate::pcp::rc::SUCCESS {
+            return pcp_error(code, sug_ext, sug_ip);
+        }
+        let bind_port = match outcome {
+            UpsertOutcome::Granted { bind_port } | UpsertOutcome::Refreshed { bind_port } => {
+                bind_port
+            }
+            _ => return pcp_error(crate::pcp::rc::NO_RESOURCES, sug_ext, sug_ip),
+        };
+        match self.external_tuple(bind_port) {
+            Some((ip, port)) => {
+                self.pcp_wait.lock().unwrap().remove(&bind_port);
+                crate::pcp::MapAnswer::Answer {
+                    code: crate::pcp::rc::SUCCESS,
+                    lifetime: granted,
+                    ext_port: port,
+                    ext_ip: ip,
+                }
+            }
+            None => self.discovery_answer(bind_port, sug_ext, sug_ip),
+        }
+    }
+
+    /// A PCP PEER: the filtering here is endpoint-independent, so a peer
+    /// request has nothing to install. It is answered with the mapping's own
+    /// tuple when the operator has enabled the opcode, and refused otherwise.
+    async fn admit_peer(
+        &self,
+        owner: Ipv4Addr,
+        proto_u8: u8,
+        int_port: u16,
+        sug_ext: u16,
+        sug_ip: Ipv4Addr,
+        lifetime: u32,
+        peer_enabled: bool,
+    ) -> crate::pcp::MapAnswer {
+        let Some(proto) = proto_of(proto_u8) else {
+            return pcp_error(crate::pcp::rc::UNSUPP_PROTOCOL, sug_ext, sug_ip);
+        };
+        let Some(bind_port) = self.bind_port_of(proto, owner, int_port).await else {
+            // nothing to extend: this server creates mappings through MAP
+            return pcp_error(crate::pcp::rc::CANNOT_PROVIDE_EXTERNAL, sug_ext, sug_ip);
+        };
+        if !peer_enabled {
+            return pcp_error(crate::pcp::rc::NOT_AUTHORIZED, sug_ext, sug_ip);
+        }
+        match self.external_tuple(bind_port) {
+            Some((ip, port)) => crate::pcp::MapAnswer::Answer {
+                code: crate::pcp::rc::SUCCESS,
+                lifetime: pcp::lifetime_cap(lifetime, crate::pcp::MAX_LIFETIME),
+                ext_port: port,
+                ext_ip: ip,
+            },
+            None => self.discovery_answer(bind_port, sug_ext, sug_ip),
+        }
+    }
+
+    /// One PCP datagram: the response to send, or None to stay silent.
+    async fn pcp_handle(&self, pkt: &[u8], client: Ipv4Addr, peer_enabled: bool) -> Option<Vec<u8>> {
+        let epoch = self.pcp_epoch();
+        match pcp::parse_pcp(pkt, client) {
+            Err(pcp::Refusal::Silent) => None,
+            Err(pcp::Refusal::Code { code, .. }) => Some(pcp::build_error(pkt, code, epoch)),
+            Ok(pcp::Req::Announce) => Some(pcp::build_announce_response(epoch)),
+            Ok(pcp::Req::Map(m)) => {
+                // THIRD_PARTY is gated on the lift the containment already
+                // defines: a caller that authenticated over DeviceProtection
+                // may map for another host, and one that did not may not.
+                let lifted = self.dp_holds_lift(client, Epoch::now());
+                let (target, view) = match (m.third_party, lifted) {
+                    (Some(other), true) => (other, None),
+                    (Some(_), false) => {
+                        return Some(pcp::build_map_response(
+                            &m,
+                            epoch,
+                            crate::pcp::rc::NOT_AUTHORIZED,
+                            pcp::error_lifetime(crate::pcp::rc::NOT_AUTHORIZED),
+                            m.sug_ext_port,
+                            m.sug_ext_ip,
+                        ))
+                    }
+                    (None, true) => (client, None),
+                    (None, false) => (
+                        client,
+                        Some(Contain {
+                            caller: client,
+                            high_port: false,
+                        }),
+                    ),
+                };
+                if m.prefer_failure {
+                    // On this uplink the AFTR owns the external port, so a
+                    // suggested external port cannot be promised, and the
+                    // option says: do not substitute. RFC 6887 section 13.2
+                    // names this result for exactly this request.
+                    return Some(pcp::build_map_response(
+                        &m,
+                        epoch,
+                        crate::pcp::rc::CANNOT_PROVIDE_EXTERNAL,
+                        pcp::error_lifetime(crate::pcp::rc::CANNOT_PROVIDE_EXTERNAL),
+                        m.sug_ext_port,
+                        m.sug_ext_ip,
+                    ));
+                }
+                match self
+                    .admit_map(
+                        client,
+                        target,
+                        view,
+                        m.proto,
+                        m.int_port,
+                        m.sug_ext_port,
+                        m.sug_ext_ip,
+                        m.lifetime,
+                        pcp::MAX_LIFETIME,
+                        &m.filters,
+                    )
+                    .await
+                {
+                    pcp::MapAnswer::Drop => None,
+                    pcp::MapAnswer::Answer {
+                        code,
+                        lifetime,
+                        ext_port,
+                        ext_ip,
+                    } => Some(pcp::build_map_response(&m, epoch, code, lifetime, ext_port, ext_ip)),
+                }
+            }
+            Ok(pcp::Req::Peer(p)) => {
+                match self
+                    .admit_peer(
+                        client,
+                        p.proto,
+                        p.int_port,
+                        p.peer_port,
+                        p.peer_ip,
+                        p.lifetime,
+                        peer_enabled,
+                    )
+                    .await
+                {
+                    pcp::MapAnswer::Drop => None,
+                    pcp::MapAnswer::Answer {
+                        code,
+                        lifetime,
+                        ext_port,
+                        ext_ip,
+                    } => Some(pcp::build_peer_response(&p, epoch, code, lifetime, ext_port, ext_ip)),
+                }
+            }
+        }
+    }
+
+    /// One NAT-PMP datagram: the response to send, or None to stay silent.
+    async fn npmp_handle(&self, pkt: &[u8], client: Ipv4Addr) -> Option<Vec<u8>> {
+        let epoch = self.pcp_epoch();
+        match pcp::parse_npmp(pkt) {
+            Err(pcp::NpmpErr::Silent) => None,
+            Err(pcp::NpmpErr::Code(code)) => Some(if code == pcp::np::UNSUPP_VERSION {
+                pcp::build_npmp_version_error(epoch)
+            } else {
+                pcp::build_npmp_echo(pkt, epoch)
+            }),
+            Ok(pcp::NpmpReq::PublicAddress) => Some(pcp::build_npmp_public(
+                pcp::np::SUCCESS,
+                epoch,
+                self.external_ip().unwrap_or(Ipv4Addr::UNSPECIFIED),
+            )),
+            Ok(pcp::NpmpReq::Map {
+                op,
+                int_port,
+                sug_ext_port,
+                lifetime,
+            }) => {
+                let proto_u8 = if op == pcp::np::OP_MAP_UDP { 17 } else { 6 };
+                if int_port == 0 && lifetime != 0 {
+                    return Some(pcp::build_npmp_map(
+                        op,
+                        pcp::np::NOT_AUTHORIZED,
+                        epoch,
+                        int_port,
+                        0,
+                        0,
+                    ));
+                }
+                let answer = self
+                    .admit_map(
+                        client,
+                        client,
+                        Some(Contain {
+                            caller: client,
+                            high_port: false,
+                        }),
+                        proto_u8,
+                        int_port,
+                        sug_ext_port,
+                        Ipv4Addr::UNSPECIFIED,
+                        lifetime,
+                        pcp::NPMP_LIFETIME,
+                        &[],
+                    )
+                    .await;
+                match answer {
+                    // NAT-PMP has no answer for a mapping still in flight:
+                    // the client asks again, and this request is dropped
+                    pcp::MapAnswer::Drop => None,
+                    pcp::MapAnswer::Answer {
+                        code,
+                        lifetime,
+                        ext_port,
+                        ..
+                    } => {
+                        let code = npmp_code(code);
+                        Some(pcp::build_npmp_map(op, code, epoch, int_port, ext_port, lifetime))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The PCP and NAT-PMP service (call/0025's fourth admission path): one
+    /// socket on the LAN address carrying both protocols on the shared port.
+    /// The caller owns the bind, so the service can be exercised without the
+    /// production port.
+    pub async fn pcp_serve(self: Arc<Self>, sock: UdpSocket, peer_enabled: bool) {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, from) = match sock.recv_from(&mut buf).await {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("pcp: recv: {}", e);
+                    continue;
+                }
+            };
+            let SocketAddr::V4(v4) = from else { continue };
+            let client = *v4.ip();
+            // LAN only, by the bind and by this check: a request from another
+            // network is not a control point of ours (RFC 6887 section 8.2).
+            if !in_lan(client, self.cfg.lan_ip) {
+                continue;
+            }
+            let pkt = &buf[..n];
+            let reply = match pcp::sniff(pkt) {
+                pcp::Sniff::Pcp => self.pcp_handle(pkt, client, peer_enabled).await,
+                pcp::Sniff::Npmp => self.npmp_handle(pkt, client).await,
+                pcp::Sniff::Unknown => None,
+            };
+            if let Some(r) = reply {
+                let _ = sock.send_to(&r, from).await;
+            }
+        }
     }
 
     /// One upsert attempt. A retry after pressure eviction is the caller's
@@ -796,6 +1205,7 @@ impl UpnpFacade {
             let mut es = self.entries.lock().await;
             es.retain(|e| !(e.req_ext == req_ext && e.proto == proto && e.owner == caller));
         }
+        self.signal_change().await;
         self.persist().await;
         Ok(String::new())
     }
@@ -1033,14 +1443,20 @@ impl UpnpFacade {
 
     // ---- GENA ----
 
-    async fn gena_subscribe(&self, callback: &[u8], timeout_secs: u32) -> Result<String, UpnpErr> {
+    async fn gena_subscribe(
+        &self,
+        callback: &[u8],
+        timeout_secs: u32,
+        caller: Ipv4Addr,
+        v2: bool,
+    ) -> Result<String, UpnpErr> {
         let Some((ip, port, path)) = parse_callback(callback) else {
             return Err(UpnpErr::InvalidArgs);
         };
         if !in_lan(ip, self.cfg.lan_ip) {
             return Err(UpnpErr::InvalidArgs);
         }
-        if path.len() > GENA_CB_MAX {
+        if path.len() > GENA_CB_MAX || !in_lan(caller, self.cfg.lan_ip) {
             return Err(UpnpErr::InvalidArgs);
         }
         let timeout = timeout_secs.clamp(1, GENA_TIMEOUT_CAP);
@@ -1058,19 +1474,19 @@ impl UpnpFacade {
             timeout_secs: timeout,
             expires_at_unix: now.saturating_add(u64::from(timeout) * 2),
             seq: 0,
+            caller,
+            v2,
+            sent: None,
         });
         drop(g);
-        // initial NOTIFY carries eventKey 0 per GENA (E5); a delivered initial
-        // notify advances the subscription's key so the first change event
-        // carries 1 — never a repeat of 0 (notify_all performs the same
-        // advance after every delivery).
-        if let Some(ext) = self.external_ip() {
-            self.notify_one(sid, ext, 0).await;
-            let mut g = self.gena.lock().await;
-            if let Some(s) = g.subs.iter_mut().find(|s| s.sid == sid) {
-                s.seq = advance_seq(s.seq);
-            }
-        }
+        // initial NOTIFY carries eventKey 0 per GENA (E5) and every declared
+        // evented variable; a delivered initial notify advances the
+        // subscription's key so the first change event carries 1 — never a
+        // repeat of 0 (notify_view performs the same advance after every
+        // delivery).
+        let ext = self.external_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let view = self.view_for(caller, v2, ext).await;
+        self.notify_view(sid, view, true).await;
         Ok(format!(
             "SID: {}\r\nTIMEOUT: Second-{}\r\n",
             String::from_utf8_lossy(&sid.wire()),
@@ -1105,21 +1521,61 @@ impl UpnpFacade {
         Ok(String::new())
     }
 
-    async fn notify_all(&self, ip: Ipv4Addr) {
-        let subs: Vec<(Sid, u32)> = {
-            let g = self.gena.lock().await;
-            g.subs.iter().map(|s| (s.sid, s.seq)).collect()
+    /// The evented view one subscriber may see: the daemon's external
+    /// address, the connection status, and its own count of mappings,
+    /// computed with the containment its reads apply (call/0025).
+    async fn view_for(&self, caller: Ipv4Addr, v2: bool, ext: Ipv4Addr) -> EventView {
+        let scope = if self.dp_holds_lift(caller, Epoch::now()) {
+            None
+        } else {
+            Some(Contain {
+                caller,
+                high_port: v2,
+            })
         };
-        for (sid, seq) in subs {
-            self.notify_one(sid, ip, seq).await;
-            let mut g = self.gena.lock().await;
-            if let Some(s) = g.subs.iter_mut().find(|s| s.sid == sid) {
-                s.seq = advance_seq(s.seq);
-            }
+        let entries = {
+            let es = self.entries.lock().await;
+            scoped_count(scope, &es)
+        };
+        let update_id = self.gena.lock().await.update_id;
+        EventView::new(ext, entries, update_id)
+    }
+
+    /// SystemUpdateID moves when a mapping appears or goes. A re-key of the
+    /// datapath tuple deliberately does not move it: the reported port is the
+    /// requested label (call/0022), so no event may invent a port change
+    /// (call/0025). What a re-key can show is the address, and that rides
+    /// ExternalIPAddress on the tuple path.
+    async fn bump_update_id(&self) {
+        let mut g = self.gena.lock().await;
+        g.update_id = g.update_id.wrapping_add(1);
+    }
+
+    /// A mapping appeared or went: move the id and tell the subscribers now,
+    /// rather than waiting for the next tuple publication.
+    async fn signal_change(&self) {
+        self.bump_update_id().await;
+        let ext = self.external_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
+        self.notify_all(ext).await;
+    }
+
+    /// Offer every subscriber the current view; each one is sent exactly the
+    /// declared variables that moved for it.
+    async fn notify_all(&self, ip: Ipv4Addr) {
+        let subs: Vec<(Sid, Ipv4Addr, bool)> = {
+            let g = self.gena.lock().await;
+            g.subs.iter().map(|s| (s.sid, s.caller, s.v2)).collect()
+        };
+        for (sid, caller, v2) in subs {
+            let view = self.view_for(caller, v2, ip).await;
+            self.notify_view(sid, view, false).await;
         }
     }
 
-    async fn notify_one(&self, sid: Sid, ip: Ipv4Addr, seq: u32) {
+    /// Deliver one NOTIFY carrying what moved for this subscriber, and record
+    /// the view it was told. `force` is the subscription's initial event,
+    /// which carries every declared variable whether or not it moved.
+    async fn notify_view(&self, sid: Sid, view: EventView, force: bool) {
         let sub = {
             let g = self.gena.lock().await;
             g.subs.iter().find(|s| s.sid == sid).cloned()
@@ -1127,16 +1583,21 @@ impl UpnpFacade {
         let Some(s) = sub else {
             return;
         };
+        let body = if force {
+            propertyset(None, &view)
+        } else {
+            propertyset(s.sent.as_ref(), &view)
+        };
+        if body.is_empty() {
+            // nothing moved: not an event, and the key must not advance
+            return;
+        }
+        let seq = s.seq;
         let path = if s.cb_path.is_empty() {
             "/".to_string()
         } else {
             String::from_utf8_lossy(&s.cb_path).into_owned()
         };
-        let body = format!(
-            "<?xml version=\"1.0\"?>\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">\
-             <e:property><ExternalIPAddress>{}</ExternalIPAddress></e:property></e:propertyset>\n",
-            ip
-        );
         let req = format!(
             "POST {} HTTP/1.1\r\nHOST: {}:{}\r\nCONTENT-TYPE: text/xml; charset=\"utf-8\"\r\n\
              NT: upnp:event\r\nNTS: upnp:propchange\r\nSID: {}\r\nSEQ: {}\r\n\
@@ -1154,6 +1615,13 @@ impl UpnpFacade {
             deliver_notify(s.cb_ip, s.cb_port, req.as_bytes()),
         )
         .await;
+        // delivered: the key advances and the view is remembered, so the next
+        // event carries only what moved since this one
+        let mut g = self.gena.lock().await;
+        if let Some(s) = g.subs.iter_mut().find(|s| s.sid == sid) {
+            s.sent = Some(view);
+            s.seq = advance_seq(seq);
+        }
     }
 
     async fn prune_expired(&self) {
@@ -1420,7 +1888,10 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
             let callback = upnp::find_header(head, b"CALLBACK").unwrap_or(b"");
             let timeout =
                 parse_timeout(upnp::find_header(head, b"TIMEOUT")).unwrap_or(GENA_TIMEOUT_CAP);
-            match facade.gena_subscribe(callback, timeout).await {
+            let v2 = request_path(head)
+                .map(|p| p.starts_with(b"/igd/v2/"))
+                .unwrap_or(false);
+            match facade.gena_subscribe(callback, timeout, client_ip, v2).await {
                 Ok(extra) => {
                     let _ = write_response(&mut stream, "200 OK", b"", &extra).await;
                 }
@@ -2289,6 +2760,153 @@ fn parse_desc(body: &[u8]) -> String {
         .filter(|c| !c.is_control())
         .collect();
     clean.chars().take(DESC_MAX).collect()
+}
+
+/// The connection status the evented surface reports. This line is not
+/// dialled by anything of ours, so the only two states the daemon can
+/// honestly claim are "the external tuple is known" and "it is not".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+    Connected,
+    Disconnected,
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::Connected => "Connected",
+            Status::Disconnected => "Disconnected",
+        }
+    }
+}
+
+/// The declared evented variables of the WAN connection service, as one
+/// value: one subscriber's view of the daemon's own truth (call/0025). The
+/// reads answer from the same state, so an event cannot contradict a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EventView {
+    ext_ip: Ipv4Addr,
+    status: Status,
+    entries: u16,
+    update_id: u32,
+}
+
+impl EventView {
+    fn new(ext_ip: Ipv4Addr, entries: u16, update_id: u32) -> Self {
+        EventView {
+            ext_ip,
+            status: if ext_ip == Ipv4Addr::UNSPECIFIED {
+                Status::Disconnected
+            } else {
+                Status::Connected
+            },
+            entries,
+            update_id,
+        }
+    }
+}
+
+/// Build a NOTIFY body carrying exactly the declared evented variables that
+/// moved, all of them for a subscription's initial event. An empty string
+/// means nothing moved, which is not an event: a subscriber is told about
+/// changes, and inventing one would make the next query contradict it.
+fn propertyset(prev: Option<&EventView>, now: &EventView) -> String {
+    let mut props = String::new();
+    if prev.map_or(true, |p| p.status != now.status) {
+        props.push_str(&format!(
+            "<e:property><ConnectionStatus>{}</ConnectionStatus></e:property>",
+            now.status.as_str()
+        ));
+    }
+    if prev.map_or(true, |p| p.ext_ip != now.ext_ip) {
+        props.push_str(&format!(
+            "<e:property><ExternalIPAddress>{}</ExternalIPAddress></e:property>",
+            now.ext_ip
+        ));
+    }
+    if prev.map_or(true, |p| p.entries != now.entries) {
+        props.push_str(&format!(
+            "<e:property><PortMappingNumberOfEntries>{}</PortMappingNumberOfEntries></e:property>",
+            now.entries
+        ));
+    }
+    if prev.map_or(true, |p| p.update_id != now.update_id) {
+        props.push_str(&format!(
+            "<e:property><SystemUpdateID>{}</SystemUpdateID></e:property>",
+            now.update_id
+        ));
+    }
+    if props.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<?xml version=\"1.0\"?>\n<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">{}</e:propertyset>\n",
+        props
+    )
+}
+
+/// How many mappings a subscriber's view holds: the same containment the
+/// reads apply, so a contained control point cannot count another client's
+/// namespace.
+fn scoped_count(scope: Option<Contain>, entries: &[FacadeEntry]) -> u16 {
+    let n = match scope {
+        None => entries.len(),
+        Some(c) => entries.iter().filter(|e| entry_within(c, e)).count(),
+    };
+    n.min(u16::MAX as usize) as u16
+}
+
+/// The transport a MAP names, as this daemon's slot engine spells it. The
+/// zero protocol ("all protocols") and anything but UDP and TCP are not
+/// mappings this datapath can hold.
+fn proto_of(code: u8) -> Option<Proto> {
+    match code {
+        17 => Some(Proto::Udp),
+        6 => Some(Proto::Tcp),
+        _ => None,
+    }
+}
+
+/// An error answer: the suggested external port and address come back as the
+/// request gave them, which is what RFC 6887 section 11.1 asks an error
+/// response to carry.
+fn pcp_error(code: u8, sug_ext: u16, sug_ip: Ipv4Addr) -> crate::pcp::MapAnswer {
+    crate::pcp::MapAnswer::Answer {
+        code,
+        lifetime: crate::pcp::error_lifetime(code),
+        ext_port: sug_ext,
+        ext_ip: sug_ip,
+    }
+}
+
+/// NAT-PMP's own result codes (RFC 6886 section 3.5) for the outcomes the
+/// admission shares with PCP.
+fn npmp_code(pcp_code: u8) -> u8 {
+    use crate::pcp::np;
+    use crate::pcp::rc;
+    match pcp_code {
+        rc::SUCCESS => np::SUCCESS,
+        rc::USER_EX_QUOTA | rc::NO_RESOURCES => np::NO_RESOURCES,
+        rc::NETWORK_FAILURE => np::NETWORK_FAILURE,
+        _ => np::NOT_AUTHORIZED,
+    }
+}
+
+/// How long a mapping may wait for its discovery before the server says so.
+/// A request that cannot be answered yet is dropped, because the client's own
+/// retransmission is the only recovery the protocol provides; past this much
+/// waiting the drop is no longer honest, and the network error is.
+const DISCOVERY_GRACE_S: u64 = 10;
+
+/// The verdict for a mapping whose tuple is not known yet: silence while the
+/// wait is young, NETWORK_FAILURE (RFC 6887 section 7.4, a short-lifetime
+/// error) once it is not.
+fn discovery_verdict(waited_s: u64, tuple_known: bool) -> Option<u8> {
+    if tuple_known || waited_s < DISCOVERY_GRACE_S {
+        None
+    } else {
+        Some(crate::pcp::rc::NETWORK_FAILURE)
+    }
 }
 
 /// Escape the five XML metacharacters. Only the description needs it: the
@@ -3539,6 +4157,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3661,6 +4280,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
 
         let bind_port = 41001;
@@ -3897,6 +4517,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
         let view = Some(Contain { caller: a, high_port: true });
 
@@ -4237,6 +4858,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
 
         // the fragment is the spec's sample shape (2.3.25.2): a namespaced
@@ -4378,6 +5000,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
 
         facade.spawn_restored_grants().await;
@@ -4446,11 +5069,12 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
 
         let cb = format!("<http://127.0.0.1:{}/evt>", port);
         facade
-            .gena_subscribe(cb.as_bytes(), 30)
+            .gena_subscribe(cb.as_bytes(), 30, Ipv4Addr::LOCALHOST, true)
             .await
             .expect("subscribe with a reachable callback");
 
@@ -4538,6 +5162,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -4990,6 +5615,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5102,6 +5728,7 @@ mod tests {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
         let addr = facade.ssdp.local_addr().unwrap();
         let f = facade.clone();
@@ -5339,6 +5966,7 @@ mod ifindex_probe {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
 
         // Dump the generated rootDesc for the external miniupnpc parser.
@@ -5586,6 +6214,7 @@ mod ifindex_probe {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: dp_seeded(),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -6082,6 +6711,7 @@ mod ifindex_probe {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6189,6 +6819,7 @@ mod ifindex_probe {
             ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
         };
         f3.cfg.upnp_port = 0;
         let down = Arc::new(f3);
@@ -6210,6 +6841,378 @@ mod ifindex_probe {
             r.contains("<errorCode>704</errorCode>") && r.contains("ConnectionSetupFailed"),
             "no tuple means the provider side is not up: {}",
             &r[..r.len().min(400)]
+        );
+    }
+
+    // ---- the evented surface (call/0025, plan/0009 #signal) ----
+
+    fn ev(ip: &str, entries: u16, update_id: u32) -> EventView {
+        EventView::new(ip.parse().unwrap(), entries, update_id)
+    }
+
+    fn ev_entry(owner: Ipv4Addr, int_port: u16, bind_port: u16) -> FacadeEntry {
+        FacadeEntry {
+            req_ext: int_port,
+            proto: Proto::Udp,
+            owner,
+            client: owner,
+            int_port,
+            bind_port,
+            granted_lifetime: 600,
+            expires_at_unix: 0,
+            desc: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_initial_event_carries_every_declared_variable() {
+        let body = propertyset(None, &ev("87.116.31.222", 3, 7));
+        for name in [
+            "ConnectionStatus",
+            "ExternalIPAddress",
+            "PortMappingNumberOfEntries",
+            "SystemUpdateID",
+        ] {
+            assert!(body.contains(name), "{} missing from {}", name, body);
+        }
+        assert!(body.contains("<ExternalIPAddress>87.116.31.222</ExternalIPAddress>"), "{}", body);
+        assert!(body.contains("<PortMappingNumberOfEntries>3</PortMappingNumberOfEntries>"), "{}", body);
+        assert!(body.contains("<SystemUpdateID>7</SystemUpdateID>"), "{}", body);
+        assert!(body.contains("urn:schemas-upnp-org:event-1-0"), "{}", body);
+    }
+
+    #[test]
+    fn a_change_event_carries_only_what_moved() {
+        let prev = ev("87.116.31.222", 3, 7);
+        let now = EventView::new("87.116.31.222".parse().unwrap(), 3, 8);
+        let body = propertyset(Some(&prev), &now);
+        assert!(body.contains("SystemUpdateID"), "{}", body);
+        assert!(!body.contains("ExternalIPAddress"), "{}", body);
+        assert!(!body.contains("PortMappingNumberOfEntries"), "{}", body);
+        assert!(!body.contains("ConnectionStatus"), "{}", body);
+        // nothing moved at all is not an event
+        assert_eq!(propertyset(Some(&now), &now), "");
+    }
+
+    #[test]
+    fn the_connection_status_follows_the_tuple() {
+        assert_eq!(EventView::new(Ipv4Addr::UNSPECIFIED, 0, 0).status, Status::Disconnected);
+        assert_eq!(
+            EventView::new(Ipv4Addr::new(87, 116, 31, 222), 0, 0).status,
+            Status::Connected
+        );
+        let down = EventView::new(Ipv4Addr::UNSPECIFIED, 0, 0);
+        let up = EventView::new(Ipv4Addr::new(87, 116, 31, 222), 0, 1);
+        let body = propertyset(Some(&down), &up);
+        assert!(body.contains("<ConnectionStatus>Connected</ConnectionStatus>"), "{}", body);
+    }
+
+    #[test]
+    fn a_scoped_count_is_the_callers_own_namespace() {
+        let a = Ipv4Addr::new(192, 168, 21, 50);
+        let b = Ipv4Addr::new(192, 168, 21, 51);
+        let entries = vec![
+            ev_entry(a, 3074, 30000),
+            ev_entry(b, 3074, 30001),
+            ev_entry(a, 40000, 30002),
+        ];
+        assert_eq!(scoped_count(None, &entries), 3, "the lift sees the whole table");
+        assert_eq!(
+            scoped_count(Some(Contain { caller: a, high_port: true }), &entries),
+            2
+        );
+        assert_eq!(
+            scoped_count(Some(Contain { caller: b, high_port: true }), &entries),
+            1
+        );
+        assert_eq!(
+            scoped_count(
+                Some(Contain { caller: Ipv4Addr::new(192, 168, 21, 99), high_port: true }),
+                &entries
+            ),
+            0,
+            "a caller sees nothing that is not its own"
+        );
+        // and the v1 face's floor, where it applies, excludes low ports
+        let low = vec![ev_entry(a, 80, 30003)];
+        assert_eq!(
+            scoped_count(Some(Contain { caller: a, high_port: true }), &low),
+            0
+        );
+        assert_eq!(
+            scoped_count(Some(Contain { caller: a, high_port: false }), &low),
+            1
+        );
+    }
+
+    #[test]
+    fn a_mapping_whose_discovery_drags_answers_the_network_error() {
+        assert_eq!(discovery_verdict(0, false), None, "young: silence, the client retries");
+        assert_eq!(discovery_verdict(DISCOVERY_GRACE_S - 1, false), None);
+        assert_eq!(
+            discovery_verdict(DISCOVERY_GRACE_S, false),
+            Some(crate::pcp::rc::NETWORK_FAILURE)
+        );
+        assert_eq!(discovery_verdict(600, true), None, "a known tuple is never an error");
+    }
+
+    /// plan/0009 #signal, end to end: a real subscription over a real socket,
+    /// told exactly what changed and scoped to its own namespace alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscriber_is_told_about_its_own_mappings_only() {
+        let l = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = l.local_addr().unwrap().port();
+        let a = Ipv4Addr::new(127, 0, 0, 1);
+        let b = Ipv4Addr::new(127, 0, 0, 2);
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/none".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "signal".into(),
+            grace_secs: 60,
+        };
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                8,
+                4,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::new(87, 116, 31, 222)).0,
+            )),
+            entries: Mutex::new(vec![ev_entry(a, 3074, 30000), ev_entry(b, 3074, 30001)]),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::new(87, 116, 31, 222)).1,
+            udn: String::from("signal"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
+        });
+
+        let cb = format!("<http://127.0.0.1:{}/evt>", port);
+        facade
+            .gena_subscribe(cb.as_bytes(), 30, a, true)
+            .await
+            .expect("subscribe with a reachable callback");
+
+        // read_head returns everything its own read took, head *and* body
+        // when the NOTIFY arrived in one segment, so the body is taken from
+        // that buffer first and only the remainder from the socket.
+        async fn body_of(stream: &mut TcpStream) -> String {
+            let raw = read_head(stream).await.expect("notify head");
+            let (head, rest) = split_head(&raw).expect("head terminator");
+            let want = content_length(head).unwrap_or(0);
+            let mut body = rest.to_vec();
+            while body.len() < want {
+                let more = read_body(stream, want - body.len()).await.expect("notify body");
+                if more.is_empty() {
+                    break;
+                }
+                body.extend_from_slice(&more);
+            }
+            String::from_utf8_lossy(&body[..want.min(body.len())]).into_owned()
+        }
+
+        // the initial event carries every declared variable, and the count is
+        // the subscriber's own namespace alone
+        let (mut s0, _) = l.accept().await.unwrap();
+        let first = body_of(&mut s0).await;
+        assert!(first.contains("ConnectionStatus"), "{}", first);
+        assert!(first.contains("ExternalIPAddress"), "{}", first);
+        assert!(first.contains("<PortMappingNumberOfEntries>1</PortMappingNumberOfEntries>"), "{}", first);
+        assert!(first.contains("SystemUpdateID"), "{}", first);
+
+        // a mapping appears: the update id moves, so that is the event
+        facade.bump_update_id().await;
+        facade.notify_all(Ipv4Addr::new(87, 116, 31, 222)).await;
+        let (mut s1, _) = l.accept().await.unwrap();
+        let second = body_of(&mut s1).await;
+        assert!(second.contains("<SystemUpdateID>1</SystemUpdateID>"), "{}", second);
+        assert!(!second.contains("ExternalIPAddress"), "the address did not move: {}", second);
+        assert!(
+            !second.contains("PortMappingNumberOfEntries"),
+            "the count did not move: {}",
+            second
+        );
+
+        // and nothing moved at all is not an event: no third delivery
+        facade.notify_all(Ipv4Addr::new(87, 116, 31, 222)).await;
+        let idle = tokio::time::timeout(Duration::from_millis(300), l.accept()).await;
+        assert!(idle.is_err(), "a NOTIFY arrived that no change justifies");
+
+        // the tuple moved: that is an event, and the address is the variable
+        facade.notify_all(Ipv4Addr::new(87, 116, 31, 223)).await;
+        let (mut s2, _) = l.accept().await.unwrap();
+        let third = body_of(&mut s2).await;
+        assert!(third.contains("<ExternalIPAddress>87.116.31.223</ExternalIPAddress>"), "{}", third);
+    }
+
+    /// plan/0009 #pcp, end to end over a real socket: the announcements, the
+    /// refusals the RFC names, and the NAT-PMP subset that shares the port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_shared_port_answers_announce_and_names_its_refusals() {
+        let a = Ipv4Addr::new(127, 0, 0, 1);
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: "/tmp/none".into(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "pcp".into(),
+            grace_secs: 60,
+        };
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                8,
+                4,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                "/tmp/none",
+                watch::channel(Ipv4Addr::new(87, 116, 31, 222)).0,
+            )),
+            entries: Mutex::new(Vec::new()),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::new(87, 116, 31, 222)).1,
+            udn: String::from("pcp"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
+        });
+        let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = sock.local_addr().unwrap();
+        let f = facade.clone();
+        tokio::spawn(async move {
+            f.pcp_serve(sock, false).await;
+        });
+        let cli = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1500];
+
+        fn mapped4(ip: Ipv4Addr) -> [u8; 16] {
+            let mut a = [0u8; 16];
+            a[10] = 0xff;
+            a[11] = 0xff;
+            a[12..16].copy_from_slice(&ip.octets());
+            a
+        }
+        fn request(opcode: u8, lifetime: u32, client: Ipv4Addr, body: &[u8]) -> Vec<u8> {
+            let mut b = vec![2u8, opcode];
+            b.extend_from_slice(&0u16.to_be_bytes());
+            b.extend_from_slice(&lifetime.to_be_bytes());
+            b.extend_from_slice(&mapped4(client));
+            b.extend_from_slice(body);
+            b
+        }
+        fn map_body(proto: u8, int_port: u16, sug: u16) -> Vec<u8> {
+            let mut b = vec![0x5Au8; 12];
+            b.push(proto);
+            b.extend_from_slice(&[0u8; 3]);
+            b.extend_from_slice(&int_port.to_be_bytes());
+            b.extend_from_slice(&sug.to_be_bytes());
+            b.extend_from_slice(&mapped4(Ipv4Addr::UNSPECIFIED));
+            b
+        }
+        async fn ask(
+            cli: &UdpSocket,
+            addr: SocketAddr,
+            req: &[u8],
+            buf: &mut [u8],
+        ) -> Option<usize> {
+            cli.send_to(req, addr).await.unwrap();
+            match tokio::time::timeout(Duration::from_millis(500), cli.recv(buf)).await {
+                Ok(Ok(n)) => Some(n),
+                _ => None,
+            }
+        }
+
+        // ANNOUNCE: the header back, no opcode payload
+        let n = ask(&cli, addr, &request(0, 0, a, &[]), &mut buf)
+            .await
+            .expect("an ANNOUNCE is answered");
+        assert_eq!(n, 24, "an ANNOUNCE response is the header alone");
+        assert_eq!(buf[1], 0x80, "the R bit, and the ANNOUNCE opcode");
+        assert_eq!(buf[3], crate::pcp::rc::SUCCESS);
+
+        // a version this server does not speak
+        let mut wrong = request(1, 120, a, &map_body(17, 3074, 3074));
+        wrong[0] = 9;
+        let n = ask(&cli, addr, &wrong, &mut buf).await.expect("answered");
+        assert_eq!(buf[3], crate::pcp::rc::UNSUPP_VERSION, "len {}", n);
+
+        // a filter this datapath cannot install: the RFC's own code for it
+        let mut filtered = request(1, 120, a, &map_body(17, 3074, 0));
+        let mut f_opt = vec![3u8, 0, 0, 20, 0, 32];
+        f_opt.extend_from_slice(&3074u16.to_be_bytes());
+        f_opt.extend_from_slice(&mapped4(Ipv4Addr::new(203, 0, 113, 7)));
+        while f_opt.len() % 4 != 0 {
+            f_opt.push(0);
+        }
+        filtered.extend_from_slice(&f_opt);
+        ask(&cli, addr, &filtered, &mut buf).await.expect("answered");
+        assert_eq!(
+            buf[3],
+            crate::pcp::rc::EXCESSIVE_REMOTE_PEERS,
+            "a filter we cannot install is refused, not claimed"
+        );
+
+        // PREFER_FAILURE: the AFTR owns the port, so no substitution
+        let mut prefer = request(1, 120, a, &map_body(17, 3074, 3074));
+        prefer.extend_from_slice(&[2u8, 0, 0, 0]);
+        ask(&cli, addr, &prefer, &mut buf).await.expect("answered");
+        assert_eq!(buf[3], crate::pcp::rc::CANNOT_PROVIDE_EXTERNAL);
+
+        // THIRD_PARTY without the lift
+        let mut third = request(1, 120, a, &map_body(17, 3074, 0));
+        third.extend_from_slice(&[1u8, 0, 0, 16]);
+        third.extend_from_slice(&mapped4(Ipv4Addr::new(192, 168, 21, 60)));
+        ask(&cli, addr, &third, &mut buf).await.expect("answered");
+        assert_eq!(buf[3], crate::pcp::rc::NOT_AUTHORIZED);
+
+        // a protocol this datapath does not hold
+        ask(&cli, addr, &request(1, 120, a, &map_body(132, 3074, 0)), &mut buf)
+            .await
+            .expect("answered");
+        assert_eq!(buf[3], crate::pcp::rc::UNSUPP_PROTOCOL);
+
+        // the delete form with nothing to delete is a success with no lifetime
+        ask(&cli, addr, &request(1, 0, a, &map_body(17, 3074, 0)), &mut buf)
+            .await
+            .expect("answered");
+        assert_eq!(buf[3], crate::pcp::rc::SUCCESS);
+        assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), 0);
+
+        // NAT-PMP on the same port: the public address, then an unknown opcode
+        let n = ask(&cli, addr, &[0u8, 0], &mut buf).await.expect("answered");
+        assert_eq!(n, 12);
+        assert_eq!(buf[1], crate::pcp::np::OP_PUBLIC | crate::pcp::np::RESP);
+        assert_eq!(&buf[8..12], &[87, 116, 31, 222], "the learned external address");
+        let n = ask(&cli, addr, &[0u8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &mut buf)
+            .await
+            .expect("answered");
+        assert_eq!(n, 12);
+        assert_eq!(buf[1], 9 | crate::pcp::np::RESP);
+        assert_eq!(
+            u16::from_be_bytes([buf[2], buf[3]]),
+            u16::from(crate::pcp::np::UNSUPP_OPCODE)
         );
     }
 }

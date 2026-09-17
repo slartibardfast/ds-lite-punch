@@ -11,9 +11,11 @@ mod ct;
 mod dp;
 mod engine;
 mod forward;
+mod hold;
 mod mapping;
 mod nft;
 mod obs;
+mod pcp;
 mod persist;
 mod publish;
 mod slot;
@@ -76,6 +78,19 @@ struct Config {
     observation: bool,
     max_rescues: u32,
     cdc: CdcKind,
+    /// The allowlist (call/0025): the devices the hold acts for. Empty means
+    /// nobody, and the observation arm keeps the admission it already had.
+    allow: Vec<Ipv4Addr>,
+    /// Whether the hold actually holds: with an allowlist and no `--hold`,
+    /// the arm only reports what it would act on (plan/0009 stage 1).
+    hold: bool,
+    /// The PCP and NAT-PMP listener on the shared port (call/0025's fourth
+    /// admission). PCP is entirely semantically private, so it is opt-in.
+    pcp: bool,
+    /// Whether the PCP PEER opcode is answered; the datapath is
+    /// endpoint-independent, so PEER has nothing to install and is refused
+    /// unless the operator asks for the standards-shaped answer.
+    pcp_peer: bool,
     // UPnP IGD facade (plan/0007 phase E): br-lan only.
     upnp_enabled: bool,
     upnp_port: u16,
@@ -104,6 +119,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut gc_grace_factor: u32 = 3;
     let mut observation = false;
     let mut max_rescues: u32 = 8;
+    let mut allow = Vec::new();
+    let mut hold = false;
+    let mut pcp = false;
+    let mut pcp_peer = false;
     let mut upnp_enabled = true;
     let mut upnp_port: u16 = upnp::UPNP_DEFAULT_PORT;
     let mut lan_ip = DEFAULT_LAN_IP;
@@ -186,6 +205,36 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
             "--max-rescues" => {
                 max_rescues = v()?.parse().map_err(|e| format!("--max-rescues: {}", e))?;
                 i += 2
+            }
+            "--allowlist" => {
+                // One IPv4 address per line, `#` comments. Read here so a
+                // typo in the path or an address fails the start rather than
+                // the first hold.
+                let allow_path = v()?;
+                let text = std::fs::read_to_string(&allow_path)
+                    .map_err(|e| format!("--allowlist {}: {}", allow_path, e))?;
+                let (list, bad) = hold::parse(&text);
+                if !bad.is_empty() {
+                    return Err(format!(
+                        "--allowlist {}: not an address: {}",
+                        allow_path,
+                        bad.join(", ")
+                    ));
+                }
+                allow = list;
+                i += 2
+            }
+            "--hold" => {
+                hold = true;
+                i += 1
+            }
+            "--pcp" => {
+                pcp = true;
+                i += 1
+            }
+            "--pcp-peer" => {
+                pcp_peer = true;
+                i += 1
             }
             "--cdc" => {
                 cdc_kind = match v()?.as_str() {
@@ -293,6 +342,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         observation,
         max_rescues,
         cdc: cdc_kind,
+        allow,
+        hold,
+        pcp,
+        pcp_peer,
         upnp_enabled,
         upnp_port,
         lan_ip,
@@ -307,6 +360,7 @@ fn usage() {
          [--state-dir /run/ds-lite-punch] [--slot-port-range LO-HI] \
          [--max-slots 32] [--max-maps-per-client 16] \
          [--gc-grace-factor 3] [--observation] [--max-rescues 8] \
+         [--allowlist PATH] [--hold] [--pcp] [--pcp-peer] \
          [--cdc proc|nft|aya] \
          [--upnp-port 49152] [--lan-ip 192.168.21.1] [--upnp-name NAME] \
          [--no-upnp]\n\
@@ -779,6 +833,28 @@ async fn main() {
         None
     };
 
+    // The hold's local half (call/0025, plan/0009 #allowlist): the conntrack
+    // timeout policy for the named devices. It is installed only when the
+    // hold is on — the log-only stage touches nothing — and its presence is
+    // read back, because the evidence that matters is the live table's, not
+    // the exit status of the batch that wrote it.
+    if cfg.hold && !cfg.allow.is_empty() {
+        match nft::apply_hold(&cfg.allow) {
+            Ok(()) => {
+                let in_force = nft::hold_in_force();
+                println!(
+                    "{{\"event\":\"hold\",\"devices\":{},\"ruleset_in_force\":{}}}",
+                    cfg.allow.len(),
+                    in_force
+                );
+                if !in_force {
+                    eprintln!("hold: policy installed but not readable back from table ip dslp");
+                }
+            }
+            Err(e) => eprintln!("hold: policy install failed (flows keep the router timeouts): {}", e),
+        }
+    }
+
     // Phase G: observation rescue engine (--observation). The selected CDC
     // produces live candidate flows; the engine claims them with shadow
     // sockets that keep the AFTR mapping alive and forward inbound to the
@@ -811,7 +887,7 @@ async fn main() {
             }
         };
         let servers = state.lock().await.servers.clone();
-        let engine = engine::ObservationEngine::new(
+        let mut engine = engine::ObservationEngine::new(
             cdc,
             held,
             cfg.max_rescues,
@@ -820,14 +896,54 @@ async fn main() {
             publisher.clone(),
             Arc::new(engine::NftPins),
         );
+        // The admission (call/0025): a named device's flows are held, and
+        // without --hold they are only reported.
+        engine.allow = cfg.allow.clone();
+        engine.hold = cfg.hold;
         let cdc_name = engine.name();
         tokio::spawn(async move {
             engine.run().await;
         });
         println!(
-            "{{\"event\":\"observe\",\"cdc\":\"{}\",\"max_rescues\":{}}}",
-            cdc_name, cfg.max_rescues
+            "{{\"event\":\"observe\",\"cdc\":\"{}\",\"max_rescues\":{},\"allowed\":{},\"hold\":{}}}",
+            cdc_name,
+            cfg.max_rescues,
+            cfg.allow.len(),
+            cfg.hold
         );
+    }
+
+    // The shared port (call/0025's fourth admission, plan/0009 #pcp): PCP and
+    // NAT-PMP on UDP 5351, LAN-only, riding the same slot engine as every
+    // other admission. It is opt-in because PCP's semantics are entirely
+    // private to this daemon (plan/0004 section 7), and it needs the facade,
+    // which owns the grant machinery.
+    if cfg.pcp {
+        match &facade {
+            Some(f) => match tokio::net::UdpSocket::bind(SocketAddrV4::new(cfg.lan_ip, pcp::PORT)).await {
+                Ok(sock) => {
+                    let f = f.clone();
+                    let peer = cfg.pcp_peer;
+                    tokio::spawn(async move {
+                        f.pcp_serve(sock, peer).await;
+                    });
+                    println!(
+                        "{{\"event\":\"pcp\",\"bind\":\"{}:{}\",\"peer\":{}}}",
+                        cfg.lan_ip,
+                        pcp::PORT,
+                        peer
+                    );
+                }
+                Err(e) => {
+                    eprintln!("fatal: pcp listener bind {}:{} failed: {}", cfg.lan_ip, pcp::PORT, e);
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("fatal: --pcp needs the facade (--no-upnp removes it)");
+                std::process::exit(2);
+            }
+        }
     }
 
     // All work happens in spawned tasks; keep main alive. procd sends
@@ -925,6 +1041,52 @@ mod tests {
             let e = parse_args_from(argv(&args)).expect_err("a malformed form is refused");
             assert!(e.contains(want), "for {:?} expected {:?}, got {:?}", args, want, e);
         }
+    }
+
+    /// The hold's flags (call/0025, plan/0009 #allowlist): the allowlist is
+    /// read and validated at parse time, and the two switches default off.
+    #[test]
+    fn the_allowlist_is_parsed_and_named() {
+        let d = std::env::temp_dir().join(format!("dslp-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let good = d.join("good.allow");
+        std::fs::write(&good, "# the consoles\n192.168.21.68\n192.168.21.138\n").unwrap();
+        let c = parse_args_from(argv(&[
+            "--static-map", "40000=192.168.0.21:40001",
+            "--allowlist", good.to_str().unwrap(),
+            "--hold",
+            "--pcp",
+            "--pcp-peer",
+        ]))
+        .expect("an allowlist with two addresses parses");
+        assert_eq!(c.allow.len(), 2);
+        assert_eq!(c.allow[0], "192.168.21.68".parse::<Ipv4Addr>().unwrap());
+        assert!(c.hold && c.pcp && c.pcp_peer, "the switches are read");
+
+        // the defaults: no list, no hold, no listener
+        let c = parse_args_from(argv(&["--static-map", "40000=192.168.0.21:40001"]))
+            .expect("the plain form parses");
+        assert!(c.allow.is_empty() && !c.hold && !c.pcp && !c.pcp_peer);
+
+        // a line that is not an address is refused, and the line is named
+        let bad = d.join("bad.allow");
+        std::fs::write(&bad, "192.168.21.68\n192.168.21.1/24\n").unwrap();
+        let e = parse_args_from(argv(&[
+            "--static-map", "40000=192.168.0.21:40001",
+            "--allowlist", bad.to_str().unwrap(),
+        ]))
+        .expect_err("a malformed line is refused");
+        assert!(e.contains("192.168.21.1/24"), "{}", e);
+
+        // and an unreadable path is refused at parse time
+        let e = parse_args_from(argv(&[
+            "--static-map", "40000=192.168.0.21:40001",
+            "--allowlist", d.join("absent.allow").to_str().unwrap(),
+        ]))
+        .expect_err("a missing file is refused");
+        assert!(e.contains("absent.allow"), "{}", e);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

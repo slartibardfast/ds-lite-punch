@@ -16,6 +16,15 @@ if [ ! -f "$ENV" ]; then
     echo "installed default $ENV — edit BIND/TARGET for your console"
 fi
 
+# The hold's allowlist (call/0025): created empty and left empty, so the
+# policy installs nothing and no device is held until an operator names one.
+ALLOWLIST=/etc/ds-lite-punch.allow
+if [ ! -f "$ALLOWLIST" ]; then
+    printf '# Devices whose flows get the hold (call/0025). One IPv4 address per\n# line; the entry grants maintenance and never authority.\n' > "$ALLOWLIST"
+    chmod 644 "$ALLOWLIST"
+    echo "installed empty $ALLOWLIST"
+fi
+
 "$INIT" enable
 "$INIT" restart
 sleep 3

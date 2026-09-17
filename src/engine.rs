@@ -39,6 +39,7 @@ use crate::forward;
 use crate::nft;
 use crate::publish::Publisher;
 use crate::stun;
+use crate::vote::VoteState;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -124,6 +125,13 @@ struct ObsSlot {
     host_port: u16,
     bind_tuple: (Ipv4Addr, u16),
     external: Option<(Ipv4Addr, u16)>,
+    /// The per-flow vote, so the report carries the decision the daemon
+    /// actually made rather than only the tuple it learned. The shadow keeps
+    /// one server (concurrent flows from one source port are NAPT'd
+    /// elsewhere), so a lone report can only be Stable or the first Churn.
+    vote: Arc<Mutex<VoteState>>,
+    /// Wall-clock second this flow was last seen live.
+    last_seen_unix: u64,
     missing_ticks: u32,
     ticks_since_inbound: u32,
     /// inbound counter value the engine last saw (task bumps on forward)
@@ -142,6 +150,18 @@ pub struct ObservationEngine {
     publisher: Arc<Publisher>,
     pins: Arc<dyn PinOps>,
     slots: Vec<ObsSlot>,
+    /// The devices this arm may act for (call/0025): the allowlist is
+    /// admission for maintenance, and everything outside it is untouched.
+    /// Set by the daemon from its configuration; empty leaves the arm the
+    /// admission it already had.
+    pub allow: Vec<Ipv4Addr>,
+    /// Whether the arm holds (claims, keeps alive, promotes) or only reports.
+    /// The log-only stage is how the allowlist is read against the AFTR's
+    /// real behaviour before a device is held.
+    pub hold: bool,
+    /// Tuples already reported in log-only mode, so the line appears once per
+    /// flow rather than once per tick.
+    reported: std::collections::HashSet<(Ipv4Addr, u16)>,
 }
 
 impl ObservationEngine {
@@ -164,6 +184,9 @@ impl ObservationEngine {
             publisher,
             pins,
             slots: Vec::new(),
+            allow: Vec::new(),
+            hold: true,
+            reported: std::collections::HashSet::new(),
         }
     }
 
@@ -181,7 +204,23 @@ impl ObservationEngine {
     }
 
     async fn tick(&mut self) {
-        let live = self.cdc.tick();
+        let live: Vec<crate::cdc::Candidate> = self.cdc.tick();
+
+        // The admission (call/0025): a configured allowlist narrows this arm
+        // to the named devices, and an empty one leaves it the admission it
+        // already had (the G2 predicate in cdc.rs), so a deployment that
+        // never names a device keeps the behaviour it was verified with.
+        let live: Vec<crate::cdc::Candidate> = if self.allow.is_empty() {
+            live
+        } else {
+            live.into_iter()
+                .filter(|c| crate::hold::allowed(&self.allow, c.host))
+                .collect()
+        };
+        if !self.hold {
+            self.report_only(&live);
+            return;
+        }
 
         // Per-slot bookkeeping: an entry reported by the CDC resets its miss
         // counter; a task inbound (counter change) resets inbound silence.
@@ -200,12 +239,22 @@ impl ObservationEngine {
             }
             // G3e: once the shadow socket sees a STUN reply, record the
             // flow's live external tuple.
+            if live.iter().any(|c| c.bind_tuple == s.bind_tuple) {
+                s.last_seen_unix = unix_now();
+            }
             if s.external.is_none() {
                 if let Some(t) = *s.external_arc.lock().await {
                     s.external = Some(t);
+                    // The decision the flow's own vote made, reported beside
+                    // the tuple it learned, so the log and the client's view
+                    // cannot disagree about what happened.
+                    let decision = s.vote.lock().await.observe(0, t);
                     self.publisher.log_transition(
                         "observed-tuple",
-                        &format!("{}:{} -> {}:{}", s.host, s.host_port, t.0, t.1),
+                        &format!(
+                            "{}:{} -> {}:{} ({:?})",
+                            s.host, s.host_port, t.0, t.1, decision
+                        ),
                     );
                 }
             }
@@ -253,6 +302,7 @@ impl ObservationEngine {
             }
             let stop = Arc::new(AtomicBool::new(false));
             let inbound_ts = Arc::new(AtomicU64::new(unix_now()));
+            let vote = Arc::new(Mutex::new(VoteState::new()));
             let external = Arc::new(Mutex::new(None));
             spawn_shadow(
                 sock,
@@ -280,6 +330,8 @@ impl ObservationEngine {
                 host_port: c.host_port,
                 bind_tuple: c.bind_tuple,
                 external: None,
+                vote,
+                last_seen_unix: unix_now(),
                 missing_ticks: 0,
                 ticks_since_inbound: 0,
                 last_inbound_seen: inbound_ts.load(Ordering::Relaxed),
@@ -310,13 +362,38 @@ impl ObservationEngine {
                 let _ = self.pins.del(gone.host, gone.host_port);
                 let _ = self.pins.del(gone.bind_tuple.0, gone.bind_tuple.1); // self-pin
                 self.pins.unaccept(gone.bind_tuple.1);
+                let silent_s = unix_now().saturating_sub(gone.last_seen_unix);
                 self.publisher.log_transition(
                     "rescue-exit",
-                    &format!("{}:{} (reason {:?})", gone.host, gone.host_port, r),
+                    &format!(
+                        "{}:{} (reason {:?}, last seen {}s ago)",
+                        gone.host, gone.host_port, r, silent_s
+                    ),
                 );
                 continue;
             }
             i += 1;
+        }
+    }
+}
+
+/// The log-only stage: report every named device's live flow once, and touch
+/// nothing. It exists so the allowlist can be read against the AFTR's real
+/// behaviour before any device is held (plan/0009's first rollout stage).
+impl ObservationEngine {
+    fn report_only(&mut self, live: &[crate::cdc::Candidate]) {
+        self.reported
+            .retain(|t| live.iter().any(|c| c.bind_tuple == *t));
+        for c in live {
+            if self.reported.insert(c.bind_tuple) {
+                self.publisher.log_transition(
+                    "observe",
+                    &format!(
+                        "{}:{} -> {} (cdc {}, would hold)",
+                        c.host, c.host_port, c.bind_tuple.1, self.cdc.name()
+                    ),
+                );
+            }
         }
     }
 }
@@ -489,6 +566,46 @@ mod tests {
         e.cdc = Box::new(FakeCdc { cands: vec![] });
         e.tick().await; // entry gone; no inbound ever -> stale past grace
         assert!(e.slots.is_empty(), "G5: stale flow exits");
+    }
+
+    // ---- the allowlist and the hold (call/0025, plan/0009 #snoop) ----
+
+    #[tokio::test]
+    async fn a_device_outside_the_allowlist_is_never_claimed() {
+        // The arm's whole point is that it acts for named devices only: a
+        // flow whose origin is not on the list is not held, however live it
+        // is, and no write is ever made for it.
+        let named = Ipv4Addr::new(192, 168, 21, 68);
+        let other = Ipv4Addr::new(192, 168, 21, 59);
+        let mut e = engine(Box::new(FakeCdc {
+            cands: vec![
+                cand((LO, 54340), named, 54340),
+                cand((LO, 54341), other, 54341),
+            ],
+        }), Vec::new(), 8, 3);
+        e.allow = vec![named];
+        e.hold = true;
+        e.tick().await;
+        assert_eq!(e.slots.len(), 1, "only the named device's flow is held");
+        assert_eq!(e.slots[0].host, named);
+    }
+
+    #[tokio::test]
+    async fn the_log_only_stage_holds_nothing() {
+        // plan/0009's first rollout stage: the arm reports what it would act
+        // on and touches nothing, so the log can be read against the AFTR's
+        // real behaviour before any device is held.
+        let named = Ipv4Addr::new(192, 168, 21, 68);
+        let mut e = engine(Box::new(FakeCdc {
+            cands: vec![cand((LO, 54342), named, 54342)],
+        }), Vec::new(), 8, 3);
+        e.allow = vec![named];
+        e.hold = false;
+        e.tick().await;
+        assert!(e.slots.is_empty(), "log-only: nothing claimed");
+        assert!(e.reported.contains(&(LO, 54342)), "but it is reported");
+        // a device outside the list is not even reported
+        assert!(!e.reported.contains(&(LO, 54343)));
     }
 
     #[tokio::test]

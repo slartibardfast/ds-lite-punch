@@ -80,6 +80,41 @@ pub fn run_script(script: &str) -> io::Result<()> {
     }
 }
 
+/// Install the conntrack timeout policy for the allowlist (call/0025,
+/// plan/0009 #allowlist). The chain and both objects are removed first and
+/// re-added, so the address list in force is exactly the allowlist's: a
+/// startup that changes the list changes the rules, and a failure leaves no
+/// policy at all, which is the safe direction (every flow keeps the router's
+/// own timeouts and the WAN half of the hold is the daemon's own writes).
+pub fn apply_hold(list: &[Ipv4Addr]) -> io::Result<()> {
+    remove_hold();
+    if list.is_empty() {
+        return Ok(());
+    }
+    run_script(&crate::hold::ruleset(list))
+}
+
+/// Remove the policy: the selection chain first, then the two objects.
+/// Best-effort by design — the daemon's table dies with the process (the
+/// stop path deletes `table ip dslp` wholesale), so a failure here leaves
+/// nothing that outlives the daemon.
+pub fn remove_hold() {
+    let _ = run_script(&crate::hold::teardown());
+}
+
+/// Whether the policy is in the live table, for the startup log: the parse
+/// after the apply is the evidence that the policy is in force, not the exit
+/// status of the batch that installed it.
+pub fn hold_in_force() -> bool {
+    let Ok(out) = Command::new("nft")
+        .args(["list", "table", "ip", "dslp"])
+        .output()
+    else {
+        return false;
+    };
+    crate::hold::present(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// The per-slot accept rule text (shared by the grant batch and the
 /// fallback path so the comment and match never drift).
 fn accept_rule(bind_port: u16, tcp: bool) -> String {

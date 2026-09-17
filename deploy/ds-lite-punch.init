@@ -67,6 +67,24 @@ start_service() {
     # an opkg upgrade.
     NO_UPNP=
     [ "${UPNP:-1}" = "1" ] || NO_UPNP=--no-upnp
+
+    # The hold's admission (call/0025): the allowlist names the devices whose
+    # flows get the RFC lifetimes, and HOLD=1 turns the arm from reporting
+    # them to holding them. The conntrack policy lands in the daemon's own
+    # table (ip dslp), so cleanup_nft's table delete reverts it with the rest
+    # of the datapath and no firewall include has to be kept in step.
+    ALLOW=
+    if [ -n "$ALLOWLIST" ] && [ -f "$ALLOWLIST" ]; then
+        ALLOW="--allowlist $ALLOWLIST"
+        [ "${HOLD:-0}" = "1" ] && ALLOW="$ALLOW --hold"
+    fi
+
+    # The shared port (plan/0009 #pcp): PCP and NAT-PMP on UDP 5351. Off by
+    # default, because PCP is a whole dialect this daemon owns privately and
+    # nothing on the LAN asked for it.
+    PCPF=
+    [ "${PCP:-0}" = "1" ] && PCPF="--pcp"
+    [ "${PCP_PEER:-0}" = "1" ] && PCPF="$PCPF --pcp-peer"
     procd_open_instance
     procd_set_param command "$PROG" \
         --bind "$BIND" --target "$TARGET" --stun "$STUN" \
@@ -77,6 +95,7 @@ start_service() {
         --upnp-port "${UPNP_PORT:-49152}" \
         --lan-ip "${LAN_IP:-192.168.21.1}" \
         $NO_UPNP \
+        $ALLOW $PCPF \
         ${OBSERVATION:+--observation}
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
