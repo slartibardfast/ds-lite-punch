@@ -241,12 +241,31 @@ port algorithm is vendor-defined and this implementation's engine supplies it.
   `NewReservedPort != NewExternalPort`; an identical remote host, external
   port, protocol and internal client is an overwrite.
 - The distinction is why the mapping engine is reached through two entry
-  points (plan/0008's version-specific SOAP semantics): `allocate_exact` for `AddPortMapping`, where
-  the requested port is authoritative and a different requester on a held port
-  takes it over, and `allocate_preferred` for this action, where a port another
-  client holds moves the request to a free one and leaves that client's
-  mapping standing. Both resolve to the same mapping objects over the one
-  engine; only the port resolution differs.
+  points (plan/0008's version-specific SOAP semantics): `allocate_exact` for
+  `AddPortMapping`, and `allocate_preferred` for this action, where a port
+  another client holds moves the request to a free one. Both resolve to the
+  same mapping objects over the one engine; only the port resolution differs.
+
+### The key is per client, not per port
+
+The mapping table is keyed `(client, external port, protocol)`, so several
+clients may hold the same requested port, and the specification's one-holder
+rule does not apply here. That is the supersession
+[host call/0022](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0022-requested-port-is-a-per-client-label.md)
+records: the rule assumes the device owns the external port, and on this line
+it owns it on neither uplink. With an AFTR the CGNAT dictates the tuple and
+the requested port is never bound; where `ds-lite-punch` does own the port, a
+second claimant is served by the any-port path above. A write replaces only
+the caller's own entry at that port, so the earlier holder keeps its mapping:
+two consoles may each hold `3074/UDP`, with their own slots and their own real
+tuples.
+
+Two actions carry no client in their key, so they resolve inside the caller's
+own namespace: `GetSpecificPortMappingEntry` and `DeletePortMapping` answer
+for the caller's own entry at that port, or 714. `GetListOfPortMappings` and
+`GetGenericPortMappingEntry` are lists, so duplicates are ordinary there, and
+the range delete with `NewManage` (2.5.19) is the bulk path for entries other
+than the caller's own.
 
 ### DeletePortMappingRange (2.5.19)
 
