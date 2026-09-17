@@ -823,20 +823,16 @@ impl UpnpFacade {
             .iter()
             .filter(|e| view.is_none_or(|c| entry_within(c, e)))
             .collect();
-        let keys: Vec<UpnpKey> = visible
-            .iter()
-            .map(|e| UpnpKey {
-                req_ext: e.req_ext,
-                proto: e.proto,
-                client: e.client,
-                int_port: e.int_port,
-            })
-            .collect();
-        let k = upnp::entry_at(&keys, index).ok_or(UpnpErr::NoSuchEntry)?;
+        // The index addresses this list directly. It used to index a list of
+        // (req_ext, proto) keys and then look the entry up by those two
+        // fields, which is no longer unique now that several clients may hold
+        // one requested port: both indexes rendered the first holder, so a
+        // two-holder table enumerated as two copies of the earlier entry.
+        // The bench for the client matrix found it.
         let e = visible
-            .iter()
-            .find(|e| e.req_ext == k.req_ext && e.proto == k.proto)
-            .expect("entry_at found the key in the same list");
+            .get(index as usize)
+            .copied()
+            .ok_or(UpnpErr::NoSuchEntry)?;
         Ok(entry_xml(e, true))
     }
 
@@ -3895,6 +3891,51 @@ mod tests {
             assert!(facade.get_generic(i, None).await.is_ok(), "uncontained index {}", i);
         }
         assert_eq!(facade.get_generic(4, None).await, Err(UpnpErr::NoSuchEntry));
+
+        // the enumeration renders each holder as itself: two clients hold
+        // 1024/UDP here, so index 1 must not render index 0's entry (the
+        // defect the deployed bench caught; the index addresses the visible
+        // list rather than a (port, protocol) key)
+        {
+            let mut es = facade.entries.lock().await;
+            es.push(FacadeEntry {
+                req_ext: 1024,
+                proto: Proto::Udp,
+                client: b,
+                int_port: 1024,
+                bind_port: 30008,
+                granted_lifetime: 3600,
+                expires_at_unix: Epoch::now() + 300,
+                desc: "b-owns-1024".to_string(),
+            });
+            es.push(FacadeEntry {
+                req_ext: 1024,
+                proto: Proto::Udp,
+                client: a,
+                int_port: 1024,
+                bind_port: 30009,
+                granted_lifetime: 3600,
+                expires_at_unix: Epoch::now() + 300,
+                desc: "a-owns-1024".to_string(),
+            });
+        }
+        let mut seen = Vec::new();
+        for i in 0..8 {
+            match facade.get_generic(i, None).await {
+                Ok(x) => seen.push(x),
+                Err(_) => break,
+            }
+        }
+        let holders: Vec<&String> = seen
+            .iter()
+            .filter(|x| x.contains("<NewExternalPort>1024</NewExternalPort>"))
+            .collect();
+        assert_eq!(holders.len(), 2, "both holders enumerate");
+        assert!(
+            holders.iter().any(|x| x.contains("a-owns-1024"))
+                && holders.iter().any(|x| x.contains("b-owns-1024")),
+            "each index renders its own holder, not the first one twice"
+        );
 
         // a delete of another client's mapping is refused
         assert_eq!(
