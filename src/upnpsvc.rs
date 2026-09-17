@@ -639,6 +639,7 @@ impl UpnpFacade {
             // table entry on any failure (never leave a phantom lease).
             if let Err(e) = nft::grant_datapath(client, int_port, bind_port, proto == Proto::Tcp) {
             let _ = nft::revoke_datapath(client, int_port, bind_port, proto == Proto::Tcp);
+        self.publisher.remove_slot(bind_port);
             let mut t = self.table.lock().await;
             t.delete_by_bind_port(bind_port);
             eprintln!("upnp: grant datapath {} failed: {}", bind_port, e);
@@ -683,6 +684,7 @@ impl UpnpFacade {
                 let _ = t.delete_by_bind_port(old_bind); // may already be gone (GC)
             }
             let _ = nft::revoke_datapath(old_client, old_int, old_bind, proto == Proto::Tcp);
+        self.publisher.remove_slot(old_bind);
             if let Some(h) = self.tasks.lock().await.remove(&old_bind) {
                 for jh in h {
                     jh.abort();
@@ -1102,6 +1104,7 @@ impl UpnpFacade {
             let _ = t.delete_by_bind_port(old_bind); // may already be gone (GC)
         }
         let _ = nft::revoke_datapath(old_client, old_int, old_bind, old_proto == Proto::Tcp);
+        self.publisher.remove_slot(old_bind);
         if let Some(h) = self.tasks.lock().await.remove(&old_bind) {
             for jh in h {
                 jh.abort();
@@ -1191,6 +1194,7 @@ impl UpnpFacade {
             let _ = t.delete_by_bind_port(bind_port); // may already be gone (GC)
         }
         let _ = nft::revoke_datapath(client, int_port, bind_port, proto == Proto::Tcp);
+        self.publisher.remove_slot(bind_port);
         if let Some(h) = self.tasks.lock().await.remove(&bind_port) {
             for jh in h {
                 jh.abort();
@@ -1688,6 +1692,7 @@ impl UpnpFacade {
             if let Some(s) = info {
                 if let Some(client) = s.client() {
                     let _ = nft::revoke_datapath(client, s.target_port, *port, s.proto == Proto::Tcp);
+        self.publisher.remove_slot(*port);
                 }
             }
             if let Some(h) = self.tasks.lock().await.remove(port) {
@@ -7214,5 +7219,61 @@ mod ifindex_probe {
             u16::from_be_bytes([buf[2], buf[3]]),
             u16::from(crate::pcp::np::UNSUPP_OPCODE)
         );
+    }
+
+    /// A revoked mapping takes its tuple file with it (found on the box,
+    /// 2026-09-17: slots 40003-40005 carried dead tuples from mappings long
+    /// gone, and a fresh grant that landed on one of those ports was answered
+    /// with the dead tuple). The file is the *learned* tuple, so a file that
+    /// outlives its mapping is a lie a client can act on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_revoked_mapping_takes_its_tuple_file_with_it() {
+        let a = Ipv4Addr::new(127, 0, 0, 1);
+        let d = std::env::temp_dir().join(format!("dslp-tuplefile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let dir = d.to_str().unwrap().to_string();
+        std::fs::write(format!("{}/tuple-30000", dir), "203.0.113.9:40001\n").unwrap();
+        let cfg = UpnpConfig {
+            lan_ip: Ipv4Addr::LOCALHOST,
+            upnp_port: 0,
+            bind_ip: Ipv4Addr::LOCALHOST,
+            state_dir: dir.clone(),
+            servers: Vec::new(),
+            interval: Duration::from_secs(2),
+            name: "tuple-file".into(),
+            grace_secs: 60,
+        };
+        let facade = Arc::new(UpnpFacade {
+            cfg,
+            table: Arc::new(Mutex::new(LeaseTable::new(
+                PortAllocator::new(30000, 30009).unwrap(),
+                8,
+                4,
+            ))),
+            publisher: Arc::new(Publisher::with_watch(
+                &dir,
+                watch::channel(Ipv4Addr::LOCALHOST).0,
+            )),
+            entries: Mutex::new(vec![ev_entry(a, 3074, 30000)]),
+            tasks: Mutex::new(HashMap::new()),
+            gena: Mutex::new(GenaState::default()),
+            ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
+            udn: String::from("tuple-file"),
+            started_unix: 0,
+            ssdp: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            bursts: Arc::new(StdMutex::new(HashMap::new())),
+            dp: StdMutex::new(crate::dp::DpState::default()),
+            pcp_wait: StdMutex::new(HashMap::new()),
+        });
+        facade
+            .delete_mapping(3074, Proto::Udp, a, None)
+            .await
+            .expect("the caller's own mapping deletes");
+        assert!(
+            !std::path::Path::new(&format!("{}/tuple-30000", dir)).exists(),
+            "the dead mapping's tuple file must go with it"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

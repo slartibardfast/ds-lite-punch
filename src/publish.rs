@@ -47,6 +47,15 @@ impl Publisher {
         }
     }
 
+    /// A mapping's tuple file goes when the mapping does. The file is the
+    /// *learned* tuple, so one that outlives its mapping is a lie a client can
+    /// act on: a later mapping that lands on the same bind port would be
+    /// answered with the dead port. The box found this on 2026-09-17, with
+    /// three revoked slots still carrying their old tuples.
+    pub fn remove_slot(&self, bind_port: u16) {
+        let _ = fs::remove_file(format!("{}/tuple-{}", self.dir, bind_port));
+    }
+
     pub fn log_transition(&self, event: &str, detail: &str) {
         println!("{{\"event\":\"{}\",\"detail\":\"{}\"}}", event, detail);
     }
