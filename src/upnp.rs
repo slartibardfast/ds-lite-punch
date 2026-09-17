@@ -1650,11 +1650,7 @@ mod verify {
 
     /// Copy `src` into `dst` at `*offset`, advancing the offset.
     fn put(dst: &mut [u8; HDR_CAP], offset: &mut usize, src: &[u8]) {
-        let mut k = 0usize;
-        while k < src.len() {
-            dst[*offset + k] = src[k];
-            k += 1;
-        }
+        dst[*offset..*offset + src.len()].copy_from_slice(src);
         *offset += src.len();
     }
 
@@ -1752,7 +1748,7 @@ mod verify {
     }
 
     #[kani::proof]
-    #[kani::unwind(96)]
+    #[kani::unwind(200)]
     fn mpost_post_parity() {
         // The parity property (E3/verification), structural half: for any
         // CLEAN short action text — printable bytes, no embedded CR/LF —
@@ -1770,7 +1766,7 @@ mod verify {
     }
 
     #[kani::proof]
-    #[kani::unwind(96)]
+    #[kani::unwind(200)]
     fn mpost_post_parity_real_actions() {
         // The parity property, concrete half: every real WANIPConnection:1
         // action name dispatches identically through the two transports at
@@ -1850,6 +1846,34 @@ mod verify {
                 assert!(!set.has(b), "after remove the sid is absent");
             }
             assert!(set.len() <= MAX_GENA_SUBS, "capacity never exceeded");
+        }
+    }
+}
+#[cfg(test)]
+mod cex_replay {
+    //! Replay of the CBMC counterexample Kani reported for
+    //! entry_at_bounds_proof (kani 0.67.0, CBMC 6.8.0, cadical): idx = 3
+    //! with maximal field values. In real Rust the property holds; the
+    //! test documents the artifact for the verification record.
+    use super::*;
+
+    #[test]
+    fn entry_at_cex_replay_idx3() {
+        let mk = || UpnpKey {
+            req_ext: 65535,
+            proto: Proto::Udp,
+            client: Ipv4Addr::new(255, 255, 255, 255),
+            int_port: 65535,
+        };
+        let arr = [mk(), mk(), mk(), mk()];
+        let idx: u32 = 3;
+        let i = idx as usize;
+        match entry_at(&arr, idx) {
+            Some(e) => {
+                assert!(i < 4);
+                assert_eq!(e, arr[i]);
+            }
+            None => panic!("idx 3 must be in range"),
         }
     }
 }
