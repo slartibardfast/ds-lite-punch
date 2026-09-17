@@ -7,6 +7,16 @@ STOP=10
 
 PROG=/usr/bin/ds-lite-punch
 CONF=/etc/ds-lite-punch.env
+# The DeviceProtection bootstrap (call/0023). The ACL and user store lives in
+# the state directory, which is tmpfs and therefore lost on reboot, and the
+# daemon has no in-band way to create its first identity (the introduction
+# protocol is deferred, call/0021). So a root-owned file here seeds it: on
+# start, if no store exists yet, the file is copied in as dp.tsv. Absent the
+# file the store stays empty and every role-gated action answers 606, which is
+# the fail-closed default. Set DEVICE_PROTECTION_ACL= to something else in the
+# env file to move it, or to "none" to disable the seed.
+ACL_DEFAULT=/etc/ds-lite-punch.acl
+STATE=/run/ds-lite-punch
 
 # Remove the ds-lite-punch nft datapath: the named-map ruleset table plus
 # any per-slot input-accepts (comments dslitepunch / dslitepunch-<R>).
@@ -35,6 +45,14 @@ start_service() {
     [ -x "$PROG" ] || { echo "ds-lite-punch: $PROG missing"; return 1; }
     [ -f "$CONF" ] || { echo "ds-lite-punch: $CONF missing"; return 1; }
     . "$CONF"
+
+    ACL="${DEVICE_PROTECTION_ACL:-$ACL_DEFAULT}"
+    if [ "$ACL" != "none" ] && [ -f "$ACL" ] && [ ! -f "$STATE/dp.tsv" ]; then
+        mkdir -p "$STATE"
+        if cp "$ACL" "$STATE/dp.tsv"; then
+            logger -t ds-lite-punch "seeded DeviceProtection store from $ACL"
+        fi
+    fi
 
     # Legacy single-map input-accept (P1 path). The daemon installs its own
     # per-slot accepts (comment dslitepunch-<R>) at startup (B4); this rule
