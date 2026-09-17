@@ -543,12 +543,13 @@ impl UpnpFacade {
         )
     }
 
-    /// allocate_exact (plan/0008's version-specific SOAP semantics): the requested external port
-    /// is authoritative, which is what WANIPConnection's AddPortMapping
-    /// means at either version. A re-Add pivots the requester's mapping to
-    /// the requested port, and a different requester on a held port takes
-    /// it over (last write wins, one mapping per external port and
-    /// protocol).
+    /// allocate_exact (plan/0008's version-specific SOAP semantics): the
+    /// requested external port is the requester's own handle. A re-Add
+    /// pivots that requester's mapping to the requested port; another
+    /// requester on the same port gets its own entry beside it, because
+    /// the port is a per-client label rather than a resource this device
+    /// allocates (call/0022, which supersedes the specification's
+    /// one-holder rule for this line).
     async fn allocate_exact(
         &self,
         req: MappingReq,
@@ -629,8 +630,9 @@ impl UpnpFacade {
         // Record / refresh the control-plane entry (one entry per internal
         // key — client, int, proto; the requested port rides the re-Add).
         // A re-Add that moved the mapping to a new slot surrenders the
-        // requested port's previous occupant, so delete/enumerate always
-        // resolve to the slot the control point actually owns.
+        // same client's previous entry at that port, so delete/enumerate
+        // always resolve to the slot the control point actually owns.
+        // Another client's entry at the same port is untouched.
         let stray = {
             let mut es = self.entries.lock().await;
             apply_entry(
@@ -743,13 +745,20 @@ impl UpnpFacade {
         &self,
         req_ext: u16,
         proto: Proto,
+        caller: Ipv4Addr,
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
         let (bind_port, client, int_port) = {
             let es = self.entries.lock().await;
+            // DeletePortMapping's own key carries no client, and the
+            // requested port is a label several clients may hold, so the
+            // lookup is the caller's own entry at that port: "mine", or
+            // 714. Another client's mapping at the same port is not
+            // reachable here; the bulk path for it is the range delete
+            // with NewManage (2.5.19).
             let Some(e) = es
                 .iter()
-                .find(|e| e.req_ext == req_ext && e.proto == proto)
+                .find(|e| e.req_ext == req_ext && e.proto == proto && e.client == caller)
             else {
                 return Err(UpnpErr::NoSuchEntry);
             };
@@ -782,12 +791,15 @@ impl UpnpFacade {
         &self,
         req_ext: u16,
         proto: Proto,
+        caller: Ipv4Addr,
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
+        // as for the delete: "my mapping at that port", or 714, because the
+        // port is a label another client may hold just as legitimately
         let Some(e) = es
             .iter()
-            .find(|e| e.req_ext == req_ext && e.proto == proto)
+            .find(|e| e.req_ext == req_ext && e.proto == proto && e.client == caller)
         else {
             return Err(UpnpErr::NoSuchEntry);
         };
@@ -920,19 +932,19 @@ impl UpnpFacade {
     ) -> Result<String, UpnpErr> {
         // 2.5.19.2: an entry the caller may not touch is skipped and the
         // rest of the range still goes. An empty selection is 730.
-        let targets: Vec<u16> = {
+        let targets: Vec<(u16, Ipv4Addr)> = {
             let es = self.entries.lock().await;
             es.iter()
                 .filter(|e| e.proto == proto && e.req_ext >= start && e.req_ext <= end)
                 .filter(|e| view.is_none_or(|c| entry_within(c, e)))
-                .map(|e| e.req_ext)
+                .map(|e| (e.req_ext, e.client))
                 .collect()
         };
         if targets.is_empty() {
             return Err(UpnpErr::PortMappingNotFound);
         }
-        for ext in targets {
-            let _ = self.delete_mapping(ext, proto, view).await;
+        for (ext, owner) in targets {
+            let _ = self.delete_mapping(ext, proto, owner, view).await;
         }
         Ok(String::new())
     }
@@ -1582,14 +1594,14 @@ async fn handle_soap(
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::DeletePortMapping,
             ) => match parse_delete_args(body) {
-                Ok((ext, proto)) => facade.delete_mapping(ext, proto, view).await,
+                Ok((ext, proto)) => facade.delete_mapping(ext, proto, client_ip, view).await,
                 Err(e) => Err(e),
             },
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetSpecificPortMappingEntry,
             ) => match parse_delete_args(body) {
-                Ok((ext, proto)) => facade.get_specific(ext, proto, view).await,
+                Ok((ext, proto)) => facade.get_specific(ext, proto, client_ip, view).await,
                 Err(e) => Err(e),
             },
             (
@@ -2312,9 +2324,10 @@ fn insert_sorted(es: &mut Vec<FacadeEntry>, e: FacadeEntry) {
 /// The control-plane entry for a grant: one entry per internal
 /// (proto, client, int_port) tuple, riding the external port the control
 /// point last used ("the requested port rides the re-Add"). Returns the
-/// stray slot a replace leaves behind — the previous occupant of the
-/// requested port whose datapath the caller must tear down — or None when
-/// no slot changed owner.
+/// stray slot a same-client replace leaves behind — that client's previous
+/// entry at the requested port, whose datapath the caller must tear down —
+/// or None when no slot changed owner. Another client's entry at the same
+/// port is never a stray: the requested port is a per-client label.
 #[allow(clippy::too_many_arguments)] // one flat decision over the grant's fields
 fn apply_entry(
     es: &mut Vec<FacadeEntry>,
@@ -2343,14 +2356,25 @@ fn apply_entry(
         insert_sorted(es, e);
         return None;
     }
-    // A different internal tuple at the same requested port: the upsert
-    // granted a NEW slot, so the previous occupant must surrender the
-    // port (IGDv1 allows one mapping per (ext, proto); last write wins).
-    // An entry whose bind_port already IS the new slot is a stale index
-    // row — refresh it in place rather than tear it down.
+    // The same client's own mapping at the same requested port, with a
+    // different internal tuple: the upsert granted a NEW slot, so that
+    // client's previous entry must surrender the port: one holder per
+    // client per port, because the port is that client's handle and a
+    // client cannot hold two mappings under one handle. An entry whose bind_port
+    // already IS the new slot is a stale index row — refresh it in place
+    // rather than tear it down.
+    //
+    // Another client's holder at the same requested port is NOT an
+    // occupant to evict. The requested port is a per-client label: the
+    // facade's datapath never binds it (the AFTR dictates the real tuple
+    // on the ds-lite uplink, and our own slot ranges do on an IPv4 NAT we
+    // control), so two clients may each hold 3074 with their own slots and
+    // their own real tuples. This is where the supersession lands: the
+    // specification's one-holder rule assumes the device owns the external
+    // port, and here it does not.
     if let Some(idx) = es
         .iter()
-        .position(|e| e.req_ext == req_ext && e.proto == proto)
+        .position(|e| e.req_ext == req_ext && e.proto == proto && e.client == client)
     {
         let stray = if es[idx].bind_port != bind_port {
             Some((es[idx].bind_port, es[idx].client, es[idx].int_port))
@@ -3631,14 +3655,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_entry_rides_internal_identity_and_replaces_occupant() {
+    fn apply_entry_keyed_per_client_lets_two_holders_share_a_port() {
         // Regression (review C2): the entry index used to refresh on
         // (req_ext, proto) and never updated bind_port, so a re-Add that
         // moved the mapping to a NEW slot left the entry naming the old
         // slot — delete tore down the wrong datapath and the live mapping
-        // became unenumerable. One entry per internal tuple; the previous
-        // occupant of a re-requested port is returned as the stray to tear
-        // down.
+        // became unenumerable. One entry per internal tuple, and, since the
+        // requested port is a per-client label, one entry per client per
+        // requested port: another client's holder is not an occupant to
+        // evict, which is the multiple-console case.
         let now = 1_700_000_000u64;
         let a = Ipv4Addr::new(192, 168, 21, 50);
         let b = Ipv4Addr::new(192, 168, 21, 60);
@@ -3647,31 +3672,39 @@ mod tests {
         // A maps 3074/UDP -> slot 30000.
         assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
-        // A re-adds the SAME internal tuple at a new external port: the
+        // A re-adds the SAME internal tuple at a new requested port: the
         // entry rides the port, the same slot, nothing torn down.
         assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].req_ext, 3075);
         assert_eq!(es[0].bind_port, 30000);
-        // B takes 3075/UDP with a different internal tuple: NEW slot 30001,
-        // and A's occupant of 3075 is surrendered (replace semantics).
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), Some((30000, a, 4000)));
+        // A claims 3075/UDP with a different internal tuple: A's own entry
+        // at that port surrenders it: one holder per client per port,
+        // because the port is that client's handle.
+        assert_eq!(
+            apply_entry(&mut es, 3075, Proto::Udp, a, 6000, 30005, 3600, now, d("client-a")),
+            Some((30000, a, 4000))
+        );
         assert_eq!(es.len(), 1);
-        assert_eq!(es[0].client, b);
-        assert_eq!(es[0].int_port, 5000);
-        assert_eq!(es[0].bind_port, 30001);
-        // B re-adds the same internal tuple at the same port: plain refresh.
+        assert_eq!(es[0].bind_port, 30005);
+        // B also claims 3075/UDP: its own entry, and A's survives. The
+        // datapath resolves each to its own slot and its own real tuple.
         assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), None);
-        assert_eq!(es.len(), 1);
-        // A fresh mapping on a free port: plain insert.
-        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, 9000, 30002, 3600, now, d("client-a")), None);
+        assert_eq!(es.len(), 2, "two clients, one requested port");
+        assert_eq!(
+            es.iter().filter(|e| e.req_ext == 3075).count(),
+            2,
+            "both holders are recorded"
+        );
+        // B re-adds its own tuple at the same port: plain refresh.
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 2);
-        // B re-Adds A's OWN 9000/TCP with a new internal tuple: the entry
-        // pivots to B's slot and A's slot is the stray — a delete of the
-        // port must then hit the newcomer, not the old slot.
-        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, 6000, 30003, 3600, now, d("client-b")), Some((30002, a, 9000)));
-        assert_eq!(es.iter().find(|e| e.req_ext == 9000).unwrap().bind_port, 30003);
-        assert_eq!(es.len(), 2, "still one entry per external port");
+        // A fresh mapping on a free port: plain insert, and B may hold the
+        // same port on another protocol without touching A.
+        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, 9000, 30002, 3600, now, d("client-a")), None);
+        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, 6000, 30003, 3600, now, d("client-b")), None);
+        assert_eq!(es.len(), 4);
+        assert_eq!(es.iter().filter(|e| e.req_ext == 9000 && e.proto == Proto::Tcp).count(), 2);
     }
 
     /// The v2 readings the transcription fixes, each a property a name-only
@@ -3839,12 +3872,13 @@ mod tests {
         // the specific read: another client's entry is forbidden, not
         // missing, and A's own below the floor is forbidden too
         assert_eq!(
-            facade.get_specific(5001, Proto::Udp, view).await,
-            Err(UpnpErr::NotAuthorized)
+            facade.get_specific(5001, Proto::Udp, a, view).await,
+            Err(UpnpErr::NoSuchEntry),
+            "5001 is B's; the lookup is A's own namespace"
         );
-        assert!(facade.get_specific(5001, Proto::Udp, None).await.is_ok());
+        assert!(facade.get_specific(5001, Proto::Udp, b, None).await.is_ok());
         assert_eq!(
-            facade.get_specific(80, Proto::Tcp, view).await,
+            facade.get_specific(80, Proto::Tcp, a, view).await,
             Err(UpnpErr::NotAuthorized)
         );
 
@@ -3864,8 +3898,9 @@ mod tests {
 
         // a delete of another client's mapping is refused
         assert_eq!(
-            facade.delete_mapping(5001, Proto::Udp, view).await,
-            Err(UpnpErr::NotAuthorized)
+            facade.delete_mapping(5001, Proto::Udp, a, view).await,
+            Err(UpnpErr::NoSuchEntry),
+            "the port is B's; A's own namespace has nothing there"
         );
         assert!(
             facade.entries.lock().await.iter().any(|x| x.req_ext == 5001),
@@ -3925,17 +3960,21 @@ mod tests {
         // another protocol's claim is not this request's obstacle
         assert_eq!(preferred_port(&held, 5000, Proto::Tcp, b), 5000);
 
-        // exact: the same request on the same state takes the port over.
-        // Over the one engine that is apply_entry's replace semantics; the
-        // occupant is surrendered to the caller for teardown.
+        // exact: the same request on the same state adds beside the other
+        // client's holder, which is the supersession call/0022 records; the
+        // earlier holder keeps its mapping.
         let mut es = held.clone();
         assert_eq!(
             apply_entry(&mut es, 5000, Proto::Udp, b, 7000, 30010, 3600, 1_700_000_000, "b".into()),
-            Some((30000, a, 5000)),
-            "exact evicts the occupant of the requested port"
+            None,
+            "exact adds beside the other client's holder rather than evicting it"
         );
-        assert_eq!(es.iter().find(|x| x.req_ext == 5000).unwrap().client, b);
-        assert_eq!(es.len(), 2, "one mapping per external port and protocol");
+        assert_eq!(es.len(), 3, "two clients now hold 5000/UDP");
+        assert!(
+            es.iter().any(|x| x.req_ext == 5000 && x.client == a),
+            "the earlier holder keeps its mapping"
+        );
+        assert!(es.iter().any(|x| x.req_ext == 5000 && x.client == b));
     }
 
     /// NewPortMappingDescription is stored, not replaced by a device
@@ -4194,7 +4233,7 @@ mod tests {
         // The control point deletes the restored mapping: the slot row, nft
         // element and tasks must all go — the socket must be released.
         facade
-            .delete_mapping(8666, Proto::Udp, None)
+            .delete_mapping(8666, Proto::Udp, Ipv4Addr::LOCALHOST, None)
             .await
             .expect("delete of a restored mapping");
         assert!(
@@ -5382,8 +5421,8 @@ mod ifindex_probe {
             )
             .await;
             assert!(
-                r.contains("<errorCode>606</errorCode>"),
-                "the :{} read of another host's entry is forbidden: {}",
+                r.contains("<errorCode>714</errorCode>"),
+                "the :{} read of another host's port is not in the caller's namespace: {}",
                 face,
                 &r[..r.len().min(300)]
             );
@@ -5483,9 +5522,36 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // the lift is the principal's roles, not the face's: the same
-        // session that DeviceProtection established answers for the whole
-        // table, and it answers on either face
+        // the lift is the principal's roles, not the face's: walking the
+        // enumeration now reaches the other host's entry, on either face
+        for face in ["1", "2"] {
+            let mut reached = Vec::new();
+            for i in 0..4 {
+                let rr = soap_post(
+                    &addr,
+                    "/ctl/IPConn",
+                    &format!(
+                        "urn:schemas-upnp-org:service:WANIPConnection:{}#GetGenericPortMappingEntry",
+                        face
+                    ),
+                    &format!(
+                        "{}GetGenericPortMappingEntry xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:{}\"><NewPortMappingIndex>{}</NewPortMappingIndex></GetGenericPortMappingEntry></s:Body></s:Envelope>",
+                        env, face, i
+                    ),
+                )
+                .await;
+                if rr.contains("<errorCode>") {
+                    break;
+                }
+                reached.push(rr.contains("192.168.21.50"));
+            }
+            assert!(
+                reached.iter().any(|x| *x),
+                "the :{} lifted walk reaches the other host's entry: {:?}",
+                face,
+                reached
+            );
+        }
         for face in ["1", "2"] {
             r = soap_post(
                 &addr,
@@ -5500,15 +5566,14 @@ mod ifindex_probe {
                 ),
             )
             .await;
-            // GetSpecificPortMappingEntry's response carries the OUT
-            // arguments only, so the evidence is the entry's internal side
-            // and its label rather than the external port it was asked for
+            // The specific read is "mine" whether or not the session holds
+            // a lift (call/0022), so what a lifted caller gains is the
+            // enumeration: walking it must now reach the other host's entry.
             assert!(
-                r.contains("<NewInternalClient>192.168.21.50</NewInternalClient>")
-                    && r.contains("<NewPortMappingDescription>other-host</NewPortMappingDescription>"),
-                "the :{} read of another host's entry is lifted: {}",
+                r.contains("<errorCode>714</errorCode>"),
+                "the :{} specific read stays the caller's own namespace: {}",
                 face,
-                &r[..r.len().min(700)]
+                &r[..r.len().min(300)]
             );
         }
 
