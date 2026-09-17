@@ -98,6 +98,12 @@ pub struct UpnpConfig {
 struct FacadeEntry {
     req_ext: u16,
     proto: Proto,
+    /// The control point that asked for the mapping: the per-client key, and
+    /// what the containment compares against. A lifted control point may name
+    /// another host as the target, so this is not the target.
+    owner: Ipv4Addr,
+    /// The datapath target (`NewInternalClient`): where inbound datagrams are
+    /// forwarded.
     client: Ipv4Addr,
     int_port: u16,
     bind_port: u16,
@@ -553,6 +559,7 @@ impl UpnpFacade {
     async fn allocate_exact(
         &self,
         req: MappingReq,
+        owner: Ipv4Addr,
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
         let MappingReq {
@@ -636,7 +643,8 @@ impl UpnpFacade {
         let stray = {
             let mut es = self.entries.lock().await;
             apply_entry(
-                &mut es, req_ext, proto, client, int_port, bind_port, lifetime, now, desc,
+                &mut es, req_ext, proto, client, owner, int_port, bind_port, lifetime, now,
+                desc,
             )
         };
         if let Some((old_bind, old_client, old_int)) = stray {
@@ -758,7 +766,7 @@ impl UpnpFacade {
             // with NewManage (2.5.19).
             let Some(e) = es
                 .iter()
-                .find(|e| e.req_ext == req_ext && e.proto == proto && e.client == caller)
+                .find(|e| e.req_ext == req_ext && e.proto == proto && e.owner == caller)
             else {
                 return Err(UpnpErr::NoSuchEntry);
             };
@@ -799,7 +807,7 @@ impl UpnpFacade {
         // port is a label another client may hold just as legitimately
         let Some(e) = es
             .iter()
-            .find(|e| e.req_ext == req_ext && e.proto == proto && e.client == caller)
+            .find(|e| e.req_ext == req_ext && e.proto == proto && e.owner == caller)
         else {
             return Err(UpnpErr::NoSuchEntry);
         };
@@ -876,6 +884,7 @@ impl UpnpFacade {
     async fn allocate_preferred(
         &self,
         req: MappingReq,
+        owner: Ipv4Addr,
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
         let MappingReq {
@@ -896,7 +905,7 @@ impl UpnpFacade {
         }
         let req_ext = {
             let es = self.entries.lock().await;
-            preferred_port(&es, ext, proto, client)
+            preferred_port(&es, ext, proto)
         };
         self.allocate_exact(
             MappingReq {
@@ -907,6 +916,7 @@ impl UpnpFacade {
                 lifetime,
                 desc,
             },
+            owner,
             None,
         )
         .await?;
@@ -933,7 +943,7 @@ impl UpnpFacade {
             es.iter()
                 .filter(|e| e.proto == proto && e.req_ext >= start && e.req_ext <= end)
                 .filter(|e| view.is_none_or(|c| entry_within(c, e)))
-                .map(|e| (e.req_ext, e.client))
+                .map(|e| (e.req_ext, e.owner))
                 .collect()
         };
         if targets.is_empty() {
@@ -1580,6 +1590,7 @@ async fn handle_soap(
                                 lifetime,
                                 desc: parse_desc(body),
                             },
+                            client_ip,
                             view,
                         )
                         .await
@@ -1627,6 +1638,7 @@ async fn handle_soap(
                                     lifetime,
                                     desc: parse_desc(body),
                                 },
+                                client_ip,
                                 view,
                             )
                             .await
@@ -2223,7 +2235,7 @@ fn request_within(c: Contain, client: Ipv4Addr, ext: u16, int_port: u16) -> bool
 /// 2.5.18.2, 2.5.21.3): the caller's own mapping, both ports at or above
 /// 1024 where the floor applies.
 fn entry_within(c: Contain, e: &FacadeEntry) -> bool {
-    e.client == c.caller
+    e.owner == c.caller
         && (!c.high_port || (e.int_port >= ANY_PORT_BASE && e.req_ext >= ANY_PORT_BASE))
 }
 
@@ -2234,12 +2246,15 @@ fn entry_within(c: Contain, e: &FacadeEntry) -> bool {
 /// answer NewReservedPort carries differs from the request, which is the
 /// case the action exists for. A wildcard (0) is the same question with no
 /// preference expressed.
-fn preferred_port(entries: &[FacadeEntry], req_ext: u16, proto: Proto, client: Ipv4Addr) -> u16 {
-    let held_by_another = req_ext != 0
-        && entries
-            .iter()
-            .any(|e| e.proto == proto && e.req_ext == req_ext && e.client != client);
-    if req_ext == 0 || held_by_another {
+fn preferred_port(entries: &[FacadeEntry], req_ext: u16, proto: Proto) -> u16 {
+    // A preferred port is honoured. It used to be moved aside when another
+    // client held it, which was the one-holder rule; with a per-client label
+    // (call/0022) another client's holder is no obstacle, and the only request
+    // that has to be resolved is the wildcard, which states no preference.
+    // On an uplink where this device owns the real port, the datapath decides
+    // whether the preference can be bound; the label is the control point's
+    // either way.
+    if req_ext == 0 {
         free_requested_port(entries, proto)
     } else {
         req_ext
@@ -2330,6 +2345,7 @@ fn apply_entry(
     req_ext: u16,
     proto: Proto,
     client: Ipv4Addr,
+    owner: Ipv4Addr,
     int_port: u16,
     bind_port: u16,
     lifetime: u32,
@@ -2342,7 +2358,7 @@ fn apply_entry(
     // untouched, nothing torn down.
     if let Some(idx) = es
         .iter()
-        .position(|e| e.proto == proto && e.client == client && e.int_port == int_port)
+        .position(|e| e.proto == proto && e.owner == owner && e.int_port == int_port)
     {
         let mut e = es.remove(idx);
         e.req_ext = req_ext;
@@ -2370,7 +2386,7 @@ fn apply_entry(
     // port, and here it does not.
     if let Some(idx) = es
         .iter()
-        .position(|e| e.req_ext == req_ext && e.proto == proto && e.client == client)
+        .position(|e| e.req_ext == req_ext && e.proto == proto && e.owner == owner)
     {
         let stray = if es[idx].bind_port != bind_port {
             Some((es[idx].bind_port, es[idx].client, es[idx].int_port))
@@ -2392,6 +2408,7 @@ fn apply_entry(
         FacadeEntry {
             req_ext,
             proto,
+            owner,
             client,
             int_port,
             bind_port,
@@ -2832,7 +2849,7 @@ fn random_sid() -> Sid {
 /// point's description.
 fn entry_line(e: &FacadeEntry) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         e.req_ext,
         e.proto.code(),
         e.bind_port,
@@ -2840,18 +2857,20 @@ fn entry_line(e: &FacadeEntry) -> String {
         e.int_port,
         e.granted_lifetime,
         e.expires_at_unix,
-        e.desc
+        e.desc,
+        e.owner
     )
 }
 
-/// A persisted index row back to an entry. The description was added
-/// after the first rows were written, so a seven-field row from the
-/// earlier build restores with an empty description rather than being
-/// dropped and losing the mapping a control point already holds. A row
-/// that parses to nothing is skipped.
+/// A persisted index row back to an entry. The row grew twice: the
+/// description was added, then the requester. A seven-field row restores with
+/// an empty description, and a row without the requester takes the target as
+/// the requester, which is what those rows meant (they were written before a
+/// lifted control point could map on another host's behalf). A row that
+/// parses to nothing is skipped.
 fn entry_from_line(line: &str) -> Option<FacadeEntry> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 7 && parts.len() != 8 {
+    if !(7..=9).contains(&parts.len()) {
         return None;
     }
     let req_ext: u16 = parts[0].parse().ok()?;
@@ -2865,9 +2884,16 @@ fn entry_from_line(line: &str) -> Option<FacadeEntry> {
     let granted_lifetime: u32 = parts[5].parse().ok()?;
     let expires_at_unix: u64 = parts[6].parse().ok()?;
     let desc = parts.get(7).copied().unwrap_or("").to_string();
+    // a row written before the requester existed means the target, since a
+    // control point then could only map for itself
+    let owner = match parts.get(8).and_then(|o| o.parse::<Ipv4Addr>().ok()) {
+        Some(o) => o,
+        None => client,
+    };
     Some(FacadeEntry {
         req_ext,
         proto,
+        owner,
         client,
         int_port,
         bind_port,
@@ -3395,6 +3421,7 @@ mod tests {
         let mk = |req_ext: u16, proto: Proto| FacadeEntry {
             req_ext,
             proto,
+            owner: Ipv4Addr::new(192, 168, 21, 50),
             client: Ipv4Addr::new(192, 168, 21, 50),
             int_port: req_ext,
             bind_port: req_ext + 1000,
@@ -3666,11 +3693,11 @@ mod tests {
         let d = |s: &str| s.to_string();
         let mut es: Vec<FacadeEntry> = Vec::new();
         // A maps 3074/UDP -> slot 30000.
-        assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, 4000, 30000, 3600, now, d("client-a")), None);
+        assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         // A re-adds the SAME internal tuple at a new requested port: the
         // entry rides the port, the same slot, nothing torn down.
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, 4000, 30000, 3600, now, d("client-a")), None);
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].req_ext, 3075);
         assert_eq!(es[0].bind_port, 30000);
@@ -3678,14 +3705,14 @@ mod tests {
         // at that port surrenders it: one holder per client per port,
         // because the port is that client's handle.
         assert_eq!(
-            apply_entry(&mut es, 3075, Proto::Udp, a, 6000, 30005, 3600, now, d("client-a")),
+            apply_entry(&mut es, 3075, Proto::Udp, a, a, 6000, 30005, 3600, now, d("client-a")),
             Some((30000, a, 4000))
         );
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].bind_port, 30005);
         // B also claims 3075/UDP: its own entry, and A's survives. The
         // datapath resolves each to its own slot and its own real tuple.
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), None);
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, b, 5000, 30001, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 2, "two clients, one requested port");
         assert_eq!(
             es.iter().filter(|e| e.req_ext == 3075).count(),
@@ -3693,12 +3720,12 @@ mod tests {
             "both holders are recorded"
         );
         // B re-adds its own tuple at the same port: plain refresh.
-        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, 5000, 30001, 3600, now, d("client-b")), None);
+        assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, b, 5000, 30001, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 2);
         // A fresh mapping on a free port: plain insert, and B may hold the
         // same port on another protocol without touching A.
-        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, 9000, 30002, 3600, now, d("client-a")), None);
-        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, 6000, 30003, 3600, now, d("client-b")), None);
+        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, a, 9000, 30002, 3600, now, d("client-a")), None);
+        assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, b, 6000, 30003, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 4);
         assert_eq!(es.iter().filter(|e| e.req_ext == 9000 && e.proto == Proto::Tcp).count(), 2);
     }
@@ -3717,6 +3744,7 @@ mod tests {
         let e = |req_ext: u16, proto: Proto| FacadeEntry {
             req_ext,
             proto,
+            owner: Ipv4Addr::new(192, 168, 21, 50),
             client: Ipv4Addr::new(192, 168, 21, 50),
             int_port: 4000,
             bind_port: 30000,
@@ -3779,6 +3807,7 @@ mod tests {
         let e = |req_ext: u16, client: Ipv4Addr, int_port: u16| FacadeEntry {
             req_ext,
             proto: Proto::Udp,
+            owner: client,
             client,
             int_port,
             bind_port: 30000,
@@ -3816,6 +3845,7 @@ mod tests {
         let e = |req_ext: u16, proto: Proto, client: Ipv4Addr, int_port: u16| FacadeEntry {
             req_ext,
             proto,
+            owner: client,
             client,
             int_port,
             bind_port: 30000,
@@ -3892,6 +3922,44 @@ mod tests {
         }
         assert_eq!(facade.get_generic(4, None).await, Err(UpnpErr::NoSuchEntry));
 
+        // A lifted control point may map on another host's behalf, and the
+        // entry is keyed by the *requester* (call/0022), not by the host it
+        // names. Before the requester was recorded, such an entry was keyed
+        // by its target, so its owner could not read or delete it: the
+        // deployed bench found exactly that (714 on its own delete).
+        {
+            let mut es = facade.entries.lock().await;
+            es.push(FacadeEntry {
+                req_ext: 25000,
+                proto: Proto::Udp,
+                owner: a,
+                client: b,
+                int_port: 25000,
+                bind_port: 30007,
+                granted_lifetime: 3600,
+                expires_at_unix: Epoch::now() + 300,
+                desc: "for-b".to_string(),
+            });
+        }
+        let got = facade
+            .get_specific(25000, Proto::Udp, a, None)
+            .await
+            .expect("the requester reads the mapping it made");
+        assert!(
+            got.contains("<NewInternalClient>192.168.21.60</NewInternalClient>"),
+            "and the target is the host it named: {}",
+            got
+        );
+        assert_eq!(
+            facade.delete_mapping(25000, Proto::Udp, b, None).await,
+            Err(UpnpErr::NoSuchEntry),
+            "the target host is not the requester and holds nothing there"
+        );
+        assert!(
+            facade.delete_mapping(25000, Proto::Udp, a, None).await.is_ok(),
+            "the requester deletes its own mapping"
+        );
+
         // the enumeration renders each holder as itself: two clients hold
         // 1024/UDP here, so index 1 must not render index 0's entry (the
         // defect the deployed bench caught; the index addresses the visible
@@ -3901,6 +3969,7 @@ mod tests {
             es.push(FacadeEntry {
                 req_ext: 1024,
                 proto: Proto::Udp,
+                owner: b,
                 client: b,
                 int_port: 1024,
                 bind_port: 30008,
@@ -3911,6 +3980,7 @@ mod tests {
             es.push(FacadeEntry {
                 req_ext: 1024,
                 proto: Proto::Udp,
+                owner: a,
                 client: a,
                 int_port: 1024,
                 bind_port: 30009,
@@ -3980,6 +4050,7 @@ mod tests {
         let e = |req_ext: u16, proto: Proto, client: Ipv4Addr| FacadeEntry {
             req_ext,
             proto,
+            owner: client,
             client,
             int_port: req_ext,
             bind_port: 30000,
@@ -3989,24 +4060,22 @@ mod tests {
         };
         let held = vec![e(5000, Proto::Udp, a), e(5001, Proto::Udp, b)];
 
-        // preferred: the port belongs to another client, so B is given a
-        // free one and A keeps its mapping
-        assert_eq!(preferred_port(&held, 5000, Proto::Udp, b), ANY_PORT_BASE);
-        // a wildcard asks the same question with no preference stated
-        assert_eq!(preferred_port(&held, 0, Proto::Udp, b), ANY_PORT_BASE);
+        // preferred: the port is a per-client label (call/0022), so another
+        // client's holder is no obstacle and the preference is honoured
+        assert_eq!(preferred_port(&held, 5000, Proto::Udp), 5000);
+        // a wildcard states no preference, so it allocates
+        assert_eq!(preferred_port(&held, 0, Proto::Udp), ANY_PORT_BASE);
         // the requester's own port is honoured, so a re-Add refreshes
-        assert_eq!(preferred_port(&held, 5001, Proto::Udp, b), 5001);
+        assert_eq!(preferred_port(&held, 5001, Proto::Udp), 5001);
         // a free port is honoured
-        assert_eq!(preferred_port(&held, 8100, Proto::Udp, b), 8100);
-        // another protocol's claim is not this request's obstacle
-        assert_eq!(preferred_port(&held, 5000, Proto::Tcp, b), 5000);
+        assert_eq!(preferred_port(&held, 8100, Proto::Udp), 8100);
 
         // exact: the same request on the same state adds beside the other
         // client's holder, which is the supersession call/0022 records; the
         // earlier holder keeps its mapping.
         let mut es = held.clone();
         assert_eq!(
-            apply_entry(&mut es, 5000, Proto::Udp, b, 7000, 30010, 3600, 1_700_000_000, "b".into()),
+            apply_entry(&mut es, 5000, Proto::Udp, b, b, 7000, 30010, 3600, 1_700_000_000, "b".into()),
             None,
             "exact adds beside the other client's holder rather than evicting it"
         );
@@ -4047,6 +4116,7 @@ mod tests {
         let e = FacadeEntry {
             req_ext: 3074,
             proto: Proto::Udp,
+            owner: Ipv4Addr::new(192, 168, 21, 50),
             client: Ipv4Addr::new(192, 168, 21, 50),
             int_port: 3074,
             bind_port: 30000,
@@ -4069,7 +4139,10 @@ mod tests {
         // the index round-trips the label, and a row from the earlier
         // build (seven fields, no label) still restores its mapping
         let line = entry_line(&e);
-        assert!(line.ends_with('\n') && line.matches('\t').count() == 7);
+        assert!(
+            line.ends_with('\n') && line.matches('\t').count() == 8,
+            "nine fields: the seven fixed, the description, the requester"
+        );
         let back = entry_from_line(line.trim_end()).expect("the row round-trips");
         assert_eq!(back.desc, e.desc);
         assert_eq!(back.req_ext, e.req_ext);
@@ -4098,6 +4171,7 @@ mod tests {
         let entry = |req_ext: u16, proto: Proto, int_port: u16, desc: &str| FacadeEntry {
             req_ext,
             proto,
+            owner: Ipv4Addr::new(192, 168, 21, 50),
             client: Ipv4Addr::new(192, 168, 21, 50),
             int_port,
             bind_port: 30000,
@@ -4247,6 +4321,7 @@ mod tests {
             entries: Mutex::new(vec![FacadeEntry {
                 req_ext: 8666,
                 proto: Proto::Udp,
+                owner: Ipv4Addr::LOCALHOST,
                 client: Ipv4Addr::LOCALHOST,
                 int_port: 51001,
                 bind_port: 30000,
@@ -4398,6 +4473,7 @@ mod tests {
         let entry = FacadeEntry {
             req_ext: int_port,
             proto: Proto::Udp,
+            owner: client,
             client,
             int_port,
             bind_port: port,
@@ -5324,6 +5400,7 @@ mod ifindex_probe {
             entries: Mutex::new(vec![FacadeEntry {
                 req_ext: 20500,
                 proto: Proto::Udp,
+                owner: Ipv4Addr::new(192, 168, 21, 50),
                 client: Ipv4Addr::new(192, 168, 21, 50),
                 int_port: 20500,
                 bind_port: 30009,
