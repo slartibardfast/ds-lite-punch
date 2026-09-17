@@ -979,7 +979,8 @@ impl UpnpFacade {
     ) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
         let now = Epoch::now();
-        let mut listing = String::from(PORT_LISTING_OPEN);
+        let mut listing = String::from(PORT_LISTING_WRAP_OPEN);
+        listing.push_str(PORT_LISTING_OPEN);
         let mut count = 0u16;
         for e in es.iter() {
             if let Some(p) = proto {
@@ -1026,6 +1027,7 @@ impl UpnpFacade {
             return Err(UpnpErr::PortMappingNotFound);
         }
         listing.push_str("</p:PortMappingList>");
+        listing.push_str(PORT_LISTING_WRAP_CLOSE);
         Ok(listing)
     }
 
@@ -3044,6 +3046,18 @@ fn derived_udn(base: &str, tag: &[u8]) -> String {
 /// shape authority).
 const PORT_LISTING_OPEN: &str = r#"<p:PortMappingList xmlns:p="urn:schemas-upnp-org:gw:WANIPConnection" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:schemas-upnp-org:gw:WANIPConnection http://www.upnp.org/schemas/gw/WANIPConnection-v2.xsd">"#;
 
+/// The wrapper that carries the fragment as the value of
+/// GetListOfPortMappings' NewPortListing OUT argument: A_ARG_TYPE_PortListing
+/// is a string holding an XML document, so the fragment rides in a CDATA
+/// section inside the argument element rather than as the response's own
+/// children, where no control point would find it under that name. The
+/// reference server emits the same wrapper, and the reference client
+/// collects the listing only from the character data of this element.
+/// A description cannot break the section: `xml_escape` renders `>` as
+/// `&gt;`, so `]]>` cannot occur inside a fragment.
+const PORT_LISTING_WRAP_OPEN: &str = "<NewPortListing><![CDATA[";
+const PORT_LISTING_WRAP_CLOSE: &str = "]]></NewPortListing>";
+
 /// WANIPConnection:1 service description. Cribbed from miniupnpd (BSD
 /// license, `netfilter/upnp_desc.c`); the action/argument/state-variable
 /// shapes follow the UPnP IGDv1 spec. The PPP alias serves the same SCPD
@@ -4227,15 +4241,22 @@ mod tests {
 
         // the fragment is the spec's sample shape (2.3.25.2): a namespaced
         // PortMappingList of PortMappingEntry elements, the invented
-        // element tree of the placeholder gone
+        // element tree of the placeholder gone. It is the value of the
+        // NewPortListing OUT argument, so the argument element and its
+        // CDATA section wrap it (the shape the reference client reads).
         let listing = facade
             .list_port_mappings(5000, 6000, Some(Proto::Udp), 0, None)
             .await
             .expect("a populated range lists");
-        assert!(listing.starts_with(
+        assert!(
+            listing.starts_with("<NewPortListing><![CDATA["),
+            "the fragment rides as the NewPortListing argument value: {}",
+            listing
+        );
+        assert!(listing.contains(
             "<p:PortMappingList xmlns:p=\"urn:schemas-upnp-org:gw:WANIPConnection\""
         ));
-        assert!(listing.ends_with("</p:PortMappingList>"));
+        assert!(listing.ends_with("]]></NewPortListing>"));
         assert!(listing.contains("<p:PortMappingEntry>"));
         assert!(listing.contains("<p:NewRemoteHost></p:NewRemoteHost>"));
         assert!(listing.contains("<p:NewExternalPort>5555</p:NewExternalPort>"));
@@ -5251,12 +5272,23 @@ mod ifindex_probe {
         );
     }
 
-    /// Local interop probe (ignored; needs the miniupnpc client source
-    /// built at /tmp/localupnpc): serves the facade HTTP layer on
-    /// 127.0.0.1:19152 without any router, writes the generated rootDesc
-    /// to /tmp/rootdesc.xml so the real miniupnpc parser can be run
-    /// against it (testigddescparse), and drives the real `upnpc -l`
-    /// walk plus a GetCommonLinkProperties SOAP against the live server.
+    /// Local interop probe (ignored; needs the miniupnpc source at
+    /// `/tmp/localupnpc/miniupnpc` with `build/upnpc-static` and
+    /// `build/testigddescparse` built from it): serves the facade HTTP
+    /// layer on 127.0.0.1:19152 without any router, dumps both rootDesc
+    /// presentations for the reference IGD description parser, and drives
+    /// the real client's walks (v1 `-l`, v2 `-L`, and the v2 `-n` the
+    /// DeviceProtection boundary refuses) plus a GetCommonLinkProperties
+    /// SOAP against the live server.
+    ///
+    /// Build the fixture with:
+    ///   git clone --depth 1 https://github.com/miniupnp/miniupnp.git /tmp/localupnpc/miniupnp
+    ///   cp -r /tmp/localupnpc/miniupnp/miniupnpc /tmp/localupnpc/miniupnpc
+    ///   make -C /tmp/localupnpc/miniupnpc -j4 BUILD=build
+    ///   cmake -S /tmp/localupnpc/miniupnpc -B /tmp/localupnpc/cmt -DUPNPC_BUILD_TESTS=ON
+    ///   cmake --build /tmp/localupnpc/cmt --target testigddescparse -j4
+    ///   cp /tmp/localupnpc/cmt/testigddescparse /tmp/localupnpc/miniupnpc/build/
+    ///
     /// Run with: cargo test -- --ignored miniupnpc_interop --nocapture
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs miniupnpc built at /tmp/localupnpc (off-router probe)"]
@@ -5284,7 +5316,21 @@ mod ifindex_probe {
             cfg,
             table,
             publisher,
-            entries: Mutex::new(Vec::new()),
+            // One entry for this loopback caller, so the reference client's
+            // IGD:2 listing walk parses a real mapping back rather than an
+            // empty PortMappingList. 3074 is at or above the containment
+            // floor, so a contained view still shows it.
+            entries: Mutex::new(vec![FacadeEntry {
+                req_ext: 3074,
+                proto: Proto::Udp,
+                owner: Ipv4Addr::LOCALHOST,
+                client: Ipv4Addr::LOCALHOST,
+                int_port: 3074,
+                bind_port: 40002,
+                granted_lifetime: 3600,
+                expires_at_unix: 0,
+                desc: "interop".into(),
+            }]),
             tasks: Mutex::new(HashMap::new()),
             gena: Mutex::new(GenaState::default()),
             ip_rx: watch::channel(Ipv4Addr::LOCALHOST).1,
@@ -5346,6 +5392,110 @@ mod ifindex_probe {
         assert!(
             text.contains("Found valid IGD") || text.contains("Found an IGD"),
             "upnpc must accept the device: {}",
+            text
+        );
+
+        // The v2 presentation, driven by the same reference client. The
+        // description parser first, over both presentations.
+        let doc_v2 = root_desc_v2(Ipv4Addr::LOCALHOST, 19152, "interop-facade", "interop-udn");
+        std::fs::write("/tmp/rootdesc-v2.xml", &doc_v2).unwrap();
+        for (label, path) in [
+            ("v1", "/tmp/rootdesc.xml"),
+            ("v2", "/tmp/rootdesc-v2.xml"),
+        ] {
+            let out =
+                std::process::Command::new("/tmp/localupnpc/miniupnpc/build/testigddescparse")
+                    .arg(path)
+                    .output()
+                    .expect("run testigddescparse");
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            println!("=== testigddescparse {} ===\n{}", label, text);
+            assert!(
+                out.status.success() && text.contains("controlURL="),
+                "the reference parser must resolve the WANIPConnection URLs of the {} \
+                 description: {}",
+                label,
+                text
+            );
+        }
+
+        // A direct SOAP probe of the same action, so the raw answer is
+        // visible whatever the reference client's walk reports.
+        let list_body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:GetListOfPortMappings xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewStartPort>1</NewStartPort><NewEndPort>65535</NewEndPort><NewProtocol>UDP</NewProtocol><NewManage>1</NewManage><NewNumberOfPorts>1000</NewNumberOfPorts></u:GetListOfPortMappings></s:Body></s:Envelope>";
+        let listed = soap_post(
+            "127.0.0.1:19152",
+            "/ctl/IPConn",
+            "urn:schemas-upnp-org:service:WANIPConnection:2#GetListOfPortMappings",
+            list_body,
+        )
+        .await;
+        println!("=== direct GetListOfPortMappings (UDP) ===\n{}", listed);
+        // The wire shape: the fragment as the NewPortListing argument
+        // value, which is what a control point reads it from.
+        assert!(
+            listed.contains("<NewPortListing><![CDATA[<p:PortMappingList"),
+            "the listing rides as the NewPortListing argument value: {}",
+            listed
+        );
+        assert!(
+            listed.contains("<p:NewInternalClient>127.0.0.1</p:NewInternalClient>"),
+            "the raw listing carries the caller's entry: {}",
+            listed
+        );
+
+        // The v2 read path is not session-gated, so the reference client's
+        // IGD:2 listing walk must parse our PortMappingList, entry fields
+        // included.
+        let out = std::process::Command::new("/tmp/localupnpc/miniupnpc/build/upnpc-static")
+            .args(["-u", "http://127.0.0.1:19152/igd/v2/rootDesc.xml", "-L"])
+            .output()
+            .expect("run upnpc-static -L");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        println!("=== upnpc -L (v2) output ===\n{}", text);
+        // The walk asks for TCP first, which holds nothing and is 730 by
+        // the spec's rule (2.5.21), so the reference client reports that
+        // fault and then asks for UDP. The UDP pass is the one that must
+        // show our listing parsed, fields and all.
+        assert!(
+            text.contains("730 (PortMappingNotFound)"),
+            "the empty TCP range is the spec's fault, which the reference client \
+             surfaces as a failed pass: {}",
+            text
+        );
+        assert!(
+            text.contains("3074->127.0.0.1:3074"),
+            "the reference parser must read the caller's own mapping back: {}",
+            text
+        );
+        assert!(
+            text.contains("'interop'"),
+            "the reference parser must read our description field: {}",
+            text
+        );
+
+        // The v2 write path is gated, and an empty DeviceProtection store
+        // holds no session, so the reference client's AddAnyPortMapping is
+        // refused with the boundary's own fault.
+        let out = std::process::Command::new("/tmp/localupnpc/miniupnpc/build/upnpc-static")
+            .args([
+                "-u",
+                "http://127.0.0.1:19152/igd/v2/rootDesc.xml",
+                "-n",
+                "127.0.0.1",
+                "3074",
+                "3074",
+                "UDP",
+            ])
+            .output()
+            .expect("run upnpc-static -n");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        println!("=== upnpc -n (v2) output ===\n{}", text);
+        assert!(
+            text.contains("failed with code 606"),
+            "the DeviceProtection boundary must refuse an unauthenticated v2 mutator: {}",
             text
         );
     }
