@@ -213,6 +213,10 @@ pub struct UpnpFacade {
     /// second the wait began. A request that cannot be answered yet is
     /// dropped; past DISCOVERY_GRACE_S the answer is the network error.
     pcp_wait: StdMutex<HashMap<u16, u64>>,
+    /// Consecutive LAN-presence misses per slot. This lives on the facade
+    /// because the GC runs as one pass per tick, so a counter local to the
+    /// pass would reset before it ever reached the threshold.
+    presence_misses: StdMutex<HashMap<u16, u8>>,
 }
 
 impl UpnpFacade {
@@ -260,6 +264,7 @@ impl UpnpFacade {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(dp_state),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         // Respawn-restored grants: main skipped their datapath spawn (its
@@ -1698,26 +1703,38 @@ impl UpnpFacade {
     /// the operator's configuration and are never touched here; a client's
     /// own request is a promise to a device, and a device that is gone has
     /// nothing to be promised.
-    async fn reap_absent_clients(&self, misses: &mut std::collections::HashMap<u16, u8>) {
+    async fn reap_absent_clients(&self) {
         let entries: Vec<(u16, Ipv4Addr, Proto, Ipv4Addr, u16)> = {
             let es = self.entries.lock().await;
             es.iter()
                 .map(|e| (e.bind_port, e.owner, e.proto, e.client, e.req_ext))
                 .collect()
         };
-        let live: std::collections::HashSet<u16> = entries.iter().map(|e| e.0).collect();
-        misses.retain(|p, _| live.contains(p));
-        for (bind_port, owner, proto, client, req_ext) in entries {
-            if crate::presence::device_up(client) {
+        // Decide under the lock and release outside it: a guard must not be
+        // held across an await.
+        let mut to_release: Vec<(Ipv4Addr, Proto, Ipv4Addr, u16)> = Vec::new();
+        {
+            let mut misses = self
+                .presence_misses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let live: std::collections::HashSet<u16> = entries.iter().map(|e| e.0).collect();
+            misses.retain(|p, _| live.contains(p));
+            for (bind_port, owner, proto, client, req_ext) in entries {
+                if crate::presence::device_up(client) {
+                    misses.remove(&bind_port);
+                    continue;
+                }
+                let n = misses.entry(bind_port).or_insert(0);
+                *n = n.saturating_add(1);
+                if !crate::presence::release_absent(false, *n) {
+                    continue;
+                }
                 misses.remove(&bind_port);
-                continue;
+                to_release.push((owner, proto, client, req_ext));
             }
-            let n = misses.entry(bind_port).or_insert(0);
-            *n = n.saturating_add(1);
-            if !crate::presence::release_absent(false, *n) {
-                continue;
-            }
-            misses.remove(&bind_port);
+        }
+        for (owner, proto, client, req_ext) in to_release {
             self.publisher.log_transition(
                 "mapping-released",
                 &format!(
@@ -1823,10 +1840,6 @@ impl UpnpFacade {
 
     async fn gc_loop(&self) {
         let grace = self.cfg.grace_secs;
-        // Consecutive presence misses per slot, loop-local: this is the
-        // loop's own memory of a device that stopped answering, not state
-        // worth persisting.
-        let mut misses: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
         // R4 before anything is reaped: a slot sharing a tuple with a
         // device's flow moves, so the reap decisions below act on ports the
         // table actually holds.
@@ -1852,7 +1865,7 @@ impl UpnpFacade {
         // survive them. This supersedes the silence backstop that used to
         // reap here, which reaped exactly the mappings a console needs when
         // it sits still.
-        self.reap_absent_clients(&mut misses).await;
+        self.reap_absent_clients().await;
         // lease-policy backstop, kept for the pool-state case only: the
         // pressure path handles the shorter grace under TableFull.
         let now = Epoch::now();
@@ -4346,6 +4359,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4469,6 +4483,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         let bind_port = 41001;
@@ -4706,6 +4721,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let view = Some(Contain { caller: a, high_port: true });
 
@@ -5047,6 +5063,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         // the fragment is the spec's sample shape (2.3.25.2): a namespaced
@@ -5189,6 +5206,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         facade.spawn_restored_grants().await;
@@ -5258,6 +5276,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         let cb = format!("<http://127.0.0.1:{}/evt>", port);
@@ -5351,6 +5370,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -5804,6 +5824,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5917,6 +5938,7 @@ mod tests {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let addr = facade.ssdp.local_addr().unwrap();
         let f = facade.clone();
@@ -6155,6 +6177,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         // Dump the generated rootDesc for the external miniupnpc parser.
@@ -6403,6 +6426,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: dp_seeded(),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -6900,6 +6924,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7008,6 +7033,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         };
         f3.cfg.upnp_port = 0;
         let down = Arc::new(f3);
@@ -7185,6 +7211,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
 
         let cb = format!("<http://127.0.0.1:{}/evt>", port);
@@ -7281,6 +7308,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
@@ -7448,6 +7476,7 @@ mod ifindex_probe {
             bursts: Arc::new(StdMutex::new(HashMap::new())),
             dp: StdMutex::new(crate::dp::DpState::default()),
             pcp_wait: StdMutex::new(HashMap::new()),
+            presence_misses: StdMutex::new(HashMap::new()),
         });
         facade
             .delete_mapping(3074, Proto::Udp, a, None)
