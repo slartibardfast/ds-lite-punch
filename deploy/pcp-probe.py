@@ -137,6 +137,15 @@ def main():
                          "the server: a client that cannot see itself must "
                          "learn this address, and the server answers "
                          "ADDRESS_MISMATCH until it does")
+    ap.add_argument("--lifetime", type=int, default=120,
+                    help="the lifetime to ask for, in seconds. The server "
+                         "caps it; 120 is the RFC's own default and the "
+                         "value every earlier run asked for")
+    ap.add_argument("--hold", action="store_true",
+                    help="after a successful MAP, keep the mapping and stay: "
+                         "the client goes silent and this socket is where the "
+                         "outside's probes land, so every arrival is printed "
+                         "with the epoch that places it against that silence")
     args = ap.parse_args()
     addr = (args.gateway, args.port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -161,7 +170,7 @@ def main():
 
     # The real thing: a MAP, retried once because a mapping whose discovery
     # is in flight is dropped rather than answered with a guess.
-    req = pcp_header(OP_MAP, 120, client) + pcp_map_body(args.proto, args.int_port, args.suggest)
+    req = pcp_header(OP_MAP, args.lifetime, client) + pcp_map_body(args.proto, args.int_port, args.suggest)
     sent_at = time.time()
     resp = send(sock, req, wait=4.0)
     got = show_pcp("MAP", resp, sent_at)
@@ -169,6 +178,20 @@ def main():
         print("retrying the MAP after 4s (the protocol's own recovery)")
         sent_at = time.time()
         got = show_pcp("MAP (retry)", send(sock, req, wait=8.0), sent_at)
+    if args.hold and got is not None and got[3] == 0:
+        # The mapping is held open on purpose. The client now goes silent and
+        # answers nothing, and this socket is where the outside's probes land.
+        # The association the requests used is dissolved first: a connected
+        # UDP socket delivers only from the peer it is connected to, and the
+        # probes come from an unrelated address; Linux dissolves the
+        # association when the socket is connected to the wildcard.
+        sock.connect(("0.0.0.0", 0))
+        sock.settimeout(None)
+        print("HOLDING: the client is silent; the mapping is the daemon's", flush=True)
+        while True:
+            data, peer = sock.recvfrom(2048)
+            print(f"RX {len(data)} bytes from {peer[0]}:{peer[1]} at {time.time():.3f}",
+                  flush=True)
     if got is not None and got[3] == 0:
         print("renewing: the same key must refresh, not move")
         show_pcp("MAP (renew)", send(sock, req, wait=8.0), time.time())
