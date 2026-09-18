@@ -523,16 +523,53 @@ const DEV_MISSES_TO_RELEASE: u8 = 3;
 /// on more than one probe.
 const PROBE_EVERY_TICKS: u64 = 3;
 
-/// Is the device on the LAN answering? The router's own `ping` is the probe:
-/// it needs no dependency, and a device that is off or asleep is exactly what
-/// a hold should stop paying for (call/0029). A probe that cannot run at all
-/// answers "up", because a broken probe must never release a live hold.
+/// Is the device on the LAN? The neighbour table is the instrument, not the
+/// echo. A console that drops ICMP still answers ARP, and a device that is
+/// off leaves FAILED or INCOMPLETE behind (measured on the router: the
+/// Switch present with a MAC and no ICMP, the PS3 absent with no ARP at all).
+/// An ICMP echo is used only as a trigger, to make the kernel settle an entry
+/// we cannot read, and never as the answer.
+///
+/// A probe that cannot run answers "up": a broken instrument must never
+/// release a live hold.
 fn device_up(ip: Ipv4Addr) -> bool {
-    std::process::Command::new("ping")
-        .args(["-c", "1", "-W", "1", &ip.to_string()])
+    let s = ip.to_string();
+    let first = neigh_state(&s).unwrap_or_default();
+    if first.trim().is_empty() {
+        let _ = std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "1", &s])
+            .output();
+        let second = neigh_state(&s).unwrap_or_default();
+        if second.trim().is_empty() {
+            return true;
+        }
+        return neigh_answers(&second);
+    }
+    neigh_answers(&first)
+}
+
+/// `ip neigh show <ip>`, as text. None means the probe itself could not run.
+fn neigh_state(ip: &str) -> Option<String> {
+    std::process::Command::new("ip")
+        .args(["neigh", "show", ip])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(true)
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Whether a neighbour listing says the device answered on the LAN. A listing
+/// with a link-layer address means it did, whatever the state; FAILED or
+/// INCOMPLETE means a probe went unanswered; anything else counts as present,
+/// so a failure of this instrument never releases a live hold.
+fn neigh_answers(listing: &str) -> bool {
+    let l = listing.trim();
+    if l.is_empty() {
+        return true;
+    }
+    if l.contains("FAILED") || l.contains("INCOMPLETE") {
+        return false;
+    }
+    true
 }
 
 /// The device's own packet count for a tuple: the connection table's entries
@@ -810,6 +847,19 @@ mod tests {
                     packets=1 bytes=37 src=192.168.21.138 dst=170.9.238.141 sport=3074 dport=39897 \
                     packets=0 bytes=0 mark=0 zone=0 use=2";
         assert_eq!(device_packets(peer, bind, host), 0);
+    }
+
+    #[test]
+    fn the_neighbour_table_is_the_presence_signal() {
+        // Measured shapes from the router: the Switch present with a MAC and
+        // dropping ICMP, the PS3 absent and answering no ARP at all.
+        assert!(neigh_answers("192.168.21.68 dev br-lan lladdr 80:d2:e5:6d:d1:00 DELAY"));
+        assert!(neigh_answers("192.168.21.68 dev br-lan lladdr 80:d2:e5:6d:d1:00 STALE"));
+        assert!(!neigh_answers("192.168.21.138 dev br-lan FAILED"));
+        assert!(!neigh_answers("192.168.21.138 dev br-lan INCOMPLETE"));
+        // a failure of the instrument is not evidence the device is gone
+        assert!(neigh_answers(""));
+        assert!(neigh_answers("something we do not understand"));
     }
 
     #[tokio::test]
