@@ -321,21 +321,19 @@ pub fn add_pin(client: Ipv4Addr, client_port: u16, r: u16) -> io::Result<()> {
     ]) {
         Ok(()) => Ok(()),
         Err(_) => {
-            // EEXIST path: accept if the element is already exactly this
-            // value (respawn re-add); reject if it maps elsewhere.
-            let out = Command::new("nft")
-                .args(["list", "map", "ip", "dslp", "snat_map"])
-                .output()?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            let needle = format!("{} . {} : {} . {}", client, client_port, NAT_ADDR, r);
-            if text.contains(&needle) {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("snat_map pin conflict for {} . {}", client, client_port),
-                ))
-            }
+            // EEXIST: the kernel keeps nft state across a daemon crash, and
+            // this map is the daemon's own, so a stale element for this key
+            // is our own mess from a previous run rather than a competing
+            // holder. A key maps to one value, and a stale value is worse
+            // than any split this used to refuse: it mis-translates the
+            // device's traffic to a port the device is not using, which is a
+            // console losing its mapping while nothing looks wrong. The
+            // element is replaced.
+            let _ = del_pin(client, client_port);
+            run(&[
+                "add", "element", "ip", "dslp", "snat_map",
+                &format!("{{ {} }}", elem),
+            ])
         }
     }
 }
