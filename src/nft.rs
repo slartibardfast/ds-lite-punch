@@ -135,22 +135,24 @@ fn accept_rule(bind_port: u16, tcp: bool) -> String {
 /// duplicate accept is otherwise unreachable because R reuse only follows
 /// a successful revoke.
 pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
-    let elem = format!("{} . {} : {} . {}", client, int_port, NAT_ADDR, bind_port);
-    let script = format!(
-        "add element ip dslp snat_map {{ {} }}\n{}\n",
-        elem,
-        accept_rule(bind_port, tcp)
-    );
+    // The client's own (client, int_port) is deliberately not pinned. That
+    // pin made the client's traffic egress through the slot's port, so one
+    // game held two external tuples at once: some flows on its own preserved
+    // port and some on the relay's, which is what a console scores as Strict
+    // or Moderate. Measured live on the router, with a console in game:
+    // 14,740 packets of one flow egressing on the slot's port while its
+    // siblings kept their own. call/0014 settled this: the console's value
+    // story is organic, "works alongside, not enabled by" the relay. The
+    // slot's own punch keeps its tuple through its own bound socket, and the
+    // inbound path needs nothing of the client's egress.
+    let _ = (client, int_port);
+    // All or nothing: the accept rule alone, in one batch, with the per-op
+    // path as the fallback for the respawn re-add case.
+    let script = format!("{}\n", accept_rule(bind_port, tcp));
     if run_script(&script).is_ok() {
         return Ok(());
     }
-    // fallback: the proven per-op sequence (with its own idempotency).
-    add_pin(client, int_port, bind_port)?;
-    if let Err(e) = add_input_accept(bind_port, tcp) {
-        let _ = del_pin(client, int_port);
-        return Err(e);
-    }
-    Ok(())
+    add_input_accept(bind_port, tcp)
 }
 
 /// Revoke a slot datapath atomically: element delete plus rule delete (by
