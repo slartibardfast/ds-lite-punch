@@ -38,6 +38,7 @@ use crate::cdc::Cdc;
 use crate::forward;
 use crate::nft;
 use crate::publish::Publisher;
+use crate::slot::LeaseTable;
 use crate::stun;
 use crate::vote::VoteState;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -162,6 +163,13 @@ pub struct ObservationEngine {
     /// Tuples already reported in log-only mode, so the line appears once per
     /// flow rather than once per tick.
     reported: std::collections::HashSet<(Ipv4Addr, u16)>,
+    /// The lease table, when this arm runs beside the facade: the tuples an
+    /// allocation holds, read live. The frozen list a start-up snapshot gives
+    /// cannot see a grant that happened since, and a slot's tuple is not this
+    /// arm's to capture (call/0027 R1).
+    pub alloc: Option<Arc<Mutex<LeaseTable>>>,
+    /// The address the slots bind, so their tuples can be named.
+    pub bind_ip: Ipv4Addr,
 }
 
 impl ObservationEngine {
@@ -187,6 +195,8 @@ impl ObservationEngine {
             allow: Vec::new(),
             hold: true,
             reported: std::collections::HashSet::new(),
+            alloc: None,
+            bind_ip: Ipv4Addr::UNSPECIFIED,
         }
     }
 
@@ -203,7 +213,20 @@ impl ObservationEngine {
         }
     }
 
+    /// The tuples an allocation holds right now: the static snapshot plus
+    /// whatever the lease table has granted since (call/0027 R1).
+    async fn held_now(&self) -> Vec<(Ipv4Addr, u16)> {
+        let mut held = self.held.clone();
+        if let Some(t) = &self.alloc {
+            for s in t.lock().await.slots() {
+                held.push((self.bind_ip, s.bind_port));
+            }
+        }
+        held
+    }
+
     async fn tick(&mut self) {
+        let held = self.held_now().await;
         let live: Vec<crate::cdc::Candidate> = self.cdc.tick();
 
         // The admission (call/0025): a configured allowlist narrows this arm
@@ -265,7 +288,7 @@ impl ObservationEngine {
             if self.slots.iter().any(|s| s.bind_tuple == c.bind_tuple) {
                 continue; // already rescued
             }
-            if !claim_allowed(c.bind_tuple, &self.held, self.slots.len(), self.max_rescues) {
+            if !claim_allowed(c.bind_tuple, &held, self.slots.len(), self.max_rescues) {
                 continue;
             }
             let bind = SocketAddr::V4(SocketAddrV4::new(c.bind_tuple.0, c.bind_tuple.1));
@@ -354,7 +377,7 @@ impl ObservationEngine {
                     s.stop.clone(),
                 )
             };
-            let held_now = self.held.contains(&t);
+            let held_now = held.contains(&t);
             let reason = exit_due(missing, self.grace_ticks, since_inbound, held_now);
             if let Some(r) = reason {
                 stop.store(true, Ordering::Relaxed);
@@ -606,6 +629,36 @@ mod tests {
         assert!(e.reported.contains(&(LO, 54342)), "but it is reported");
         // a device outside the list is not even reported
         assert!(!e.reported.contains(&(LO, 54343)));
+    }
+
+    #[tokio::test]
+    async fn an_allocated_tuple_is_never_captured() {
+        // call/0027 R1 from this arm's side. The snapshot it starts with
+        // cannot see a grant that happened since, so the claim gate reads the
+        // live table: a slot's tuple belongs to the slot, and a shadow socket
+        // on it would be two local owners of one inner tuple.
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        let mut t = crate::slot::LeaseTable::new(
+            crate::slot::PortAllocator::new(30000, 30009).unwrap(),
+            4,
+            2,
+        );
+        assert_eq!(
+            t.upsert_pcp(crate::slot::Proto::Udp, 3074, c, 600, 1_800_000_000, c, 3074),
+            crate::slot::UpsertOutcome::Granted { bind_port: 30000 }
+        );
+        let mut e = engine(
+            Box::new(FakeCdc {
+                cands: vec![cand((LO, 30000), c, 30000)],
+            }),
+            Vec::new(),
+            8,
+            3,
+        );
+        e.alloc = Some(Arc::new(Mutex::new(t)));
+        e.bind_ip = LO;
+        e.tick().await;
+        assert!(e.slots.is_empty(), "an allocation's tuple is not this arm's");
     }
 
     #[tokio::test]

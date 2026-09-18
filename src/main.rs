@@ -900,6 +900,11 @@ async fn main() {
         // without --hold they are only reported.
         engine.allow = cfg.allow.clone();
         engine.hold = cfg.hold;
+        // The allocation side of the collision rule (call/0027 R1): the arm
+        // reads the live lease table, so a tuple a grant has taken since this
+        // arm started is not one it captures.
+        engine.alloc = Some(table.clone());
+        engine.bind_ip = bind_ip;
         let cdc_name = engine.name();
         tokio::spawn(async move {
             engine.run().await;

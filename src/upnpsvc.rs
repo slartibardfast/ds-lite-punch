@@ -610,6 +610,30 @@ impl UpnpFacade {
         }
         let lifetime = if lifetime == 0 { INFINITE_LEASE } else { lifetime };
         let now = Epoch::now();
+        // The punch collision rule (call/0027 R2/R3): a bind port whose inner
+        // tuple is already live belongs to whoever punched it, so the
+        // allocator's probe runs before a fresh allocation and steers around
+        // every live tuple the change-data-capture shows. A renewal allocates
+        // nothing, so it reads nothing. When the mirror is unavailable the
+        // probe cannot run, and that is said rather than passed over in
+        // silence (R5).
+        let fresh = {
+            let t = self.table.lock().await;
+            t.by_pcp_key(proto, int_port, owner).is_none()
+        };
+        if fresh {
+            match nft::list_flow_obs() {
+                Ok(live) => {
+                    let ports: Vec<u16> = live.iter().map(|(_, r)| *r).collect();
+                    let mut t = self.table.lock().await;
+                    t.avoid_ports(&ports);
+                }
+                Err(e) => self.publisher.log_transition(
+                    "collision-probe-unavailable",
+                    &format!("no live-tuple set to steer around: {}", e),
+                ),
+            }
+        }
         let mut outcome = self.upsert_once(proto, int_port, client, lifetime, now).await;
         if outcome == UpsertOutcome::TableFull && self.evict_candidate(client).await.is_some() {
             // Pool pressure: the first upsert found no slot. Reclaim the
@@ -652,6 +676,21 @@ impl UpnpFacade {
             match handles {
                 Ok(h) => {
                     self.tasks.lock().await.insert(bind_port, h);
+                    // R5: name what the rule steered around, so the decision
+                    // is auditable without a packet capture.
+                    let steered = {
+                        let t = self.table.lock().await;
+                        t.avoid_steering(bind_port)
+                    };
+                    if !steered.is_empty() {
+                        self.publisher.log_transition(
+                            "collision-avoided",
+                            &format!(
+                                "slot {} steered around the live tuple(s) {:?}",
+                                bind_port, steered
+                            ),
+                        );
+                    }
                 }
                 Err(e) => {
                     // bind failed: roll back nft + table

@@ -38,7 +38,10 @@ pub enum CdcKind {
     Aya,
 }
 
-pub trait Cdc: Send {
+/// The backends are used behind an `Arc` inside a spawned task, and the
+/// engine now reads the lease table across an await while it holds one, so
+/// the trait carries both bounds the runtime needs.
+pub trait Cdc: Send + Sync {
     /// Live candidates this tick. Cheap by contract: capped at the rescue
     /// budget, no blocking beyond a kernel table read, 2 s cadence.
     fn tick(&mut self) -> Vec<Candidate>;

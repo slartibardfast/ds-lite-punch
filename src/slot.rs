@@ -176,6 +176,12 @@ pub struct LeaseTable {
     allocator: PortAllocator,
     max_slots: usize,
     max_maps_per_client: u16,
+    /// Ports a live flow already holds: the punch collision rule (call/0027).
+    /// A tuple the change-data-capture shows live belongs to whoever punched
+    /// it, so the allocator MUST NOT put a slot on it. Sorted and unique, and
+    /// replaced on every refresh rather than accumulated, so a tuple that
+    /// goes quiet stops reserving its port.
+    avoid: Vec<u16>,
 }
 
 impl LeaseTable {
@@ -185,6 +191,7 @@ impl LeaseTable {
             allocator,
             max_slots,
             max_maps_per_client,
+            avoid: Vec::new(),
         }
     }
 
@@ -202,13 +209,51 @@ impl LeaseTable {
 
     /// First free port in [lo,hi] scanning live slots directly — no
     /// intermediate collection, so Kani only sees iteration over arrays.
+    /// The first bind port neither this table nor a live punch holds: the
+    /// allocation's probe before it claims (call/0027 R3). A port a live flow
+    /// already uses is not available, because the AFTR keys its mapping on
+    /// the inner tuple and two local owners of one tuple share one inbound
+    /// path.
     fn find_free_bind_port(&self) -> Option<u16> {
         for port in self.allocator.lo..=self.allocator.hi {
+            if self.avoid.contains(&port) {
+                continue;
+            }
             if !self.slots.iter().any(|s| s.bind_port == port) {
                 return Some(port);
             }
         }
         None
+    }
+
+    /// Replace the live-tuple reservation. Callers pass the ports of the
+    /// post-NAT tuples the change-data-capture currently shows, which is the
+    /// same liveness the observation arm reads, so both mechanisms cannot
+    /// disagree about what is in use (call/0027 R2/R3).
+    pub fn avoid_ports(&mut self, live: &[u16]) {
+        self.avoid = live
+            .iter()
+            .copied()
+            .filter(|p| self.allocator.contains(*p))
+            .collect();
+        self.avoid.sort_unstable();
+        self.avoid.dedup();
+    }
+
+    /// What the rule is currently steering around, for the log (R5).
+    pub fn reserved_ports(&self) -> Vec<u16> {
+        self.avoid.clone()
+    }
+
+    /// The ports the probe skipped on the way to `chosen`: live tuples below
+    /// the port it took, which are the ones the rule actually decided. Empty
+    /// means the choice was free and no collision was in play.
+    pub fn avoid_steering(&self, chosen: u16) -> Vec<u16> {
+        self.avoid
+            .iter()
+            .copied()
+            .filter(|p| *p < chosen && !self.slots.iter().any(|s| s.bind_port == *p))
+            .collect()
     }
 
     // -- indices --
@@ -877,6 +922,95 @@ mod tests {
         let r2 = e.epoch_at(1_800_000_010);
         assert!(r1 < r2, "restart must reset epoch below the continuous one");
     }
+
+    // ---- the punch collision rules (call/0027) ----
+
+    fn candidate(ip: &str, port: u16) -> (Ipv4Addr, u16) {
+        (ip.parse().unwrap(), port)
+    }
+
+    #[test]
+    fn a_live_punch_reserves_its_port_from_allocation() {
+        // R2/R3: the incumbent keeps the tuple, and the allocator probes
+        // before it claims. Slot 30000 is live from a punch nobody allocated,
+        // so a fresh grant takes the next free port instead of sharing a
+        // tuple the AFTR would then key as one mapping.
+        let mut t = table();
+        t.avoid_ports(&[30000]);
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        let g = t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        assert_eq!(g, UpsertOutcome::Granted { bind_port: 30001 });
+        // and the choice is reportable: the ports the rule steered around,
+        // below the one it took
+        assert_eq!(t.avoid_steering(30001), vec![30000]);
+    }
+
+    #[test]
+    fn a_renewal_keeps_its_port_even_when_the_probe_would_avoid_it() {
+        // R4's neighbour: a refresh allocates nothing. The slot's own punch
+        // puts its tuple in the live set, so a renewal must not read that
+        // set as a reason to move.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        assert_eq!(
+            t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478),
+            UpsertOutcome::Granted { bind_port: 30000 }
+        );
+        t.avoid_ports(&[30000]);
+        assert_eq!(
+            t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW + 30, c, 3478),
+            UpsertOutcome::Refreshed { bind_port: 30000 },
+            "a renewal holds the port it already has"
+        );
+    }
+
+    #[test]
+    fn the_reservation_follows_the_live_set_and_is_not_a_leak() {
+        // The set is replaced, never accumulated: a tuple that goes quiet
+        // stops being reserved, so a port cannot be lost to a flow that is
+        // gone. (One refresh, one set.)
+        let mut t = table();
+        t.avoid_ports(&[30000]);
+        t.avoid_ports(&[]);
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        assert_eq!(
+            t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478),
+            UpsertOutcome::Granted { bind_port: 30000 },
+            "nothing is live now, so the lowest port is free again"
+        );
+    }
+
+    #[test]
+    fn steering_ignores_what_the_range_cannot_allocate() {
+        // A live tuple outside the slot range costs nothing and is not
+        // reported as a decision: the allocator never considered it.
+        let mut t = table();
+        t.avoid_ports(&[12345, 30002]);
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        let g = t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        assert_eq!(g, UpsertOutcome::Granted { bind_port: 30000 });
+        assert!(t.avoid_steering(30000).is_empty(), "nothing was skipped");
+        // with the low ports live, the third port is the first free one and
+        // the two it skipped are named
+        let mut t = table();
+        t.avoid_ports(&[30000, 30001]);
+        assert_eq!(
+            t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478),
+            UpsertOutcome::Granted { bind_port: 30002 }
+        );
+        assert_eq!(t.avoid_steering(30002), vec![30000, 30001]);
+    }
+
+    #[test]
+    fn a_client_outside_the_allowlist_is_not_a_collision() {
+        // R7 stated as a test: the probe knows tuples, not identities. A
+        // live tuple is reserved whatever its origin, and its owner is not
+        // thereby admitted to anything.
+        let mut t = table();
+        t.avoid_ports(&[candidate("192.168.21.59", 30000).1]);
+        assert_eq!(t.avoid_steering(30001), vec![30000]);
+        assert_eq!(t.reserved_ports(), vec![30000]);
+    }
 }
 
 /// Kani proofs: lease-table invariants and exact-inverse/edge arithmetic.
@@ -1073,4 +1207,5 @@ mod verify {
         assert_eq!(l.is_expired(now), now >= exp, "expiry is exactly now>=expiry");
         assert!(!Lease::Static.is_expired(now), "static never expires");
     }
+
 }
