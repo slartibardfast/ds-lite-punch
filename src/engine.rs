@@ -190,6 +190,11 @@ pub struct ObservationEngine {
     probe_cursor: usize,
     /// The per-device hold cap.
     per_host: u32,
+    /// Candidates not yet held, with the device's last packet count and how
+    /// many ticks it has been quiet. A flow is claimed when it has been quiet
+    /// long enough to need us, which is what keeps a device's capacity for
+    /// the mappings that matter.
+    young: std::collections::HashMap<(Ipv4Addr, u16), (u64, u32)>,
 }
 
 impl ObservationEngine {
@@ -220,6 +225,7 @@ impl ObservationEngine {
             ticks: 0,
             probe_cursor: 0,
             per_host: 4,
+            young: std::collections::HashMap::new(),
         }
     }
 
@@ -309,6 +315,15 @@ impl ObservationEngine {
         for c in &live {
             if self.slots.iter().any(|s| s.bind_tuple == c.bind_tuple) {
                 continue; // already rescued
+            }
+            let (_, quiet) = self
+                .young
+                .get(&c.bind_tuple)
+                .copied()
+                .unwrap_or((c.host_port as u64, 0));
+            if quiet < HOLD_AFTER_TICKS {
+                // the device is still refreshing this flow: it needs nothing
+                continue;
             }
             if !host_budget_ok(c.host, &self.slots, self.per_host) {
                 // one device's churn cannot spend another device's capacity
@@ -412,6 +427,29 @@ impl ObservationEngine {
         // its origin, so it cannot be mistaken for the device's), and a peer
         // probe is what the shadow timestamps as inbound.
         self.ticks += 1;
+        // Age the young: a candidate's own device packets reset its quiet
+        // count, so only a flow the device has stopped refreshing becomes a
+        // hold candidate.
+        if !live.is_empty() {
+            let proc_text = std::fs::read_to_string("/proc/net/nf_conntrack").ok();
+            for c in live.iter() {
+                let pkts = proc_text
+                    .as_deref()
+                    .map(|t| device_packets(t, c.bind_tuple, c.host))
+                    .unwrap_or(0);
+                let e = self.young.entry(c.bind_tuple).or_insert((pkts, 0));
+                if pkts > e.0 {
+                    e.0 = pkts;
+                    e.1 = 0;
+                } else {
+                    let (last, quiet) = (e.0, e.1);
+                    *e = (last.max(pkts), quiet.saturating_add(1));
+                }
+            }
+            let live_set: std::collections::HashSet<(Ipv4Addr, u16)> =
+                live.iter().map(|c| c.bind_tuple).collect();
+            self.young.retain(|t, _| live_set.contains(t));
+        }
         if !self.slots.is_empty() {
             let proc_text = std::fs::read_to_string("/proc/net/nf_conntrack").ok();
             for s in self.slots.iter_mut() {
@@ -468,16 +506,14 @@ impl ObservationEngine {
                 let s = &self.slots[i];
                 (s.quiet_ticks, s.dev_misses)
             };
-            let mut reason = exit_due(missing, self.grace_ticks, since_inbound, held_now);
-            if reason.is_none() && misses >= DEV_MISSES_TO_RELEASE {
-                // the device is not on the LAN any more: nothing it owns can
-                // be waiting for this mapping
-                reason = Some(ExitReason::DeviceGone);
-            }
-            if reason.is_none() && quiet >= LONG_QUIET_TICKS {
-                // both sides silent for a minute: the flow is nobody's
-                reason = Some(ExitReason::Stale);
-            }
+            let reason = release_reason(
+                held_now,
+                misses,
+                quiet,
+                missing,
+                since_inbound,
+                LONG_QUIET_TICKS,
+            );
             if let Some(r) = reason {
                 stop.store(true, Ordering::Relaxed);
                 let gone = self.slots.swap_remove(i);
@@ -513,10 +549,17 @@ fn observe_report(
     }
 }
 
-/// A hold with neither the device nor a peer touching it for this many ticks
-/// is released: sixty seconds of total silence is a flow nobody is using,
-/// and the mapping is gone long before that either way.
-const LONG_QUIET_TICKS: u32 = 30;
+/// A candidate is claimed only once its device has been quiet this long: a
+/// flow the device is refreshing needs nothing from us, and claiming it would
+/// spend the device's own capacity on churn (call/0029). Five to ten seconds
+/// is well inside the uplink's measured reaping window, so the hold starts
+/// before the mapping can lapse.
+const HOLD_AFTER_TICKS: u32 = 3;
+/// A hold is released when both sides have left it alone this long. Generous
+/// on purpose: a lobby is silence, and silence is what the hold is for, so
+/// this is a backstop behind the device-presence probe rather than a
+/// liveness rule.
+const LONG_QUIET_TICKS: u32 = 150;
 /// Consecutive failed LAN probes before a hold is released as abandoned.
 const DEV_MISSES_TO_RELEASE: u8 = 3;
 /// Probe one slot's device every this many ticks, so the tick never blocks
@@ -570,6 +613,32 @@ fn neigh_answers(listing: &str) -> bool {
         return false;
     }
     true
+}
+
+/// The one place a hold's end is decided. A hold yields to a slot, ends when
+/// its device stops answering on the LAN, and otherwise ends only when both
+/// sides have left the tuple alone for the long window: going quiet is what a
+/// hold is for, so quiet is never by itself a reason to release one
+/// (call/0029). Pure, so the policy is testable without a clock.
+fn release_reason(
+    held_now: bool,
+    misses: u8,
+    quiet: u32,
+    missing: u32,
+    since_inbound: u32,
+    long_quiet: u32,
+) -> Option<ExitReason> {
+    if held_now {
+        return Some(ExitReason::HeldBySlot);
+    }
+    if misses >= DEV_MISSES_TO_RELEASE {
+        return Some(ExitReason::DeviceGone);
+    }
+    match exit_due(missing, long_quiet, since_inbound, false) {
+        Some(r) => Some(r),
+        None if quiet >= long_quiet => Some(ExitReason::Stale),
+        None => None,
+    }
 }
 
 /// The device's own packet count for a tuple: the connection table's entries
@@ -719,6 +788,16 @@ mod tests {
         fn unaccept(&self, _r: u16) {}
     }
 
+    /// Tick until a candidate has been quiet long enough to be held: the arm
+    /// holds what a device has stopped refreshing, so a fresh flow needs a
+    /// few ticks before it is old enough, and a flow the device keeps
+    /// refreshing is never claimed at all.
+    async fn age(e: &mut ObservationEngine, ticks: usize) {
+        for _ in 0..ticks {
+            e.tick().await;
+        }
+    }
+
     fn cand(bind: (Ipv4Addr, u16), host: Ipv4Addr, hp: u16) -> crate::cdc::Candidate {
         crate::cdc::Candidate {
             bind_tuple: bind,
@@ -751,9 +830,9 @@ mod tests {
         // the test's runtime, and cargo runs tests in parallel
         let c = cand((LO, 54322), HOST, 54322);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), Vec::new(), 8, 3);
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1);
-        e.tick().await; // same candidate again: no duplicate claim
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await; // same candidate again: no duplicate claim
         assert_eq!(e.slots.len(), 1);
         assert_eq!(e.slots[0].missing_ticks, 0);
     }
@@ -763,7 +842,7 @@ mod tests {
         let c1 = cand((LO, 54324), HOST, 54324);
         let c2 = cand((LO, 54325), HOST, 54325);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c1, c2] }), Vec::new(), 1, 3);
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "budget 1 blocks the second claim");
     }
 
@@ -771,19 +850,34 @@ mod tests {
     async fn held_candidate_not_claimed() {
         let c = cand((LO, 54326), HOST, 54326);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), vec![(LO, 54326)], 8, 3);
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "I1: held tuple never claimed");
     }
 
     #[tokio::test]
-    async fn stale_flow_exits_after_grace() {
-        let c = cand((LO, 54327), HOST, 54327);
-        let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), Vec::new(), 8, 1);
-        e.tick().await; // claim
-        assert_eq!(e.slots.len(), 1);
-        e.cdc = Box::new(FakeCdc { cands: vec![] });
-        e.tick().await; // entry gone; no inbound ever -> stale past grace
-        assert!(e.slots.is_empty(), "G5: stale flow exits");
+    async fn a_quiet_hold_is_kept_not_released() {
+        // The rule this milestone changed: an entry gone from the change data
+        // capture with no inbound is what a lobby looks like, and it is the
+        // state a hold exists to survive. The old rule released on exactly
+        // those two counters.
+        let h = HOST;
+        let mut e = engine(
+            Box::new(FakeCdc { cands: vec![cand((LO, 54360), h, 54360)] }),
+            Vec::new(),
+            8,
+            3,
+        );
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        assert_eq!(e.slots.len(), 1, "the flow is held");
+        {
+            let s = &mut e.slots[0];
+            s.missing_ticks = 99;
+            s.ticks_since_inbound = 99;
+            s.quiet_ticks = 4;
+            s.dev_misses = 0;
+        }
+        e.tick().await;
+        assert_eq!(e.slots.len(), 1, "quiet is what the hold is for");
     }
 
     // ---- the allowlist and the hold (call/0025, plan/0009 #snoop) ----
@@ -803,7 +897,7 @@ mod tests {
         }), Vec::new(), 8, 3);
         e.allow = vec![named];
         e.hold = true;
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "only the named device's flow is held");
         assert_eq!(e.slots[0].host, named);
     }
@@ -819,7 +913,7 @@ mod tests {
         }), Vec::new(), 8, 3);
         e.allow = vec![named];
         e.hold = false;
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "log-only: nothing claimed");
         assert!(e.reported.contains(&(LO, 54342)), "but it is reported");
         // a device outside the list is not even reported
@@ -850,6 +944,33 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_hold_is_kept_and_a_gone_device_is_not() {
+        // Quiet is what a hold is for: neither the device nor a peer touching
+        // the tuple is the normal case for a lobby, and it must not end the
+        // hold. Only the device's disappearance, a slot's claim, or the long
+        // backstop does.
+        let long = 150;
+        assert_eq!(release_reason(false, 0, 5, 9, 9, long), None, "quiet is kept");
+        assert_eq!(
+            release_reason(false, 3, 1, 1, 1, long),
+            Some(ExitReason::DeviceGone),
+            "an absent device releases its holds"
+        );
+        assert_eq!(
+            release_reason(true, 0, 9, 9, 9, long),
+            Some(ExitReason::HeldBySlot),
+            "a slot's claim takes the tuple"
+        );
+        assert_eq!(
+            release_reason(false, 0, long, long, long, long),
+            Some(ExitReason::Stale),
+            "both sides silent for the long window is the backstop"
+        );
+        // and the short grace of the old rule no longer ends anything
+        assert_eq!(release_reason(false, 0, 3, 3, 3, long), None);
+    }
+
+    #[test]
     fn the_neighbour_table_is_the_presence_signal() {
         // Measured shapes from the router: the Switch present with a MAC and
         // dropping ICMP, the PS3 absent and answering no ARP at all.
@@ -873,7 +994,7 @@ mod tests {
             3,
         );
         e.per_host = 1;
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "a lone flow from a named device is held");
         // a second flow from the same device is refused by that device's own
         // cap, which is the point: the churn cannot spend another's capacity
@@ -886,7 +1007,7 @@ mod tests {
             3,
         );
         e2.per_host = 1;
-        e2.tick().await;
+        age(&mut e2, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e2.slots.len(), 1, "one device's churn spends its own budget");
         // another device still has its own capacity
         let mut e3 = engine(
@@ -898,7 +1019,7 @@ mod tests {
             3,
         );
         e3.per_host = 1;
-        e3.tick().await;
+        age(&mut e3, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e3.slots.len(), 2, "each device has its own capacity");
     }
 
@@ -943,7 +1064,7 @@ mod tests {
         );
         e.alloc = Some(Arc::new(Mutex::new(t)));
         e.bind_ip = LO;
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "an allocation's tuple is not this arm's");
     }
 
@@ -951,10 +1072,10 @@ mod tests {
     async fn slot_claimed_by_holder_exits() {
         let c = cand((LO, 54328), HOST, 54328);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), Vec::new(), 8, 3);
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1);
         e.held.push((LO, 54328)); // a static/lease slot claims the tuple
-        e.tick().await;
+        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "I1: engine exits once a slot holds the tuple");
     }
 }
