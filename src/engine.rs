@@ -265,21 +265,17 @@ impl ObservationEngine {
             if live.iter().any(|c| c.bind_tuple == s.bind_tuple) {
                 s.last_seen_unix = unix_now();
             }
-            if s.external.is_none() {
-                if let Some(t) = *s.external_arc.lock().await {
-                    s.external = Some(t);
-                    // The decision the flow's own vote made, reported beside
-                    // the tuple it learned, so the log and the client's view
-                    // cannot disagree about what happened.
-                    let decision = s.vote.lock().await.observe(0, t);
-                    self.publisher.log_transition(
-                        "observed-tuple",
-                        &format!(
-                            "{}:{} -> {}:{} ({:?})",
-                            s.host, s.host_port, t.0, t.1, decision
-                        ),
-                    );
-                }
+            let seen = *s.external_arc.lock().await;
+            if let Some(t) = observe_report(s.external, seen) {
+                s.external = Some(t);
+                // The decision the flow's own vote made, reported beside the
+                // tuple it learned, so the log and the client's view cannot
+                // disagree about what happened.
+                let decision = s.vote.lock().await.observe(0, t);
+                self.publisher.log_transition(
+                    "observed-tuple",
+                    &format!("{}:{} -> {}:{} ({:?})", s.host, s.host_port, t.0, t.1, decision),
+                );
             }
         }
 
@@ -397,6 +393,20 @@ impl ObservationEngine {
             }
             i += 1;
         }
+    }
+}
+
+/// Whether a flow's observation is worth reporting, and with which tuple:
+/// the first look, or a tuple that has moved since the last one. The daemon
+/// reports the tuple as often as it changes, so a re-key appears in the log
+/// beside its decision rather than being invisible (#snoop, call/0027 R5).
+fn observe_report(
+    prev: Option<(Ipv4Addr, u16)>,
+    now: Option<(Ipv4Addr, u16)>,
+) -> Option<(Ipv4Addr, u16)> {
+    match now {
+        Some(t) if prev != Some(t) => Some(t),
+        _ => None,
     }
 }
 
@@ -629,6 +639,21 @@ mod tests {
         assert!(e.reported.contains(&(LO, 54342)), "but it is reported");
         // a device outside the list is not even reported
         assert!(!e.reported.contains(&(LO, 54343)));
+    }
+
+    #[test]
+    fn a_report_is_per_observation_not_once_per_flow() {
+        // #snoop wants the learned tuple, the last-seen stamp and the
+        // decision per observation, so the log carries a flow's tuple
+        // history rather than only its first value. A re-key is the case
+        // that matters: the AFTR can move the tuple under a held flow, and a
+        // change that is not reported is what call/0027 R5 forbids.
+        let a = ("203.0.113.1".parse().unwrap(), 40001);
+        let b = ("203.0.113.1".parse().unwrap(), 40002);
+        assert_eq!(observe_report(None, Some(a)), Some(a), "the first look is reported");
+        assert_eq!(observe_report(Some(a), Some(a)), None, "unchanged is not an event");
+        assert_eq!(observe_report(Some(a), Some(b)), Some(b), "a re-key is reported");
+        assert_eq!(observe_report(Some(a), None), None, "silence reports nothing");
     }
 
     #[tokio::test]
