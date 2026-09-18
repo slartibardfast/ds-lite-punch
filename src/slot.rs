@@ -260,7 +260,17 @@ impl LeaseTable {
             if nat != ctx.vm_nat || !ctx.is_brlan(e.orig_src) {
                 continue;
             }
-            if self.slots.iter().any(|s| s.bind_port == port) && !out.contains(&port) {
+            // A static is the operator's configuration (call/0030), so a
+            // device's flow on a static's port is reported and the port is
+            // left where the config put it: moving it would diverge the
+            // running state from the config that produced it. A granted
+            // lease is the daemon's, and R4 yields it.
+            if self
+                .slots
+                .iter()
+                .any(|s| s.bind_port == port && !s.is_static())
+                && !out.contains(&port)
+            {
                 out.push(port);
             }
         }
@@ -1091,6 +1101,26 @@ mod tests {
         );
         let text = device_flow("192.168.21.68", 30000);
         assert_eq!(t.collided(&text), vec![30000]);
+    }
+
+    #[test]
+    fn a_static_is_the_operators_and_is_never_the_slot_that_moves() {
+        // call/0030: a static mapping is the operator's configuration, and
+        // the same rule that releases a console's mapping leaves the
+        // configured relay alone. A device's flow that lands on a static's
+        // port is still a collision, and the log is where it becomes
+        // visible, but the port is not the daemon's to take: yielding it
+        // would put the operator's own relay on a port they never chose, and
+        // the running state would diverge from the config that produced it.
+        let mut t = table();
+        assert!(t
+            .insert_static(30002, Ipv4Addr::new(192, 168, 21, 12), 40000)
+            .is_ok());
+        let text = device_flow("192.168.21.68", 30002);
+        assert!(
+            t.collided(&text).is_empty(),
+            "a static's port is the operator's, not a lease the yield may move"
+        );
     }
 
     #[test]
