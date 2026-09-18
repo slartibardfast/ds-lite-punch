@@ -110,11 +110,23 @@ pub trait PinOps: Send + Sync {
 pub struct NftPins;
 
 impl PinOps for NftPins {
-    fn add(&self, host: Ipv4Addr, host_port: u16, r: u16) -> std::io::Result<()> {
-        nft::add_pin(host, host_port, r)
+    /// Pin the shadow's own egress, never the device's key. The shadow binds
+    /// the device's tuple, so what it needs is for its own keepalives to
+    /// leave as that tuple: a pin on the *device's* (client, port) key would
+    /// instead drag the device's own traffic onto our port, and a console
+    /// whose game flows then egress on two different external tuples is
+    /// scored Strict or Moderate. call/0014 settled this, and the port a
+    /// device keeps by preservation is the tuple the shadow mirrors.
+    fn add(&self, _host: Ipv4Addr, _host_port: u16, r: u16) -> std::io::Result<()> {
+        nft::add_pin(nft::NAT_ADDR, r, r)
     }
+    /// Only ever a self-pin. A device-key element is not ours to remove with
+    /// the tuple gone; those are cleaned once by hand when the arm stops
+    /// installing them.
     fn del(&self, host: Ipv4Addr, host_port: u16) {
-        let _ = nft::del_pin(host, host_port);
+        if host == nft::NAT_ADDR {
+            let _ = nft::del_pin(host, host_port);
+        }
     }
     fn accept(&self, r: u16) -> std::io::Result<()> {
         nft::add_input_accept(r, false)
