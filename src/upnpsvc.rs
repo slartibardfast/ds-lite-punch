@@ -1694,6 +1694,41 @@ impl UpnpFacade {
     /// runs first, so the slot moves to a port nothing live holds; the label
     /// the client asked for does not change (call/0022); and the substitution
     /// is reported (R5).
+    /// Release the mappings whose client has left the LAN. The statics are
+    /// the operator's configuration and are never touched here; a client's
+    /// own request is a promise to a device, and a device that is gone has
+    /// nothing to be promised.
+    async fn reap_absent_clients(&self, misses: &mut std::collections::HashMap<u16, u8>) {
+        let entries: Vec<(u16, Ipv4Addr, Proto, Ipv4Addr, u16)> = {
+            let es = self.entries.lock().await;
+            es.iter()
+                .map(|e| (e.bind_port, e.owner, e.proto, e.client, e.req_ext))
+                .collect()
+        };
+        let live: std::collections::HashSet<u16> = entries.iter().map(|e| e.0).collect();
+        misses.retain(|p, _| live.contains(p));
+        for (bind_port, owner, proto, client, req_ext) in entries {
+            if crate::presence::device_up(client) {
+                misses.remove(&bind_port);
+                continue;
+            }
+            let n = misses.entry(bind_port).or_insert(0);
+            *n = n.saturating_add(1);
+            if !crate::presence::release_absent(false, *n) {
+                continue;
+            }
+            misses.remove(&bind_port);
+            self.publisher.log_transition(
+                "mapping-released",
+                &format!(
+                    "{}:{} asked for {} and is no longer on the LAN; its mapping goes",
+                    client, req_ext, req_ext
+                ),
+            );
+            let _ = self.delete_mapping(req_ext, proto, owner, None).await;
+        }
+    }
+
     async fn yield_collided_slots(&self) {
         let Ok(text) = std::fs::read_to_string("/proc/net/nf_conntrack") else {
             return;
@@ -1788,6 +1823,10 @@ impl UpnpFacade {
 
     async fn gc_loop(&self) {
         let grace = self.cfg.grace_secs;
+        // Consecutive presence misses per slot, loop-local: this is the
+        // loop's own memory of a device that stopped answering, not state
+        // worth persisting.
+        let mut misses: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
         // R4 before anything is reaped: a slot sharing a tuple with a
         // device's flow moves, so the reap decisions below act on ports the
         // table actually holds.
@@ -1807,9 +1846,15 @@ impl UpnpFacade {
             self.tear_down_ports(&pre, &freed).await;
             emiteln!("upnp: gc freed expired slots {:?}", freed);
         }
-        // lease-policy backstop: reap UDP grants whose client went silent
-        // past LEASE_BACKSTOP_S, whatever the pool state (the pressure
-        // path handles the shorter grace under TableFull).
+        // A client-requested mapping ends when its client is no longer on
+        // the LAN (presence.rs) and never for the client being quiet: a
+        // lobby and a paused game are quiet, and the mapping is what must
+        // survive them. This supersedes the silence backstop that used to
+        // reap here, which reaped exactly the mappings a console needs when
+        // it sits still.
+        self.reap_absent_clients(&mut misses).await;
+        // lease-policy backstop, kept for the pool-state case only: the
+        // pressure path handles the shorter grace under TableFull.
         let now = Epoch::now();
         let pre: Vec<Slot> = {
             let t = self.table.lock().await;

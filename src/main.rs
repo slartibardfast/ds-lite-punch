@@ -16,6 +16,7 @@ mod mapping;
 mod nft;
 mod obs;
 mod pcp;
+mod presence;
 mod persist;
 mod publish;
 mod slot;
