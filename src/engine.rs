@@ -244,6 +244,9 @@ impl ObservationEngine {
             self.report_only(&live);
             return;
         }
+        // The report set follows the live set in either mode, so a tuple that
+        // is long gone cannot keep its place in it.
+        self.reported.retain(|t| live.iter().any(|c| c.bind_tuple == *t));
 
         // Per-slot bookkeeping: an entry reported by the CDC resets its miss
         // counter; a task inbound (counter change) resets inbound silence.
@@ -285,6 +288,19 @@ impl ObservationEngine {
                 continue; // already rescued
             }
             if !claim_allowed(c.bind_tuple, &held, self.slots.len(), self.max_rescues) {
+                // R5: a tuple a slot holds is refused rather than captured,
+                // and the refusal is reported. A device's flow on a slot's
+                // tuple is the late collision (call/0028), and the log is
+                // where it becomes visible; the device keeps the inbound.
+                if held.contains(&c.bind_tuple) && self.reported.insert(c.bind_tuple) {
+                    self.publisher.log_transition(
+                        "collision-reported",
+                        &format!(
+                            "{}:{} shares tuple {} with a slot that holds it",
+                            c.host, c.host_port, c.bind_tuple.1
+                        ),
+                    );
+                }
                 continue;
             }
             let bind = SocketAddr::V4(SocketAddrV4::new(c.bind_tuple.0, c.bind_tuple.1));

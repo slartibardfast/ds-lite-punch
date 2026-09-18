@@ -1688,8 +1688,110 @@ impl UpnpFacade {
 
     // ---- local GC (facade-owned teardown) ----
 
+    // ---- R4: the late collision (call/0027, call/0028) ----
+
+    /// A lease whose bind port a device's flow has taken yields it. The probe
+    /// runs first, so the slot moves to a port nothing live holds; the label
+    /// the client asked for does not change (call/0022); and the substitution
+    /// is reported (R5).
+    async fn yield_collided_slots(&self) {
+        let Ok(text) = std::fs::read_to_string("/proc/net/nf_conntrack") else {
+            return;
+        };
+        if let Ok(live) = nft::list_flow_obs() {
+            let ports: Vec<u16> = live.iter().map(|(_, r)| *r).collect();
+            let mut t = self.table.lock().await;
+            t.avoid_ports(&ports);
+        }
+        let collided = {
+            let t = self.table.lock().await;
+            t.collided(&text)
+        };
+        for old in collided {
+            self.yield_port(old).await;
+        }
+    }
+
+    /// Move one lease off a port a device's flow holds. The new datapath goes
+    /// up first and the old one comes down only once it is up, so a move that
+    /// cannot be completed leaves the slot working where it was. Nothing is
+    /// signalled: the count does not change and the reported port is the
+    /// client's label, so an event would invent a change it cannot see
+    /// (call/0025). A PCP client learns the new assigned tuple on its next
+    /// renewal, which is what the protocol is for.
+    async fn yield_port(&self, old: u16) {
+        let entry = {
+            let es = self.entries.lock().await;
+            es.iter().find(|e| e.bind_port == old).cloned()
+        };
+        let Some(e) = entry else {
+            return;
+        };
+        let moved = {
+            let mut t = self.table.lock().await;
+            t.move_bind_port(old)
+        };
+        let Some(new) = moved else {
+            self.publisher.log_transition(
+                "collision-reported",
+                &format!(
+                    "slot {} shares its tuple with a device's flow and the range has nowhere to go",
+                    old
+                ),
+            );
+            return;
+        };
+        let tcp = e.proto == Proto::Tcp;
+        let handles = match e.proto {
+            Proto::Udp => self.spawn_udp_slot(new, e.client, e.int_port).await,
+            Proto::Tcp => self.spawn_tcp_slot(new, e.client, e.int_port).await,
+        };
+        let h = match handles {
+            Ok(h) => h,
+            Err(err) => {
+                let mut t = self.table.lock().await;
+                t.restore_bind_port(new, old);
+                self.publisher.log_transition(
+                    "collision-reported",
+                    &format!(
+                        "slot {} could not move to {}: {}; it keeps the port it had",
+                        old, new, err
+                    ),
+                );
+                return;
+            }
+        };
+        let _ = nft::grant_datapath(e.client, e.int_port, new, tcp);
+        self.tasks.lock().await.insert(new, h);
+        let _ = nft::revoke_datapath(e.client, e.int_port, old, tcp);
+        if let Some(prev) = self.tasks.lock().await.remove(&old) {
+            for jh in prev {
+                jh.abort();
+            }
+        }
+        self.publisher.remove_slot(old);
+        {
+            let mut es = self.entries.lock().await;
+            if let Some(x) = es.iter_mut().find(|x| x.bind_port == old) {
+                x.bind_port = new;
+            }
+        }
+        self.publisher.log_transition(
+            "collision-yield",
+            &format!(
+                "slot {} yielded to a device's flow and moved to {} (label {} kept)",
+                old, new, e.req_ext
+            ),
+        );
+        self.persist().await;
+    }
+
     async fn gc_loop(&self) {
         let grace = self.cfg.grace_secs;
+        // R4 before anything is reaped: a slot sharing a tuple with a
+        // device's flow moves, so the reap decisions below act on ports the
+        // table actually holds.
+        self.yield_collided_slots().await;
         // expiry-GC for finite leases (the appearing-infinite grants never
         // trip this; their lifecycle belongs to the lease policy below)
         let now = Epoch::now();

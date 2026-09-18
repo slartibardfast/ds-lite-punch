@@ -240,6 +240,61 @@ impl LeaseTable {
         self.avoid.dedup();
     }
 
+    /// The bind ports a device's flow has taken: call/0028's signature, a
+    /// connection entry whose NAT side is one of our tuples while its origin
+    /// is a br-lan host. The slot's own punch egresses from the NAT address
+    /// and an outside peer's datagram carries the peer's source, so neither
+    /// reads as a collision; a device's flow does, because that flow is the
+    /// incumbent (call/0027 R2) and the port is not ours to take back.
+    ///
+    /// The addresses are the daemon's constants, the same ones the
+    /// observation arm's predicate uses, so both mechanisms read one world.
+    pub fn collided(&self, proc_text: &str) -> Vec<u16> {
+        let ctx = crate::obs::brlan_ctx();
+        let mut out: Vec<u16> = Vec::new();
+        for line in proc_text.lines() {
+            let Some(e) = crate::obs::parse_line(line) else {
+                continue;
+            };
+            let (nat, port) = e.nat_src();
+            if nat != ctx.vm_nat || !ctx.is_brlan(e.orig_src) {
+                continue;
+            }
+            if self.slots.iter().any(|s| s.bind_port == port) && !out.contains(&port) {
+                out.push(port);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// R4: yield a port a device's flow has taken. The slot keeps its client,
+    /// its internal port and the label the client asked for; it takes a port
+    /// the probe leaves free, and the caller re-establishes the datapath on
+    /// the new one and reports the substitution (R5). `None` means the range
+    /// had nowhere to go, and the slot keeps what it has.
+    pub fn move_bind_port(&mut self, old: u16) -> Option<u16> {
+        let idx = self.slots.iter().position(|s| s.bind_port == old)?;
+        // the old port's tuple is a device's now, so the probe must not hand
+        // it back to us
+        if !self.avoid.contains(&old) {
+            self.avoid.push(old);
+            self.avoid.sort_unstable();
+        }
+        let new = self.find_free_bind_port()?;
+        self.slots[idx].bind_port = new;
+        Some(new)
+    }
+
+    /// Put a lease back where it was when a move could not be completed. The
+    /// port it came from stays in the probe's view, because a device's flow
+    /// holds it now.
+    pub fn restore_bind_port(&mut self, from: u16, to: u16) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.bind_port == from) {
+            s.bind_port = to;
+        }
+    }
+
     /// What the rule is currently steering around, for the log (R5).
     pub fn reserved_ports(&self) -> Vec<u16> {
         self.avoid.clone()
@@ -1011,6 +1066,106 @@ mod tests {
         assert_eq!(t.avoid_steering(30001), vec![30000]);
         assert_eq!(t.reserved_ports(), vec![30000]);
     }
+
+    // ---- R4: the late collision (call/0027, call/0028) ----
+
+    /// A device's flow on a leased tuple, in the shape the router prints it:
+    /// its pre-NAT origin is the device, and the NAT side is the bind port.
+    fn device_flow(host: &str, sport: u16) -> String {
+        format!(
+            "ipv4     2 udp      17 100 src={} dst=8.8.8.8 sport={} dport=53 packets=1 bytes=92 \
+             src=8.8.8.8 dst=192.168.0.21 sport=53 dport={} packets=1 bytes=60 mark=0 zone=0 use=2",
+            host, sport, sport
+        )
+    }
+
+    #[test]
+    fn a_device_flow_on_a_leased_tuple_is_a_collision() {
+        // The signature call/0028 names: a connection entry whose NAT side is
+        // our bind tuple and whose origin is a device.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        assert_eq!(
+            t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478),
+            UpsertOutcome::Granted { bind_port: 30000 }
+        );
+        let text = device_flow("192.168.21.68", 30000);
+        assert_eq!(t.collided(&text), vec![30000]);
+    }
+
+    #[test]
+    fn the_slots_own_punch_is_not_a_collision() {
+        // A slot's keepalive egresses from (NAT, R) itself: the origin is the
+        // NAT address, not a device, and that is the flow we own.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        let own = "ipv4     2 udp      17 100 src=192.168.0.21 dst=162.159.207.0 sport=30000 dport=3478 packets=41 bytes=1968 src=162.159.207.0 dst=192.168.0.21 sport=3478 dport=30000 packets=41 bytes=2460 [ASSURED] mark=0 zone=0 use=2";
+        assert!(t.collided(own).is_empty(), "our own punch is not a collision");
+    }
+
+    #[test]
+    fn an_outside_peer_on_the_tuple_is_not_a_collision() {
+        // An external prober's datagram reaches the same tuple and must not
+        // make the slot move: the incumbent rule is about a device's flow,
+        // not about who is knocking.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        let peer = "ipv4     2 udp      17 25 src=170.9.238.141 dst=192.168.0.21 sport=39897 dport=30000 packets=1 bytes=37 [UNREPLIED] src=192.168.21.68 dst=170.9.238.141 sport=30000 dport=39897 packets=0 bytes=0 mark=0 zone=0 use=2";
+        assert!(t.collided(peer).is_empty(), "a peer is not a device's flow");
+    }
+
+    #[test]
+    fn a_device_flow_on_an_unleased_port_is_not_ours_to_move() {
+        // R7: a punch nobody allocated is left to its owner, and the table
+        // only speaks for the ports it holds.
+        let t = table();
+        assert!(t.collided(&device_flow("192.168.21.68", 30000)).is_empty());
+    }
+
+    #[test]
+    fn a_yield_takes_a_free_port_and_keeps_the_label() {
+        // R4: the slot moves, the client's label does not, and the lease's
+        // client and internal port are untouched.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        // the colliding tuple is live, so the probe must steer past it
+        t.avoid_ports(&[30000]);
+        assert_eq!(t.move_bind_port(30000), Some(30001));
+        let s = t.by_bind_port(30001).expect("the slot moved");
+        assert_eq!(s.pcp_key(), Some((Proto::Udp, 3478, c)), "key and label intact");
+        // and the old port is free again for the next allocation
+        assert!(t.by_bind_port(30000).is_none());
+    }
+
+    #[test]
+    fn a_failed_yield_can_be_put_back() {
+        // The caller moves the lease first and establishes the datapath after,
+        // so a failure needs the row back where it was: the old port stays in
+        // the probe's view either way, since a device's flow holds it.
+        let mut t = table();
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        assert_eq!(t.move_bind_port(30000), Some(30001));
+        t.restore_bind_port(30001, 30000);
+        assert_eq!(t.by_bind_port(30000).map(|s| s.pcp_key()), Some(Some((Proto::Udp, 3478, c))));
+        assert!(t.reserved_ports().contains(&30000), "the taken port stays avoided");
+    }
+
+    #[test]
+    fn a_yield_with_nowhere_to_go_reports_and_leaves_it() {
+        // The range is a budget: when it is full the slot stays where it is
+        // and says so, which is R5's report rather than a silent failure.
+        let mut t = LeaseTable::new(PortAllocator::new(30000, 30001).unwrap(), 4, 2);
+        let c = Ipv4Addr::new(192, 168, 21, 68);
+        t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
+        t.upsert_pcp(Proto::Udp, 3479, c, 600, NOW, c, 3479);
+        t.avoid_ports(&[30000, 30001]);
+        assert_eq!(t.move_bind_port(30000), None);
+        assert!(t.by_bind_port(30000).is_some(), "it keeps what it has");
+    }
 }
 
 /// Kani proofs: lease-table invariants and exact-inverse/edge arithmetic.
@@ -1207,5 +1362,4 @@ mod verify {
         assert_eq!(l.is_expired(now), now >= exp, "expiry is exactly now>=expiry");
         assert!(!Lease::Static.is_expired(now), "static never expires");
     }
-
 }
