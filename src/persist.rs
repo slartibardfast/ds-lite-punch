@@ -137,6 +137,22 @@ pub fn write_leases(dir: &Path, slots: &[PersistedSlot]) -> std::io::Result<()> 
 /// semantics in the brief treat a malformed row as a bind failure, so the
 /// strictness lives in slot::LeaseTable::restore, not here).
 #[allow(dead_code)] // B8 respawn-restore reader
+/// Atomically replace `upnp.tsv` (tmpfile + rename). The rename is what
+/// makes a record visible, so it happens only when the write did: renaming
+/// unconditionally published an empty tmpfile over a good table when the
+/// state directory was full, which is what a 0-byte `upnp.tsv` and a
+/// long-running daemon were, on the router, 2026-09-18.
+pub fn write_entries(dir: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join("upnp.tsv.tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+    }
+    fs::rename(&tmp, dir.join("upnp.tsv"))
+}
+
 pub fn read_leases(dir: &Path) -> (Vec<PersistedSlot>, usize) {
     let path = dir.join("leases.tsv");
     let text = match fs::read_to_string(&path) {
@@ -203,6 +219,30 @@ pub fn read_leases(dir: &Path) -> (Vec<PersistedSlot>, usize) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_failed_entry_write_cannot_publish_an_empty_record() {
+        // The forced failure is a directory where the tmpfile belongs, so the
+        // create fails and the rename is never reached. The point is the
+        // property, not the errno: the table that was there stays there.
+        let d = tmpdir("entries");
+        fs::create_dir_all(&d).unwrap();
+        let good = d.join("upnp.tsv");
+        fs::write(&good, "3074\t17\t40002\t...\n").unwrap();
+        fs::create_dir_all(d.join("upnp.tsv.tmp")).unwrap();
+        let r = write_entries(&d, "something else\n");
+        assert!(r.is_err(), "the write is reported, not swallowed");
+        assert_eq!(
+            fs::read_to_string(&good).unwrap(),
+            "3074\t17\t40002\t...\n",
+            "the record that was there is untouched"
+        );
+        // and a directory that can be written publishes the new body
+        fs::remove_dir(d.join("upnp.tsv.tmp")).unwrap();
+        write_entries(&d, "fresh\n").unwrap();
+        assert_eq!(fs::read_to_string(&good).unwrap(), "fresh\n");
+        let _ = fs::remove_dir_all(&d);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dslp-test-{}-{}", tag, std::process::id()));

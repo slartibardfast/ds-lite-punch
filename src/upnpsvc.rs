@@ -750,10 +750,9 @@ impl UpnpFacade {
     /// publisher writes. `None` means discovery has not completed, which is
     /// the drop rule: the client's own retransmission brings it back.
     fn external_tuple(&self, bind_port: u16) -> Option<(Ipv4Addr, u16)> {
-        let path = format!("{}/tuple-{}", self.cfg.state_dir, bind_port);
-        let s = std::fs::read_to_string(path).ok()?;
-        let (ip, port) = s.trim().split_once(':')?;
-        Some((ip.parse().ok()?, port.parse().ok()?))
+        // memory first: a state directory that cannot be written must not
+        // turn every PCP MAP into a drop
+        self.publisher.slot_tuple(bind_port)
     }
 
     /// Bind port of a mapping, by the key its dialect addresses it with.
@@ -1876,10 +1875,11 @@ impl UpnpFacade {
             let t = self.table.lock().await;
             t.slots().to_vec()
         };
-        let _ = persist::write_leases(
+        let w = persist::write_leases(
             std::path::Path::new(DEFAULT_DIR),
             &persist::snapshot(&slots, now),
         );
+        self.publisher.note_write("leases.tsv", w);
         // the control-plane index (req_ext key) rides its own file
         let es = self.entries.lock().await;
         let mut out = String::new();
@@ -1887,12 +1887,8 @@ impl UpnpFacade {
             out.push_str(&entry_line(e));
         }
         drop(es);
-        let dir = std::path::Path::new(DEFAULT_DIR);
-        let _ = std::fs::create_dir_all(dir);
-        let tmp = dir.join("upnp.tsv.tmp");
-        let final_path = dir.join("upnp.tsv");
-        let _ = std::fs::write(&tmp, out);
-        let _ = std::fs::rename(&tmp, final_path);
+        let w = persist::write_entries(std::path::Path::new(DEFAULT_DIR), &out);
+        self.publisher.note_write("upnp.tsv", w);
     }
 }
 
