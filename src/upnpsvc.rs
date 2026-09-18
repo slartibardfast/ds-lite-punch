@@ -33,6 +33,7 @@ use crate::tcpslot;
 use crate::upnp;
 use crate::upnp::*;
 use crate::vote::VoteState;
+use crate::publish::{emiteln, emitln};
 
 /// Concurrency cap for the HTTP service (E8: bounded connections).
 const HTTP_CONN_CAP: usize = 16;
@@ -325,7 +326,7 @@ impl UpnpFacade {
         let f = facade.clone();
         tokio::spawn(async move {
             if let Err(e) = http_loop(f).await {
-                eprintln!("upnp: http service stopped: {}", e);
+                emiteln!("upnp: http service stopped: {}", e);
             }
         });
 
@@ -362,7 +363,7 @@ impl UpnpFacade {
                     self.tasks.lock().await.insert(e.bind_port, h);
                 }
                 Err(err) => {
-                    eprintln!(
+                    emiteln!(
                         "upnp: restore slot {}:{:?} bind failed: {}",
                         e.bind_port, e.proto, err
                     );
@@ -449,7 +450,7 @@ impl UpnpFacade {
                 DiscoveryAction::ReplyV2(t) => {
                     // an explicit IGD:2 search inside a pending burst flips
                     // the deferred ssdp:all response to v2 (R6)
-                    if let Some(tx) = self.bursts.lock().unwrap().get(&key) {
+                    if let Some(tx) = crate::publish::lock_or_recover(&self.bursts).get(&key) {
                         let _ = tx.send(true);
                     }
                     self.send_discovery(t, src, mx, DOC_V2).await;
@@ -492,14 +493,14 @@ impl UpnpFacade {
     /// same control point coalesce onto the existing burst.
     async fn defer_all(&self, key: (Ipv4Addr, u16), src: SocketAddr) {
         {
-            let m = self.bursts.lock().unwrap();
+            let m = crate::publish::lock_or_recover(&self.bursts);
             if m.contains_key(&key) {
                 return; // already deferred; the pending task answers
             }
         }
         let (tx, rx) = watch::channel(false);
         {
-            let mut m = self.bursts.lock().unwrap();
+            let mut m = crate::publish::lock_or_recover(&self.bursts);
             if m.insert(key, tx).is_some() {
                 return; // raced: a concurrent defer won the slot
             }
@@ -523,7 +524,7 @@ impl UpnpFacade {
                 loc,
             );
             let _ = ssdp.send_to(&resp, src).await;
-            bursts.lock().unwrap().remove(&key);
+            crate::publish::lock_or_recover(&bursts).remove(&key);
         });
     }
 
@@ -666,7 +667,7 @@ impl UpnpFacade {
         self.publisher.remove_slot(bind_port);
             let mut t = self.table.lock().await;
             t.delete_by_bind_port(bind_port);
-            eprintln!("upnp: grant datapath {} failed: {}", bind_port, e);
+            emiteln!("upnp: grant datapath {} failed: {}", bind_port, e);
             return Err(UpnpErr::ActionFailed);
         }
             let handles = match proto {
@@ -698,7 +699,7 @@ impl UpnpFacade {
                     let _ = nft::del_pin(client, int_port);
                     let mut t = self.table.lock().await;
                     t.delete_by_bind_port(bind_port);
-                    eprintln!("upnp: slot bind {} failed: {}", bind_port, e);
+                    emiteln!("upnp: slot bind {} failed: {}", bind_port, e);
                     return Err(UpnpErr::ActionFailed);
                 }
             }
@@ -773,7 +774,7 @@ impl UpnpFacade {
         sug_ip: Ipv4Addr,
     ) -> crate::pcp::MapAnswer {
         let now = Epoch::now();
-        let mut w = self.pcp_wait.lock().unwrap();
+        let mut w = crate::publish::lock_or_recover(&self.pcp_wait);
         let started = *w.entry(bind_port).or_insert(now);
         match discovery_verdict(now.saturating_sub(started), false) {
             Some(code) => {
@@ -870,7 +871,7 @@ impl UpnpFacade {
         };
         match self.external_tuple(bind_port) {
             Some((ip, port)) => {
-                self.pcp_wait.lock().unwrap().remove(&bind_port);
+                crate::publish::lock_or_recover(&self.pcp_wait).remove(&bind_port);
                 crate::pcp::MapAnswer::Answer {
                     code: crate::pcp::rc::SUCCESS,
                     lifetime: granted,
@@ -1089,7 +1090,7 @@ impl UpnpFacade {
             let (n, from) = match sock.recv_from(&mut buf).await {
                 Ok(x) => x,
                 Err(e) => {
-                    eprintln!("pcp: recv: {}", e);
+                    emiteln!("pcp: recv: {}", e);
                     continue;
                 }
             };
@@ -1306,7 +1307,7 @@ impl UpnpFacade {
     /// The DeviceProtection authorization decision for a control point
     /// (section 26.7: the boundary sits in front of the engine).
     fn dp_enforce(&self, key: Ipv4Addr, required: &dp::DpAuthz, now: u64) -> Result<(), UpnpErr> {
-        let state = self.dp.lock().unwrap();
+        let state = crate::publish::lock_or_recover(&self.dp);
         state.enforce(key, required, now).map_err(map_dp_err)
     }
 
@@ -1315,14 +1316,14 @@ impl UpnpFacade {
     /// callers without the lift). The policy function is the same one the boundary uses, so
     /// the lift cannot drift from the gate.
     fn dp_holds_lift(&self, key: Ipv4Addr, now: u64) -> bool {
-        let state = self.dp.lock().unwrap();
+        let state = crate::publish::lock_or_recover(&self.dp);
         let roles = state.session_roles(key, now);
         dp::authorize(&roles, &dp::DpAuthz::Roles(vec!["Basic".to_string()]))
     }
 
     /// Refresh a session's activity stamp after an authorized action.
     fn dp_touch(&self, key: Ipv4Addr, now: u64) {
-        let mut state = self.dp.lock().unwrap();
+        let mut state = crate::publish::lock_or_recover(&self.dp);
         state.touch(key, now);
     }
 
@@ -1678,7 +1679,7 @@ impl UpnpFacade {
             for sid in keep {
                 let _ = g.sids.add(sid);
             }
-            eprintln!(
+            emiteln!(
                 "upnp: gena pruned {} expired subscription(s)",
                 before - g.subs.len()
             );
@@ -1804,7 +1805,7 @@ impl UpnpFacade {
         };
         if !freed.is_empty() {
             self.tear_down_ports(&pre, &freed).await;
-            eprintln!("upnp: gc freed expired slots {:?}", freed);
+            emiteln!("upnp: gc freed expired slots {:?}", freed);
         }
         // lease-policy backstop: reap UDP grants whose client went silent
         // past LEASE_BACKSTOP_S, whatever the pool state (the pressure
@@ -1820,7 +1821,7 @@ impl UpnpFacade {
         };
         if !idle_freed.is_empty() {
             self.tear_down_ports(&pre, &idle_freed).await;
-            eprintln!("upnp: gc freed idle slots {:?}", idle_freed);
+            emiteln!("upnp: gc freed idle slots {:?}", idle_freed);
         }
     }
 
@@ -1913,7 +1914,7 @@ async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Resul
                 // advertising, and a dead HTTP service would leave the
                 // facade a ghost IGD. Log and retry, like the sibling
                 // loops' Err(_) => continue.
-                eprintln!("upnp: accept: {}", e);
+                emiteln!("upnp: accept: {}", e);
                 continue;
             }
         };
@@ -2335,7 +2336,7 @@ async fn handle_soap(
             let action_name = String::from_utf8_lossy(upnp::soap_action_name(action));
             let xml = upnp::soap_success_v(service, v2, &action_name, &inner);
             let _ = write_response(stream, "200 OK", &xml, "").await;
-            println!(
+            emitln!(
                 "{{\"event\":\"upnp\",\"action\":\"{}\",\"service\":\"{}\"}}",
                 action_name,
                 String::from_utf8_lossy(upnp::service_urn_v(service, v2))
@@ -2359,7 +2360,7 @@ fn dp_challenge(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result
         return Err(UpnpErr::InvalidValue);
     }
     let name = dp_str_tag(body, b"Name")?;
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     let (salt, challenge) = state
         .begin_login(client_ip, &name, dp_random_16(), Epoch::now())
         .map_err(map_dp_err)?;
@@ -2382,7 +2383,7 @@ fn dp_login(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<Str
         .and_then(|v| std::str::from_utf8(v).ok())
         .and_then(dp::base64_decode)
         .ok_or(UpnpErr::InvalidValue)?;
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     state
         .login(client_ip, challenge, &auth, Epoch::now())
         .map(|_| String::new())
@@ -2391,7 +2392,7 @@ fn dp_login(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<Str
 
 /// UserLogout (DP 2.6.7): drop the session principal. No arguments.
 fn dp_logout(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr> {
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     state.logout(client_ip, Epoch::now());
     Ok(String::new())
 }
@@ -2399,7 +2400,7 @@ fn dp_logout(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr
 /// GetAssignedRoles (DP 2.6.3): the session's role set, space-separated.
 /// Per 2.6.3.2, an unauthenticated session sees only "Public".
 fn dp_assigned_roles(facade: &UpnpFacade, client_ip: Ipv4Addr) -> String {
-    let state = facade.dp.lock().unwrap();
+    let state = crate::publish::lock_or_recover(&facade.dp);
     let roles = state.session_roles(client_ip, Epoch::now());
     if roles.is_empty() {
         "<RoleList>Public</RoleList>".to_string()
@@ -2446,7 +2447,7 @@ fn dp_send_setup(facade: &UpnpFacade, body: &[u8]) -> Result<String, UpnpErr> {
     }
     // No setup operation is pending or possible: SetupReady stays
     // unchanged (2.4.2 semantics; the evented variable never moves).
-    let _state = facade.dp.lock().unwrap();
+    let _state = crate::publish::lock_or_recover(&facade.dp);
     let _ = _state.setup_ready();
     Err(map_dp_err(dp::DpErr::Processing))
 }
@@ -2456,7 +2457,7 @@ fn dp_send_setup(facade: &UpnpFacade, body: &[u8]) -> Result<String, UpnpErr> {
 fn dp_get_acl(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr> {
     let now = Epoch::now();
     let required = dp::required_role(dp::DpTarget::DeviceProtection, "GetACLData");
-    let state = facade.dp.lock().unwrap();
+    let state = crate::publish::lock_or_recover(&facade.dp);
     state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
     Ok(dp::acl_xml(state.acl()))
 }
@@ -2467,7 +2468,7 @@ fn dp_get_acl(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpEr
 fn dp_add_identities(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let now = Epoch::now();
     let required = dp::required_role(dp::DpTarget::DeviceProtection, "AddIdentityList");
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
     let incoming = dp::DpAcl {
         identities: dp_identity_names(body)
@@ -2490,7 +2491,7 @@ fn dp_add_identities(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> R
 fn dp_remove_identity(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let now = Epoch::now();
     let required = dp::required_role(dp::DpTarget::DeviceProtection, "RemoveIdentity");
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
     let name = dp_identity_names(body)
         .into_iter()
@@ -2514,7 +2515,7 @@ fn dp_set_password(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Res
     let stored = dp_b64_tag16(body, b"Stored")?;
     let salt = dp_b64_tag16(body, b"Salt")?;
     let now = Epoch::now();
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     let admin = dp::required_role(dp::DpTarget::DeviceProtection, "SetUserLoginPassword");
     let self_ok = state.session_user(client_ip, now) == Some(name.as_str());
     if !self_ok {
@@ -2543,7 +2544,7 @@ fn dp_add_roles(
         "RemoveRolesForIdentity"
     };
     let required = dp::required_role(dp::DpTarget::DeviceProtection, action);
-    let mut state = facade.dp.lock().unwrap();
+    let mut state = crate::publish::lock_or_recover(&facade.dp);
     state.enforce(client_ip, &required, now).map_err(map_dp_err)?;
     let identity = dp_identity_names(body)
         .into_iter()
@@ -3377,7 +3378,7 @@ fn bind_ssdp(lan_ip: Ipv4Addr) -> io::Result<UdpSocket> {
                     libc::IP_ADD_MEMBERSHIP => "join multicast group",
                     _ => "set multicast interface",
                 };
-                eprintln!("upnp: ssdp {} failed: {}", msg, io::Error::last_os_error());
+                emiteln!("upnp: ssdp {} failed: {}", msg, io::Error::last_os_error());
                 return Err(io::Error::last_os_error());
             }
         }
@@ -6158,7 +6159,7 @@ mod ifindex_probe {
         .expect("run upnpc-static");
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
-        println!("=== upnpc -l output ===\n{}", text);
+        emitln!("=== upnpc -l output ===\n{}", text);
         assert!(
             text.contains("Found valid IGD") || text.contains("Found an IGD"),
             "upnpc must accept the device: {}",
@@ -6180,7 +6181,7 @@ mod ifindex_probe {
                     .expect("run testigddescparse");
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
-            println!("=== testigddescparse {} ===\n{}", label, text);
+            emitln!("=== testigddescparse {} ===\n{}", label, text);
             assert!(
                 out.status.success() && text.contains("controlURL="),
                 "the reference parser must resolve the WANIPConnection URLs of the {} \
@@ -6200,7 +6201,7 @@ mod ifindex_probe {
             list_body,
         )
         .await;
-        println!("=== direct GetListOfPortMappings (UDP) ===\n{}", listed);
+        emitln!("=== direct GetListOfPortMappings (UDP) ===\n{}", listed);
         // The wire shape: the fragment as the NewPortListing argument
         // value, which is what a control point reads it from.
         assert!(
@@ -6223,7 +6224,7 @@ mod ifindex_probe {
             .expect("run upnpc-static -L");
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
-        println!("=== upnpc -L (v2) output ===\n{}", text);
+        emitln!("=== upnpc -L (v2) output ===\n{}", text);
         // The walk asks for TCP first, which holds nothing and is 730 by
         // the spec's rule (2.5.21), so the reference client reports that
         // fault and then asks for UDP. The UDP pass is the one that must
@@ -6262,7 +6263,7 @@ mod ifindex_probe {
             .expect("run upnpc-static -n");
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
-        println!("=== upnpc -n (v2) output ===\n{}", text);
+        emitln!("=== upnpc -n (v2) output ===\n{}", text);
         assert!(
             text.contains("failed with code 606"),
             "the DeviceProtection boundary must refuse an unauthenticated v2 mutator: {}",

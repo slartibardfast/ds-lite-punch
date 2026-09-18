@@ -8,6 +8,11 @@
 //! from the flow's own post-NAT tuple refreshes the AFTR mapping. This module
 //! owns the local half: the policy objects and the chain that selects them.
 //!
+//! The chain's hook is at mangle priority rather than at raw, and that is a
+//! measurement rather than a preference: at a pre-conntrack priority the
+//! assignment has no effect on this build, and one hook later it does. Both
+//! readings are in this milestone's results record.
+//!
 //! The policy lives in the daemon's own datapath table (`ip dslp`), beside the
 //! named map and the CDC mirror, for one reason: the allowlist drives both
 //! halves of the hold, so the process that owns the arm owns the policy, and
@@ -34,9 +39,13 @@ pub const TABLE: &str = "ip dslp";
 /// global to the table, and the table is shared with the rest of the datapath.
 pub const UDP_POLICY: &str = "dslp_udp_long";
 pub const TCP_POLICY: &str = "dslp_tcp_long";
-/// The selection chain: raw prerouting, so the policy is attached to the
-/// conntrack entry at the entry's creation, before any later hook can see it.
-pub const CHAIN: &str = "preraw";
+/// The selection chain. Its hook is measured rather than reasoned about: the
+/// same statement at a pre-conntrack raw priority left every entry at the
+/// default sixty seconds on this build, and the same statement one hook later
+/// attaches the policy to the entry the conntrack hook has just created.
+/// Mangle priority sits after conntrack, and fw4's own prerouting chain at the
+/// same priority does not interact with this one.
+pub const CHAIN: &str = "hold";
 /// UDP: five minutes in both directions, against the two-minute floor the
 /// mapping requirements set (RFC 4787's UDP mapping lifetime, carried into the
 /// carrier-grade requirements). Above the floor on purpose: the cost of a
@@ -96,7 +105,7 @@ pub fn ruleset(list: &[Ipv4Addr]) -> String {
          \t\t{TCP_POLICY_BODY}\n\
          \t}}\n\
          \tchain {chain} {{\n\
-         \t\ttype filter hook prerouting priority raw - 10; policy accept;\n\
+         \t\ttype filter hook prerouting priority -150; policy accept;\n\
          \t\tip saddr {{ {set} }} meta l4proto udp ct timeout set \"{udp}\"\n\
          \t\tip saddr {{ {set} }} meta l4proto tcp ct timeout set \"{tcp}\"\n\
          \t}}\n\
@@ -200,8 +209,14 @@ mod tests {
             "{}",
             rs
         );
-        // the hook: raw prerouting, ahead of every later hook
-        assert!(rs.contains("hook prerouting priority raw - 10"), "{}", rs);
+        // The hook is measured, not chosen: `ct timeout set` at a
+        // pre-conntrack raw priority has no effect on this build (the entry
+        // keeps the default 60 s), while the same statement at mangle
+        // priority attaches the policy to the entry the conntrack hook has
+        // just created. Both were read back from `/proc/net/nf_conntrack` on
+        // the router, 2026-09-18.
+        assert!(rs.contains("hook prerouting priority -150"), "{}", rs);
+        assert!(!rs.contains("priority raw"), "the hook that does not work: {}", rs);
         // `ether saddr` is bridge-family; the key is the address
         assert!(!rs.contains("ether saddr"), "{}", rs);
     }

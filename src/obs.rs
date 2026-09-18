@@ -89,6 +89,13 @@ impl CtEntry {
 /// the Kani harnesses use `'static` const arrays).
 #[derive(Clone, Copy, Debug)]
 pub struct ObsCtx<'a> {
+    /// The allowlist (call/0025). A named device's flow is admitted on its
+    /// own outbound tuple: the mapping a console's NAT type rides is the one
+    /// its own packets create, and once it goes quiet only our writes can
+    /// keep it alive, so an unanswered flow is exactly the one that needs us
+    /// (call/0029). An unnamed flow keeps the reply requirement, where the
+    /// heuristic is all there is to go on.
+    pub allowed: &'a [Ipv4Addr],
     /// br-lan prefix (hosts eligible for rescue). Default 192.168.21.0/24.
     pub brlan: (Ipv4Addr, u8),
     /// hub-LAN NAT address — only flows egressing the VM line (AFTR) have
@@ -139,8 +146,9 @@ pub fn should_rescue(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
     if ctx.is_private_local(e.orig_dst) {
         return false; // off-LAN requirement: dst must be a routable public
     }
-    // Bidirectional: a peer must be able to care about this flow.
-    if !e.has_seen_reply() {
+    // Bidirectional, or named: a peer must be able to care about this flow,
+    // and for a named device our own writes are what let it care at all.
+    if !e.has_seen_reply() && !ctx.allowed.contains(&e.orig_src) {
         return false;
     }
     // VM line only: the reply's destination is the hub-LAN NAT address,
@@ -275,6 +283,7 @@ pub fn brlan_ctx() -> ObsCtx<'static> {
         vm_nat: Ipv4Addr::new(192, 168, 0, 21),
         held: &[],
         max_rescues: 8,
+        allowed: &[],
         rescues_so_far: 0,
     }
 }
@@ -303,7 +312,29 @@ mod tests {
     }
 
     #[test]
-    fn udp_flow_unreplied_not_rescued() {
+    fn an_unreplied_flow_from_a_named_device_is_rescued() {
+        // call/0029: the mapping a console's NAT type rides is the one its
+        // own packets create, and its flows to game peers are frequently
+        // unanswered. A named device is admitted on that tuple; an unnamed
+        // one is not.
+        let l = GOOD;
+        let e = parse_line(l).expect("fixture parses");
+        assert!(e.unreplied, "the fixture is the unanswered case");
+        let host = e.orig_src;
+        let named = [host];
+        let ctx = ObsCtx {
+            allowed: &named,
+            ..brlan_ctx()
+        };
+        assert!(should_rescue(&e, &ctx), "a named device is admitted unanswered");
+        assert!(
+            !should_rescue(&e, &brlan_ctx()),
+            "without the list the reply requirement stands"
+        );
+    }
+
+    #[test]
+    fn an_unreplied_flow_from_an_unnamed_device_is_not_rescued() {
         let e = parse_line(GOOD).unwrap();
         // no reply seen → predicate false (wait for a reply; mapping matters
         // to a peer)

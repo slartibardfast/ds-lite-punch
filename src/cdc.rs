@@ -18,6 +18,7 @@
 use crate::obs::{scan, ObsCtx, RescueCandidate};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use crate::publish::{emiteln};
 
 /// One live candidate: the shadow-bind tuple (`bind_tuple`, alias of
 /// `obs::RescueCandidate`) + the br-lan flow origin (`host`/`host_port`,
@@ -50,6 +51,9 @@ pub trait Cdc: Send + Sync {
 
 /// `/proc/net/nf_conntrack` polling backend (G1 fallback).
 pub struct ProcCdc {
+    /// The allowlist: the admission for a flow the device itself has not
+    /// been answered on (call/0029).
+    allowed: Vec<Ipv4Addr>,
     path: String,
     brlan: (Ipv4Addr, u8),
     vm_nat: Ipv4Addr,
@@ -59,13 +63,14 @@ pub struct ProcCdc {
 
 impl ProcCdc {
     /// held = inner tuples static/lease slots own (I1: never capture one).
-    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_rescues: u32) -> Self {
+    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_rescues: u32, allowed: Vec<Ipv4Addr>) -> Self {
         ProcCdc {
             path: PROC_PATH.to_string(),
             brlan: BR_LAN,
             vm_nat: VM_NAT,
             held,
             max_rescues,
+            allowed,
         }
     }
 }
@@ -75,13 +80,14 @@ impl Cdc for ProcCdc {
         let f = match std::fs::read_to_string(&self.path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("warn: cdc(proc): {}: {}", self.path, e);
+                emiteln!("warn: cdc(proc): {}: {}", self.path, e);
                 return Vec::new();
             }
         };
         let ctx = ObsCtx {
             brlan: self.brlan,
             vm_nat: self.vm_nat,
+            allowed: &self.allowed,
             held: &self.held,
             max_rescues: self.max_rescues,
             rescues_so_far: 0,
@@ -105,14 +111,17 @@ pub struct NftCdc {
     known: HashMap<(Ipv4Addr, u16), Candidate>,
     held: Vec<(Ipv4Addr, u16)>,
     max_rescues: u32,
+    /// The allowlist, as for the proc backend.
+    allowed: Vec<Ipv4Addr>,
 }
 
 impl NftCdc {
-    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_rescues: u32) -> Self {
+    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_rescues: u32, allowed: Vec<Ipv4Addr>) -> Self {
         NftCdc {
             known: HashMap::new(),
             held,
             max_rescues,
+            allowed,
         }
     }
 }
@@ -122,7 +131,7 @@ impl Cdc for NftCdc {
         let live = match crate::nft::list_flow_obs() {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("warn: cdc(nft): list flow_obs failed: {}", e);
+                emiteln!("warn: cdc(nft): list flow_obs failed: {}", e);
                 return Vec::new();
             }
         };
@@ -137,6 +146,7 @@ impl Cdc for NftCdc {
             &mut self.known,
             &self.held,
             self.max_rescues,
+            &self.allowed,
         )
     }
 
@@ -156,6 +166,7 @@ fn reconcile(
     known: &mut HashMap<(Ipv4Addr, u16), Candidate>,
     held: &[(Ipv4Addr, u16)],
     max_rescues: u32,
+    allowed: &[Ipv4Addr],
 ) -> Vec<Candidate> {
     let fresh: Vec<(Ipv4Addr, u16)> = live
         .iter()
@@ -169,6 +180,7 @@ fn reconcile(
                 vm_nat: VM_NAT,
                 held,
                 max_rescues,
+                allowed,
                 rescues_so_far: 0,
             };
             for c in scan(f, &ctx) {
@@ -213,6 +225,7 @@ mod tests {
             vm_nat: VM_NAT,
             held: Vec::new(),
             max_rescues: 8,
+            allowed: Vec::new(),
         };
         let cands = cdc.tick();
         assert_eq!(cdc.name(), "proc");
@@ -231,6 +244,7 @@ mod tests {
             vm_nat: VM_NAT,
             held: vec![(VM_NAT, 54322)],
             max_rescues: 8,
+            allowed: Vec::new(),
         };
         assert!(cdc.tick().is_empty(), "I1: held tuple never surfaces");
     }
@@ -249,6 +263,7 @@ mod tests {
             vm_nat: VM_NAT,
             held: Vec::new(),
             max_rescues: 2,
+            allowed: Vec::new(),
         };
         assert_eq!(cdc.tick().len(), 2, "scan caps at the rescue budget");
     }
@@ -261,6 +276,7 @@ mod tests {
             vm_nat: VM_NAT,
             held: Vec::new(),
             max_rescues: 8,
+            allowed: Vec::new(),
         };
         assert!(cdc.tick().is_empty(), "unreadable table -> empty tick, not panic");
     }
@@ -286,14 +302,14 @@ mod tests {
         let mut known = HashMap::new();
         let live = mirror_live();
         // first tick: fresh tuple, resolved via the proc snapshot
-        let mut out = reconcile(&live, Some(&proc_fixture()), &mut known, &[], 8);
+        let mut out = reconcile(&live, Some(&proc_fixture()), &mut known, &[], 8, &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].bind_tuple, (VM_NAT, 54322));
         assert_eq!(out[0].host, Ipv4Addr::new(192, 168, 21, 10));
         assert_eq!(out[0].host_port, 54322);
         assert_eq!(out[0].peer, (Ipv4Addr::new(8, 8, 8, 8), 53));
         // steady state: no proc read needed, cached identity served
-        out = reconcile(&live, None, &mut known, &[], 8);
+        out = reconcile(&live, None, &mut known, &[], 8, &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].host, Ipv4Addr::new(192, 168, 21, 10));
     }
@@ -302,10 +318,10 @@ mod tests {
     fn reconcile_prunes_evicted_tuples() {
         let mut known = HashMap::new();
         let live = mirror_live();
-        assert_eq!(reconcile(&live, Some(&proc_fixture()), &mut known, &[], 8).len(), 1);
+        assert_eq!(reconcile(&live, Some(&proc_fixture()), &mut known, &[], 8, &[]).len(), 1);
         // mirror loses the flow (15 s element expiry is the silence
         // detector): nothing live -> nothing returned, cache pruned
-        let out = reconcile(&[], None, &mut known, &[], 8);
+        let out = reconcile(&[], None, &mut known, &[], 8, &[]);
         assert!(out.is_empty());
         assert!(known.is_empty());
     }
@@ -315,11 +331,11 @@ mod tests {
         let mut known = HashMap::new();
         let live = mirror_live();
         // held: the I1 predicate drops it during identity resolution
-        let out = reconcile(&live, Some(&proc_fixture()), &mut known, &[(VM_NAT, 54322)], 8);
+        let out = reconcile(&live, Some(&proc_fixture()), &mut known, &[(VM_NAT, 54322)], 8, &[]);
         assert!(out.is_empty());
         // unresolvable: proc tuple absent from the snapshot -> no identity
         let mut known = HashMap::new();
-        let out = reconcile(&live, Some("ipv4     2 tcp       6 50 src=9.9.9.9 dst=1.1.1.1 sport=1 dport=1 packets=1 bytes=1 src=1.1.1.1 dst=9.9.9.9 sport=1 dport=1 packets=0 bytes=0 mark=0 zone=0 use=2\n"), &mut known, &[], 8);
+        let out = reconcile(&live, Some("ipv4     2 tcp       6 50 src=9.9.9.9 dst=1.1.1.1 sport=1 dport=1 packets=1 bytes=1 src=1.1.1.1 dst=9.9.9.9 sport=1 dport=1 packets=0 bytes=0 mark=0 zone=0 use=2\n"), &mut known, &[], 8, &[]);
         assert!(out.is_empty());
         assert!(known.is_empty());
     }
@@ -335,7 +351,7 @@ mod tests {
             table.push_str(&good);
             table.push('\n');
         }
-        let out = reconcile(&live, Some(&table), &mut known, &[], 1);
+        let out = reconcile(&live, Some(&table), &mut known, &[], 1, &[]);
         assert_eq!(out.len(), 1, "budget caps how many fresh tuples resolve");
     }
 }

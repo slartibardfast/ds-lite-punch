@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+use crate::publish::{emiteln};
 
 /// Engine cadence. 2 s « 5–10 s AFTR TTL (I3).
 pub const TICK: Duration = Duration::from_secs(2);
@@ -62,6 +63,9 @@ pub enum ExitReason {
     HeldBySlot,
     /// Entry gone from the CDC and no inbound within grace — flow dead.
     Stale,
+    /// The device itself stopped answering on the LAN (call/0029): a hold
+    /// for a device that is off or asleep releases nothing anyone uses.
+    DeviceGone,
 }
 
 /// I1 + G2 budget gate before claiming a candidate. Pure; Kani-proven.
@@ -133,6 +137,16 @@ struct ObsSlot {
     vote: Arc<Mutex<VoteState>>,
     /// Wall-clock second this flow was last seen live.
     last_seen_unix: u64,
+    /// The device's own packet count for this tuple, as the connection table
+    /// last reported it. Our own writes are not the device's, and they are
+    /// what used to keep this arm believing a flow was alive: the delta over
+    /// this counter is the liveness signal that cannot be self-fulfilled.
+    dev_pkts: u64,
+    /// Consecutive ticks with neither the device nor a peer touching the
+    /// tuple.
+    quiet_ticks: u32,
+    /// Consecutive failed LAN probes for this slot's device.
+    dev_misses: u8,
     missing_ticks: u32,
     ticks_since_inbound: u32,
     /// inbound counter value the engine last saw (task bumps on forward)
@@ -170,6 +184,12 @@ pub struct ObservationEngine {
     pub alloc: Option<Arc<Mutex<LeaseTable>>>,
     /// The address the slots bind, so their tuples can be named.
     pub bind_ip: Ipv4Addr,
+    /// Ticks since start, for the probe throttle and its round robin.
+    ticks: u64,
+    /// Which slot the next device probe looks at.
+    probe_cursor: usize,
+    /// The per-device hold cap.
+    per_host: u32,
 }
 
 impl ObservationEngine {
@@ -197,6 +217,9 @@ impl ObservationEngine {
             reported: std::collections::HashSet::new(),
             alloc: None,
             bind_ip: Ipv4Addr::UNSPECIFIED,
+            ticks: 0,
+            probe_cursor: 0,
+            per_host: 4,
         }
     }
 
@@ -287,6 +310,10 @@ impl ObservationEngine {
             if self.slots.iter().any(|s| s.bind_tuple == c.bind_tuple) {
                 continue; // already rescued
             }
+            if !host_budget_ok(c.host, &self.slots, self.per_host) {
+                // one device's churn cannot spend another device's capacity
+                continue;
+            }
             if !claim_allowed(c.bind_tuple, &held, self.slots.len(), self.max_rescues) {
                 // R5: a tuple a slot holds is refused rather than captured,
                 // and the refusal is reported. A device's flow on a slot's
@@ -307,7 +334,7 @@ impl ObservationEngine {
             let sock = match UdpSocket::bind(bind).await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("warn: shadow bind {} failed: {}", bind, e);
+                    emiteln!("warn: shadow bind {} failed: {}", bind, e);
                     continue;
                 }
             };
@@ -315,12 +342,12 @@ impl ObservationEngine {
             // as (NAT, R_nat) or the kernel NAPT's it elsewhere and the
             // rescue refreshes the wrong mapping (measured 41077 → 1024).
             if let Err(e) = self.pins.add(c.bind_tuple.0, c.bind_tuple.1, c.bind_tuple.1) {
-                eprintln!("warn: shadow self-pin {} failed: {}", c.bind_tuple.1, e);
+                emiteln!("warn: shadow self-pin {} failed: {}", c.bind_tuple.1, e);
                 drop(sock);
                 continue;
             }
             if let Err(e) = self.pins.add(c.host, c.host_port, c.bind_tuple.1) {
-                eprintln!(
+                emiteln!(
                     "warn: shadow pin {}:{} -> {} failed: {}",
                     c.host, c.host_port, c.bind_tuple.1, e
                 );
@@ -329,7 +356,7 @@ impl ObservationEngine {
                 continue;
             }
             if let Err(e) = self.pins.accept(c.bind_tuple.1) {
-                eprintln!("warn: shadow accept {} failed: {}", c.bind_tuple.1, e);
+                emiteln!("warn: shadow accept {} failed: {}", c.bind_tuple.1, e);
                 let _ = self.pins.del(c.host, c.host_port);
                 let _ = self.pins.del(c.bind_tuple.0, c.bind_tuple.1);
                 drop(sock);
@@ -367,6 +394,9 @@ impl ObservationEngine {
                 external: None,
                 vote,
                 last_seen_unix: unix_now(),
+                dev_pkts: 0,
+                quiet_ticks: 0,
+                dev_misses: 0,
                 missing_ticks: 0,
                 ticks_since_inbound: 0,
                 last_inbound_seen: inbound_ts.load(Ordering::Relaxed),
@@ -374,6 +404,50 @@ impl ObservationEngine {
                 inbound_ts,
                 external_arc: external,
             });
+        }
+
+        // Liveness pass: what keeps a hold alive is the device or a peer,
+        // never our own writes. The device's own packet count comes from the
+        // connection table (our egress appears there with the NAT address as
+        // its origin, so it cannot be mistaken for the device's), and a peer
+        // probe is what the shadow timestamps as inbound.
+        self.ticks += 1;
+        if !self.slots.is_empty() {
+            let proc_text = std::fs::read_to_string("/proc/net/nf_conntrack").ok();
+            for s in self.slots.iter_mut() {
+                let dev_now = proc_text
+                    .as_deref()
+                    .map(|t| device_packets(t, s.bind_tuple, s.host))
+                    .unwrap_or(s.dev_pkts);
+                let device_active = dev_now > s.dev_pkts;
+                s.dev_pkts = dev_now;
+                let peer_active = s.ticks_since_inbound == 0;
+                if device_active || peer_active {
+                    s.quiet_ticks = 0;
+                } else {
+                    s.quiet_ticks = s.quiet_ticks.saturating_add(1);
+                }
+            }
+            // One device probe per throttle window, round robin across the
+            // holds so a tick never blocks on more than one ping.
+            if self.ticks % PROBE_EVERY_TICKS == 0 {
+                if self.probe_cursor >= self.slots.len() {
+                    self.probe_cursor = 0;
+                }
+                if let Some(s) = self.slots.get_mut(self.probe_cursor) {
+                    let host = s.host;
+                    if device_up(host) {
+                        for s in self.slots.iter_mut().filter(|s| s.host == host) {
+                            s.dev_misses = 0;
+                        }
+                    } else {
+                        for s in self.slots.iter_mut().filter(|s| s.host == host) {
+                            s.dev_misses = s.dev_misses.saturating_add(1);
+                        }
+                    }
+                }
+                self.probe_cursor = self.probe_cursor.saturating_add(1);
+            }
         }
 
         // Exit pass (G5). Held-by-slot is instant (I1); stale needs the
@@ -390,7 +464,20 @@ impl ObservationEngine {
                 )
             };
             let held_now = held.contains(&t);
-            let reason = exit_due(missing, self.grace_ticks, since_inbound, held_now);
+            let (quiet, misses) = {
+                let s = &self.slots[i];
+                (s.quiet_ticks, s.dev_misses)
+            };
+            let mut reason = exit_due(missing, self.grace_ticks, since_inbound, held_now);
+            if reason.is_none() && misses >= DEV_MISSES_TO_RELEASE {
+                // the device is not on the LAN any more: nothing it owns can
+                // be waiting for this mapping
+                reason = Some(ExitReason::DeviceGone);
+            }
+            if reason.is_none() && quiet >= LONG_QUIET_TICKS {
+                // both sides silent for a minute: the flow is nobody's
+                reason = Some(ExitReason::Stale);
+            }
             if let Some(r) = reason {
                 stop.store(true, Ordering::Relaxed);
                 let gone = self.slots.swap_remove(i);
@@ -424,6 +511,51 @@ fn observe_report(
         Some(t) if prev != Some(t) => Some(t),
         _ => None,
     }
+}
+
+/// A hold with neither the device nor a peer touching it for this many ticks
+/// is released: sixty seconds of total silence is a flow nobody is using,
+/// and the mapping is gone long before that either way.
+const LONG_QUIET_TICKS: u32 = 30;
+/// Consecutive failed LAN probes before a hold is released as abandoned.
+const DEV_MISSES_TO_RELEASE: u8 = 3;
+/// Probe one slot's device every this many ticks, so the tick never blocks
+/// on more than one probe.
+const PROBE_EVERY_TICKS: u64 = 3;
+
+/// Is the device on the LAN answering? The router's own `ping` is the probe:
+/// it needs no dependency, and a device that is off or asleep is exactly what
+/// a hold should stop paying for (call/0029). A probe that cannot run at all
+/// answers "up", because a broken probe must never release a live hold.
+fn device_up(ip: Ipv4Addr) -> bool {
+    std::process::Command::new("ping")
+        .args(["-c", "1", "-W", "1", &ip.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true)
+}
+
+/// The device's own packet count for a tuple: the connection table's entries
+/// whose NAT side is that tuple and whose origin is the device. A game
+/// talking to several peers is several entries on one tuple, so this is a
+/// sum, and our own writes to the same tuple carry the NAT address as their
+/// origin and are therefore counted out. That exclusion is the whole point:
+/// a liveness signal our own keepalives can satisfy proves nothing
+/// (call/0029).
+fn device_packets(proc_text: &str, bind: (Ipv4Addr, u16), host: Ipv4Addr) -> u64 {
+    proc_text
+        .lines()
+        .filter_map(crate::obs::parse_line)
+        .filter(|e| e.nat_src() == bind && e.orig_src == host)
+        .map(|e| e.orig_packets)
+        .sum()
+}
+
+/// Per-device budget: one device's churn must not spend another's capacity.
+/// Pure; the caller passes the holds grouped by host.
+fn host_budget_ok(host: Ipv4Addr, slots: &[ObsSlot], per_host: u32) -> bool {
+    let mine = slots.iter().filter(|s| s.host == host).count() as u64;
+    mine < per_host as u64
 }
 
 /// The log-only stage: report every named device's live flow once, and touch
@@ -481,7 +613,7 @@ fn spawn_shadow(
                         let txn = stun::random_txn();
                         let req = stun::binding_request(&txn);
                         if let Err(e) = sock.send_to(&req, server).await {
-                            eprintln!("warn: shadow keepalive {} failed: {}", server, e);
+                            emiteln!("warn: shadow keepalive {} failed: {}", server, e);
                             cursor = cursor.wrapping_add(1);
                         }
                     }
@@ -501,14 +633,14 @@ fn spawn_shadow(
                                 Ok(()) => {
                                     inbound_ts.store(unix_now(), Ordering::Relaxed);
                                 }
-                                Err(e) => eprintln!(
+                                Err(e) => emiteln!(
                                     "warn: shadow forward {} -> {} failed: {}",
                                     v4, target, e
                                 ),
                             }
                         }
                     }
-                    Err(e) => eprintln!("warn: shadow recv: {}", e),
+                    Err(e) => emiteln!("warn: shadow recv: {}", e),
                 },
             }
         }
@@ -655,6 +787,69 @@ mod tests {
         assert!(e.reported.contains(&(LO, 54342)), "but it is reported");
         // a device outside the list is not even reported
         assert!(!e.reported.contains(&(LO, 54343)));
+    }
+
+    #[test]
+    fn liveness_is_the_device_s_packets_and_never_our_own() {
+        // The tuple is (192.168.0.21, 3074); the device is the console.
+        let bind = (Ipv4Addr::new(192, 168, 0, 21), 3074);
+        let host = Ipv4Addr::new(192, 168, 21, 138);
+        // the console's own store to a peer: origin is the console
+        let dev = "ipv4 2 udp 17 180 src=192.168.21.138 dst=185.34.107.129 sport=3074 dport=3074 \
+                   packets=9 bytes=540 src=185.34.107.129 dst=192.168.0.21 sport=3074 dport=3074 \
+                   packets=2 bytes=90 mark=0 zone=0 use=2";
+        // our shadow's keepalive: NAT side the same, origin the NAT address
+        let ours = "ipv4 2 udp 17 300 src=192.168.0.21 dst=162.159.207.0 sport=3074 dport=3478 \
+                    packets=41 bytes=1968 src=162.159.207.0 dst=192.168.0.21 sport=3478 dport=3074 \
+                    packets=41 bytes=2460 [ASSURED] mark=0 zone=0 use=2";
+        assert_eq!(device_packets(dev, bind, host), 9, "the device's own count");
+        assert_eq!(device_packets(ours, bind, host), 0, "our writes are not the device");
+        assert_eq!(device_packets(&format!("{}\n{}", dev, ours), bind, host), 9);
+        // a peer's datagram arriving (orig from the peer) is not the device
+        let peer = "ipv4 2 udp 17 25 src=170.9.238.141 dst=192.168.0.21 sport=39897 dport=3074 \
+                    packets=1 bytes=37 src=192.168.21.138 dst=170.9.238.141 sport=3074 dport=39897 \
+                    packets=0 bytes=0 mark=0 zone=0 use=2";
+        assert_eq!(device_packets(peer, bind, host), 0);
+    }
+
+    #[tokio::test]
+    async fn a_device_s_budget_is_its_own() {
+        let c = Ipv4Addr::new(192, 168, 21, 138);
+        let other = Ipv4Addr::new(192, 168, 21, 68);
+        let mut e = engine(
+            Box::new(FakeCdc { cands: vec![cand((LO, 54410), c, 54410)] }),
+            Vec::new(),
+            8,
+            3,
+        );
+        e.per_host = 1;
+        e.tick().await;
+        assert_eq!(e.slots.len(), 1, "a lone flow from a named device is held");
+        // a second flow from the same device is refused by that device's own
+        // cap, which is the point: the churn cannot spend another's capacity
+        let mut e2 = engine(
+            Box::new(FakeCdc {
+                cands: vec![cand((LO, 54411), c, 54411), cand((LO, 54412), c, 54412)],
+            }),
+            Vec::new(),
+            8,
+            3,
+        );
+        e2.per_host = 1;
+        e2.tick().await;
+        assert_eq!(e2.slots.len(), 1, "one device's churn spends its own budget");
+        // another device still has its own capacity
+        let mut e3 = engine(
+            Box::new(FakeCdc {
+                cands: vec![cand((LO, 54413), c, 54413), cand((LO, 54414), other, 54414)],
+            }),
+            Vec::new(),
+            8,
+            3,
+        );
+        e3.per_host = 1;
+        e3.tick().await;
+        assert_eq!(e3.slots.len(), 2, "each device has its own capacity");
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! re-bisecting.
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
+use crate::publish::{emitln};
 
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
@@ -196,7 +197,7 @@ pub fn self_test() {
     let sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(e) => {
-            println!("ct-probe: bind failed: {}", e);
+            emitln!("ct-probe: bind failed: {}", e);
             return;
         }
     };
@@ -206,7 +207,7 @@ pub fn self_test() {
     let nat = (Ipv4Addr::new(192, 168, 0, 21), hp);
     let dst = std::net::SocketAddrV4::new(peer.0, peer.1);
     if let Err(e) = sock.send_to(b"x", dst) {
-        println!("ct-probe: send failed: {}", e);
+        emitln!("ct-probe: send failed: {}", e);
         return;
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -300,6 +301,6 @@ mod tests {
             19302,
         );
         let hex: String = m.iter().map(|b| format!("{:02x}", b)).collect();
-        println!("MY  len {} hex {}", m.len(), hex);
+        emitln!("MY  len {} hex {}", m.len(), hex);
     }
 }

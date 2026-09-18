@@ -12,6 +12,36 @@ use std::net::Ipv4Addr;
 
 use tokio::sync::watch;
 
+/// Take a lock without letting a poisoned one take the process down. The
+/// daemon sets `panic = "abort"`, so a panic anywhere is fatal, and a
+/// `StdMutex` that a panicking thread held stays poisoned: `.unwrap()` would
+/// then abort the daemon on the next request. A failed write must never do
+/// that (call/0029), and neither must the lock around the state it writes.
+pub fn lock_or_recover<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Print a line without letting a failed write take the process down.
+/// `println!` panics when stdout is a broken pipe, and this daemon's stdout is
+/// a procd pipe; with `panic = "abort"` set that panic is fatal. Every line
+/// this daemon emits goes through here (call/0029).
+macro_rules! emitln {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($t)*);
+    }};
+}
+
+/// As `emitln`, for stderr.
+macro_rules! emiteln {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+pub(crate) use {emiteln, emitln};
+
 pub struct Publisher {
     dir: String,
     ip_watch: Option<watch::Sender<Ipv4Addr>>,
@@ -41,7 +71,7 @@ impl Publisher {
     pub fn publish(&self, ip: Ipv4Addr, port: u16) {
         let path = format!("{}/tuple", self.dir);
         let _ = fs::write(&path, format!("{}:{}\n", ip, port));
-        println!("{{\"event\":\"tuple\",\"ip\":\"{}\",\"port\":{}}}", ip, port);
+        emitln!("{{\"event\":\"tuple\",\"ip\":\"{}\",\"port\":{}}}", ip, port);
     }
 
     /// Per-slot tuple file (B6/B8): `tuple-<R>` alongside the aggregate
@@ -52,10 +82,10 @@ impl Publisher {
         let path = format!("{}/tuple-{}", self.dir, bind_port);
         // memory first: the answer a client gets must not depend on the
         // state directory accepting a write
-        self.slots.lock().unwrap().insert(bind_port, (ip, port));
+        lock_or_recover(&self.slots).insert(bind_port, (ip, port));
         let w = fs::write(&path, format!("{}:{}\n", ip, port));
         self.note_write(&format!("tuple-{}", bind_port), w);
-        println!(
+        emitln!(
             "{{\"event\":\"tuple\",\"slot\":{},\"ip\":\"{}\",\"port\":{}}}",
             bind_port, ip, port
         );
@@ -69,7 +99,7 @@ impl Publisher {
     /// the live answer, then the file, which is how a restored slot's tuple
     /// comes back after a restart.
     pub fn slot_tuple(&self, bind_port: u16) -> Option<(Ipv4Addr, u16)> {
-        if let Some(t) = self.slots.lock().unwrap().get(&bind_port) {
+        if let Some(t) = lock_or_recover(&self.slots).get(&bind_port) {
             return Some(*t);
         }
         let s = fs::read_to_string(format!("{}/tuple-{}", self.dir, bind_port)).ok()?;
@@ -105,18 +135,19 @@ impl Publisher {
     /// answered with the dead port. The box found this on 2026-09-17, with
     /// three revoked slots still carrying their old tuples.
     pub fn remove_slot(&self, bind_port: u16) {
-        self.slots.lock().unwrap().remove(&bind_port);
+        lock_or_recover(&self.slots).remove(&bind_port);
         let _ = fs::remove_file(format!("{}/tuple-{}", self.dir, bind_port));
     }
 
     pub fn log_transition(&self, event: &str, detail: &str) {
-        println!("{{\"event\":\"{}\",\"detail\":\"{}\"}}", event, detail);
+        emitln!("{{\"event\":\"{}\",\"detail\":\"{}\"}}", event, detail);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// The fallback the daemon needs when its state directory will not take a
     /// write: the tuple a client is answered with comes from memory.
@@ -141,6 +172,24 @@ mod tests {
         );
         // and a mapping that never published is simply unknown
         assert_eq!(p.slot_tuple(30001), None);
+    }
+
+    /// A poisoned lock must not take the daemon down. `panic = "abort"` makes
+    /// any panic fatal, and a `StdMutex` a panicking thread held stays
+    /// poisoned, so `.unwrap()` on it would abort the daemon on the next
+    /// request — a failed write bringing the service down by construction is
+    /// what this rules out (call/0029).
+    #[test]
+    fn a_poisoned_lock_is_recovered_not_fatal() {
+        let m = Arc::new(StdMutex::new(7u32));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("a thread dies holding the lock");
+        })
+        .join();
+        assert!(m.is_poisoned(), "the lock is poisoned for the test to mean anything");
+        assert_eq!(*lock_or_recover(&m), 7, "the value survives and the lock is taken");
     }
 
     /// A restored slot's tuple is the one case the file is the source, since

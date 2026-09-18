@@ -41,6 +41,7 @@ use tokio::sync::{watch, Mutex};
 use upnp::DEFAULT_LAN_IP;
 use upnpsvc::UpnpFacade;
 use vote::{VoteDecision, VoteState};
+use crate::publish::{emiteln, emitln};
 
 /// Format a static-map/restore rejection for logs (the enum stays heap-free
 /// in `slot.rs` for the Kani proofs; messages live only at this boundary).
@@ -354,7 +355,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
 }
 
 fn usage() {
-    eprintln!(
+    emiteln!(
         "ds-lite-punch --static-map R=ip:port [--static-map ...] \
          [--stun host:port,host:port] [--interval 2] [--gateway 192.168.0.1] \
          [--state-dir /run/ds-lite-punch] [--slot-port-range LO-HI] \
@@ -378,8 +379,8 @@ fn add_stun_routes(servers: &[SocketAddrV4], gateway: &str) {
             .status();
         match status {
             Ok(st) if st.success() => {}
-            Ok(st) => eprintln!("warn: ip route replace {} via {} -> {}", s.ip(), gateway, st),
-            Err(e) => eprintln!("warn: ip route replace failed: {}", e),
+            Ok(st) => emiteln!("warn: ip route replace {} via {} -> {}", s.ip(), gateway, st),
+            Err(e) => emiteln!("warn: ip route replace failed: {}", e),
         }
     }
 }
@@ -418,7 +419,7 @@ fn add_egress_rule(bind_ip: &SocketAddr, gateway: &str) {
         .status();
     if let Ok(st) = status {
         if !st.success() {
-            eprintln!("warn: ip rule egress {} -> {}", from, st);
+            emiteln!("warn: ip rule egress {} -> {}", from, st);
         }
     }
 }
@@ -435,7 +436,7 @@ async fn resolve_stun(hosts: &[String]) -> Vec<SocketAddrV4> {
                     }
                 }
             }
-            Err(e) => eprintln!("warn: resolve {} failed: {}", h, e),
+            Err(e) => emiteln!("warn: resolve {} failed: {}", h, e),
         }
     }
     out
@@ -463,11 +464,11 @@ pub(crate) async fn keepalive_loop(
         let txn = stun::random_txn();
         let req = stun::binding_request(&txn);
         if let Err(e) = sock.send_to(&req, server).await {
-            eprintln!("warn: keepalive send to {} failed: {}", server, e);
+            emiteln!("warn: keepalive send to {} failed: {}", server, e);
         }
         let rotated = state.lock().await.note_silence();
         if rotated {
-            eprintln!(
+            emiteln!(
                 "keepalive: STUN server unresponsive, rotated to {}",
                 state.lock().await.current_server()
             );
@@ -503,7 +504,7 @@ pub(crate) async fn run_slot(
         let (n, src) = match sock.recv_from(&mut buf).await {
             Ok(x) => x,
             Err(e) => {
-                eprintln!("warn: recv failed: {}", e);
+                emiteln!("warn: recv failed: {}", e);
                 continue;
             }
         };
@@ -555,7 +556,7 @@ pub(crate) async fn run_slot(
                 t.stamp_activity_if_stale(bind_port, Epoch::now(), LEASE_STAMP_MIN_S);
             }
             if let Err(e) = forward::forward(pkt, src_v4, target) {
-                eprintln!("warn: forward {} -> {} failed: {}", src_v4, target, e);
+                emiteln!("warn: forward {} -> {} failed: {}", src_v4, target, e);
             }
         }
     }
@@ -566,7 +567,7 @@ async fn main() {
     let cfg = match parse_args() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {}", e);
+            emiteln!("error: {}", e);
             usage();
             std::process::exit(2);
         }
@@ -574,7 +575,7 @@ async fn main() {
 
     let servers = resolve_stun(&cfg.stun).await;
     if servers.is_empty() {
-        eprintln!("fatal: no STUN servers resolved");
+        emiteln!("fatal: no STUN servers resolved");
         std::process::exit(1);
     }
     add_stun_routes(&servers, &cfg.gateway);
@@ -610,7 +611,7 @@ async fn main() {
     let static_rs: Vec<u16> = static_tuples.iter().map(|t| t.0).collect();
     let (persisted, skipped) = read_leases(persist_dir);
     if skipped > 0 {
-        eprintln!("warn: {} malformed lease rows ignored", skipped);
+        emiteln!("warn: {} malformed lease rows ignored", skipped);
     }
     let granted: Vec<slot::GrantedRecord> = persisted
         .iter()
@@ -630,7 +631,7 @@ async fn main() {
         })
         .collect();
     if let Err(e) = table.restore(&static_tuples, &granted, now) {
-        eprintln!(
+        emiteln!(
             "fatal: lease table restore failed: {}",
             fmt_static_err(e, cfg.slot_lo, cfg.slot_hi)
         );
@@ -643,7 +644,7 @@ async fn main() {
     // not carry a second copy that can drift from it.
     let persisted_snapshot: Vec<persist::PersistedSlot> = snapshot(table.slots(), now);
     if let Err(e) = write_leases(persist_dir, &persisted_snapshot) {
-        eprintln!("warn: persist leases failed: {}", e);
+        emiteln!("warn: persist leases failed: {}", e);
     }
 
     // B9 GC: scan every 60 s; free granted leases expired past
@@ -667,7 +668,7 @@ async fn main() {
                 let now = Epoch::now();
                 let freed = gc_table.lock().await.gc(now, grace as u64);
                 if !freed.is_empty() {
-                    eprintln!(
+                    emiteln!(
                         "gc: freed slots {:?} (no refresh, no traffic, past grace)",
                         freed
                     );
@@ -690,7 +691,7 @@ async fn main() {
     // Pin key is uniform across statics and restored grants: the slot's own
     // (target ip, target port) tuple -> (NAT_ADDR, R) (B4; I2).
     if let Err(e) = ensure_ruleset() {
-        eprintln!("fatal: nft ruleset install failed: {}", e);
+        emiteln!("fatal: nft ruleset install failed: {}", e);
         std::process::exit(1);
     }
     let bind_ip = match cfg.bind {
@@ -699,19 +700,19 @@ async fn main() {
     };
     for s in &slots_snapshot {
         if let Err(e) = add_pin(s.target, s.target_port, s.bind_port) {
-            eprintln!(
+            emiteln!(
                 "fatal: nft add_pin {}:{} -> {} failed: {}",
                 s.target, s.target_port, s.bind_port, e
             );
             std::process::exit(1);
         }
         if let Err(e) = add_input_accept(s.bind_port, s.proto == slot::Proto::Tcp) {
-            eprintln!("fatal: nft input accept for {} failed: {}", s.bind_port, e);
+            emiteln!("fatal: nft input accept for {} failed: {}", s.bind_port, e);
             std::process::exit(1);
         }
     }
 
-    println!(
+    emitln!(
         "{{\"event\":\"start\",\"bind\":\"{}\",\"target\":\"{}\",\"stun_servers\":{},\"slots\":{}}}",
         cfg.bind,
         target,
@@ -740,7 +741,7 @@ async fn main() {
             let listener = match tcpslot::bind_pin(s.bind_port).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!(
+                    emiteln!(
                         "fatal: bind tcp slot {}:{} failed: {}",
                         bind_ip, s.bind_port, e
                     );
@@ -762,7 +763,7 @@ async fn main() {
             match UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(bind_ip, s.bind_port))).await {
                 Ok(sk) => sk,
                 Err(e) => {
-                    eprintln!("fatal: bind slot {}:{} failed: {}", bind_ip, s.bind_port, e);
+                    emiteln!("fatal: bind slot {}:{} failed: {}", bind_ip, s.bind_port, e);
                     std::process::exit(1);
                 }
             },
@@ -816,7 +817,7 @@ async fn main() {
         .await
         {
             Ok(f) => {
-                println!(
+                emitln!(
                     "{{\"event\":\"upnp\",\"lan\":\"{}:{}\",\"udn\":\"uuid:{}\"}}",
                     cfg.lan_ip,
                     cfg.upnp_port,
@@ -825,7 +826,7 @@ async fn main() {
                 Some(f)
             }
             Err(e) => {
-                eprintln!("upnp: facade unavailable, continuing without it: {}", e);
+                emiteln!("upnp: facade unavailable, continuing without it: {}", e);
                 None
             }
         }
@@ -842,16 +843,16 @@ async fn main() {
         match nft::apply_hold(&cfg.allow) {
             Ok(()) => {
                 let in_force = nft::hold_in_force();
-                println!(
+                emitln!(
                     "{{\"event\":\"hold\",\"devices\":{},\"ruleset_in_force\":{}}}",
                     cfg.allow.len(),
                     in_force
                 );
                 if !in_force {
-                    eprintln!("hold: policy installed but not readable back from table ip dslp");
+                    emiteln!("hold: policy installed but not readable back from table ip dslp");
                 }
             }
-            Err(e) => eprintln!("hold: policy install failed (flows keep the router timeouts): {}", e),
+            Err(e) => emiteln!("hold: policy install failed (flows keep the router timeouts): {}", e),
         }
     }
 
@@ -870,19 +871,19 @@ async fn main() {
             .map(|s| (bind_ip, s.bind_port))
             .collect();
         let cdc: Box<dyn cdc::Cdc> = match cfg.cdc {
-            cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(held.clone(), cfg.max_rescues)),
+            cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(held.clone(), cfg.max_rescues, cfg.allow.clone())),
             cdc::CdcKind::Nft => {
                 // The mirror is part of the daemon's ruleset but only when
                 // the observation engine is enabled — the production daemon
                 // (no --observation) keeps today's byte-identical ruleset.
                 if let Err(e) = ensure_flow_obs() {
-                    eprintln!("fatal: nft flow_obs mirror install failed: {}", e);
+                    emiteln!("fatal: nft flow_obs mirror install failed: {}", e);
                     std::process::exit(1);
                 }
-                Box::new(cdc::NftCdc::new(held.clone(), cfg.max_rescues))
+                Box::new(cdc::NftCdc::new(held.clone(), cfg.max_rescues, cfg.allow.clone()))
             }
             cdc::CdcKind::Aya => {
-                eprintln!("fatal: --cdc aya is not built yet");
+                emiteln!("fatal: --cdc aya is not built yet");
                 std::process::exit(2);
             }
         };
@@ -909,7 +910,7 @@ async fn main() {
         tokio::spawn(async move {
             engine.run().await;
         });
-        println!(
+        emitln!(
             "{{\"event\":\"observe\",\"cdc\":\"{}\",\"max_rescues\":{},\"allowed\":{},\"hold\":{}}}",
             cdc_name,
             cfg.max_rescues,
@@ -932,7 +933,7 @@ async fn main() {
                     tokio::spawn(async move {
                         f.pcp_serve(sock, peer).await;
                     });
-                    println!(
+                    emitln!(
                         "{{\"event\":\"pcp\",\"bind\":\"{}:{}\",\"peer\":{}}}",
                         cfg.lan_ip,
                         pcp::PORT,
@@ -940,12 +941,12 @@ async fn main() {
                     );
                 }
                 Err(e) => {
-                    eprintln!("fatal: pcp listener bind {}:{} failed: {}", cfg.lan_ip, pcp::PORT, e);
+                    emiteln!("fatal: pcp listener bind {}:{} failed: {}", cfg.lan_ip, pcp::PORT, e);
                     std::process::exit(1);
                 }
             },
             None => {
-                eprintln!("fatal: --pcp needs the facade (--no-upnp removes it)");
+                emiteln!("fatal: --pcp needs the facade (--no-upnp removes it)");
                 std::process::exit(2);
             }
         }
