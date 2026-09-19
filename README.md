@@ -1,6 +1,6 @@
 # ds-lite-punch
 
-**ds-lite-punch = DS-Lite Proxy UPnP NAT/CGNAT Holder.**
+**DS-Lite Proxy UPnP NAT/CGNAT Holder (ds-lite-punch).**
 
 This daemon runs on a router at the end of a ds-lite line. It holds one path
 through the carrier CGNAT open. It sends inbound traffic to one host on the
