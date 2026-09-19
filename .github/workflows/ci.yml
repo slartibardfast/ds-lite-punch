@@ -52,4 +52,16 @@ jobs:
       # transcription.
       - name: Print the artifact hash as `.host-software` records it
         run: |
-          printf 'artifact = %s %s\n' "$ARTIFACT" "$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
+          printf 'artifact = %s %s\n' "$ARTIFACT" "$(sha256sum "$ARTIFACT" | cut -d' ' -f1)" | tee artifact-record.txt
+      # The artifact leaves the job with its hash, so what ships can be the
+      # bytes GitHub built rather than a local build of the same source. With
+      # an upload that can silently produce nothing, absence would read as
+      # success, so a missing file fails the job.
+      - name: Upload the artifact and the line that records it
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds-lite-punch-x86_64-unknown-linux-musl
+          path: |
+            target/x86_64-unknown-linux-musl/release/ds-lite-punch
+            artifact-record.txt
+          if-no-files-found: error
