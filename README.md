@@ -1,44 +1,80 @@
 # ds-lite-punch
 
-CGNAT-aware UDP relay for the Virgin Media Ireland ds-lite softwire, plus PCP
-and UPnP IGDv1 facade work — **code only** (design docs and the operational
-agentic structure live in the rope-agentic monorepo and will be moved here
-later).
+**ds-lite-punch = DS-Lite Proxy UPnP NAT/CGNAT Holder.**
 
-- Single-binary Rust daemon holding a live CGNAT mapping via STUN and
-  forwarding inbound UDP to a br-lan target with source preserved.
-- Built for the ImmortalWrt router host: musl-static
-  `x86_64-unknown-linux-musl`, no TLS, leanish deps.
+This daemon runs on a router at the end of a ds-lite line. It holds one path
+through the carrier CGNAT open. It sends inbound traffic to one host on the
+local network.
 
-## UPnP IGD facade (plan/0007 phase E)
+## What it does
 
-Enabled by default (E1–E8): an SSDP responder on br-lan, the IGD
-description chain (`rootDesc.xml` + `WANIPConnection:1`/`WANPPPConnection:1`
-SCPDs cribbed from miniupnpd), SOAP with POST and M-POST parity, GENA
-subscriptions, and `AddPortMapping` grants for UDP and TCP that build real
-datapaths (the call/0017 TCP slot for TCP). `--no-upnp` disables it;
-`--upnp-port` and `--lan-ip` (default 49152 / 192.168.21.1) place it.
+- **Hold.** The daemon keeps one external mapping for the router. A STUN
+  request every two seconds keeps the mapping alive and reads its external
+  address and port.
+- **Forward.** The daemon sends inbound UDP and TCP to a target on the local
+  network. The target sees the real source address of the peer.
+- **Answer.** The daemon answers UPnP IGD, PCP and NAT-PMP. A client can ask
+  for a mapping, and it can read the mapping back.
 
-**Documented divergences from a conventional IGD** (E8): the AFTR dictates
-the external tuple, so a grant cannot honour the requested external port —
-the request is the mapping key ("report-requested"), the granted R is
-reported through enumeration, and the real external tuple arrives via STUN
-publication; `GetExternalIPAddress` returns the live STUN value (never
-0.0.0.0; a pre-discovery request is answered from the last published tuple,
-and a reboot-fresh box with no tuple yet answers ActionFailed rather than
-fabricating an address); and unlike miniupnpd's leases file there is no
-lease-file tail escape — the lease table is capped (`--max-slots`,
-`--max-maps-per-client`) and persisted atomically.
-miniupnpd's "WAN-deaf" behaviour (an IGD that never answers) is likewise not
-reproduced: the facade answers on br-lan as soon as it starts, and
-`SIGTERM` sends the SSDP byebye NOTIFYs before exit.
+## State at 2026-09-19
 
-## Layout
+Working on the test router today:
 
-| Path | What |
+- A held mapping survives the silence of its client. The external vantage
+  answered the mapping after 30, 60, 120 and 300 seconds of silence
+  ([measurements](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/results/RESULTS-2026-09-18-held-mapping-silence.md)).
+- Inbound UDP and TCP forward to the target, with the source address kept.
+- The UPnP IGD facade answers for both service versions: `WANIPConnection:1`
+  and `WANIPConnection:2`, with `DeviceProtection:1`.
+- PCP and NAT-PMP answer on UDP port 5351, on the local network only.
+- The hold admission: the operator names the devices that receive the hold.
+- The collision rules hold for a port that nobody allocated.
+
+Evidence, for a reader who must re-derive these claims:
+
+| Item | Value |
 |---|---|
-| `src/` | crate code (STUN codec, slot table with PCP/UPnP indices, mapping state machine, forward, nft, observation engine, the UPnP facade: `upnp.rs` pure core + `upnpsvc.rs` runtime) |
-| `deploy/` | procd init script, env, install.sh |
+| pin | the commit in the host record, [`.host-software`](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/.host-software) |
+| branch | `main` |
+| toolchain | `ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a` |
+| build | `cargo build --release --target x86_64-unknown-linux-musl` |
+| artifact | `target/x86_64-unknown-linux-musl/release/ds-lite-punch` |
+| artifact sha256 | `ab0f9bd517ef075885fd5b6e6a91b9fcc7e64ad9805e7d6450f2bd3eefd11a45` |
+| tests | 196 passed, 1 ignored |
+| proofs | Kani harnesses: the STUN codec, the slot and holder invariants, the SSDP grammar, the SOAP dispatch, the enumeration index, the session identifier, the sequence number |
+| lane | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+
+The lane runs the tests and the release build inside the toolchain image above.
+It prints the artifact line that the host record uses. It uploads the binary,
+and an empty upload fails the job. The test router runs the bytes from the lane
+([call/0032](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0032-the-builder-of-record-is-the-lane.md)).
+
+## Limits
+
+- The carrier chooses the external port. A request for a port is a key, and it
+  is not a promise ([call/0018](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0018-igd-facade-honours-requests-as-reported.md)).
+- A device receives the hold only when the operator names it
+  ([call/0029](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0029-the-named-device-is-the-admission.md)).
+- One client holds one mapping on one port
+  ([call/0022](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0022-requested-port-is-a-per-client-label.md)).
+- The carrier drops an idle UDP mapping in 5 to 10 seconds. It drops an idle
+  TCP mapping in 120 to 300 seconds. These numbers are measured on this line
+  ([call/0030](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0030-a-mapping-ends-with-its-device.md)).
+
+## Future work
+
+1. **The lobby case.** A console in a lobby sends no traffic. The hold must
+   survive that silence on a real console. This test needs the operator
+   ([plan/0009](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0009-mapping-hold-and-signalling/README.md)).
+2. **The Kani suite on a larger host.** The full suite waits for a host with
+   more memory
+   ([call/0019](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0019-facade-kani-deferred-to-larger-host.md)).
+3. **The R4 rule.** A late collision moves an allocation, and it never moves a
+   punch. Decide if the rule must follow the protocol of the entry
+   ([call/0027](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0027-collisions-for-punched-ports.md),
+   [result](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/results/RESULTS-2026-09-18-collision-yield.md)).
+4. **EIF loss.** Detect a change in the filtering behaviour of the carrier
+   ([plan/0004](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0004-ds-lite-punch/README.md)).
 
 ## Build
 
@@ -46,18 +82,35 @@ reproduced: the facade answers on br-lan as soon as it starts, and
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Formal verification via `cargo kani` over the parser and pure state machine
-(bit-precise, all inputs): STUN codec, slot/holder invariants, SSDP grammar,
-SOAP dispatch with M-POST parity, enumeration index math, SID/SEQ.
+A local build is for iteration. It is not a deployment source.
 
-## DeviceProtection bootstrap
+## Deploy
 
-The v2 facade's mapping mutators need an authenticated `Basic` session, and
-the device has no in-band way to create its first identity (the WPS
-introduction protocol is deferred, `call/0021`), so an empty store refuses
-every role-gated action. The operator seeds it: write `/etc/ds-lite-punch.acl`
-(root, mode 600) in the store's tab-separated form and restart the service.
-The init script copies it into the state directory at start and only when no
-store exists yet, so it creates the first identity and never reverts a store
-the device already holds. The format and the PBKDF2 derivation are documented
-in `deploy/ds-lite-punch.env`; `call/0023` records the decision.
+1. Write the device list to `/etc/ds-lite-punch.allow`.
+2. Make the first `DeviceProtection` identity in `/etc/ds-lite-punch.acl`, then
+   restart the service
+   ([call/0023](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0023-the-operator-bootstraps-deviceprotection.md)).
+3. Install the binary from a lane run. Check the hash against the host record
+   before the service starts.
+
+## Where the thought lives
+
+The plans, the decisions and the record are in the host repository:
+[agentic-ds-lite-punch](https://github.com/slartibardfast/agentic-ds-lite-punch).
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| AFTR | the carrier router at the far end of the ds-lite tunnel |
+| CGNAT | carrier-grade network address translation |
+| ds-lite | dual-stack lite: IPv4 over a tunnel to the carrier |
+| mapping | one external address and port that the carrier holds open |
+| STUN | the protocol that keeps the mapping and reads it |
+| UPnP IGD | the UPnP Internet Gateway Device interface |
+| DeviceProtection | the UPnP service that authenticates a control point |
+| PCP | Port Control Protocol, a way for a client to ask for a mapping |
+| NAT-PMP | NAT Port Mapping Protocol, the older form of that request |
+| procd | the service manager on the router |
+| pin | the source commit that the host record names |
+| artifact | the release binary that the lane builds from the pin |
