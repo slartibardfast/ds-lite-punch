@@ -28,11 +28,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # The development host's own command, release profile included: the
-      # profile carries lto, codegen-units=1 and strip, so a debug-profile pass
-      # would test a different program than the one that ships.
-      - name: Build and test
-        run: cargo test --release --locked
+      # The crate's .cargo/config.toml targets musl for every cargo command, so
+      # the tests are built, and their static binaries run, inside the same
+      # pinned toolchain the artifact is built in. A runner-side rustup would
+      # be a second compiler: the profile carries lto, codegen-units=1 and
+      # strip, so a debug-profile or foreign-toolchain pass would test a
+      # different program than the one that ships.
+      - name: Build and test in the pinned toolchain
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'cargo test --release --locked'
 
   release-build:
     runs-on: ubuntu-latest
