@@ -1,0 +1,50 @@
+# The component's own lane.
+#
+# The host's Reproducible build workflow rebuilds from the pin inside a
+# digest-pinned container and compares the result with the hash recorded in
+# `.host-software`. This lane runs the same recipe the same way, with the same
+# image and the same /src mount, so that a hash printed here is a hash the host
+# will reproduce rather than a second opinion about a different build. It is
+# also where that hash comes from when the record has to be re-derived, which
+# is the difference between a recorded anchor and an asserted one.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1" # weekly, so drift finds us before a release does
+
+env:
+  # One definition of the toolchain, by digest. The same value is what the host
+  # records in `.host-software`; a tag would be movable and a moved toolchain
+  # silently invalidates every hash ever recorded under it.
+  TOOLCHAIN: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
+  ARTIFACT: target/x86_64-unknown-linux-musl/release/ds-lite-punch
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The development host's own command, release profile included: the
+      # profile carries lto, codegen-units=1 and strip, so a debug-profile pass
+      # would test a different program than the one that ships.
+      - name: Build and test
+        run: cargo test --release --locked
+
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the release artifact in the pinned toolchain
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'cargo build --release --locked --target x86_64-unknown-linux-musl'
+      # The hash is the point of this job. It is printed in the form the host's
+      # record uses, so re-deriving the anchor is a copy rather than a
+      # transcription.
+      - name: Print the artifact hash as `.host-software` records it
+        run: |
+          printf 'artifact = %s %s\n' "$ARTIFACT" "$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
