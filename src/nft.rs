@@ -115,45 +115,67 @@ pub fn hold_in_force() -> bool {
     crate::hold::present(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// The match half of a slot's accept rule: every discriminator, no verb.
-/// `insert` builds a rule from it and `delete` removes one by it, so a delete
-/// needs no handle and never parses a listing. One definition, so the rule
-/// the daemon installs is the rule it can remove.
-fn accept_match(bind_port: u16, tcp: bool) -> Vec<String> {
-    let kw = if tcp { "tcp" } else { "udp" };
+/// The daemon's accept sets, inside fw4's table: a slot's inbound accept is an
+/// *element* of the set its protocol uses, and the two rules that accept the
+/// sets are installed once.
+///
+/// This is a fix, not a style. `delete rule` by expression is refused by this
+/// nft ("syntax error, unexpected iifname, expecting handle"), so a per-port
+/// rule could only be removed by a handle read out of
+/// `nft -a list chain inet fw4 input` — the listing the libnftables segfaults
+/// come from — and a delete that failed left the rule installed: two accept
+/// rules from earlier daemons were still on the test router, one of them for a
+/// protocol this build does not enable. An element is addressed by key, so
+/// nothing in the datapath needs a handle, and both sets are emptied when the
+/// daemon installs them, so no port outlives the process that wanted it.
+pub const ACCEPT_SET_UDP: &str = "dslp_ports_udp";
+pub const ACCEPT_SET_TCP: &str = "dslp_ports_tcp";
+
+fn accept_set(tcp: bool) -> &'static str {
+    if tcp {
+        ACCEPT_SET_TCP
+    } else {
+        ACCEPT_SET_UDP
+    }
+}
+
+/// One element operation on the set, as argv: the verb and the key.
+fn accept_element(verb: &str, r: u16, tcp: bool) -> Vec<String> {
     vec![
-        "iifname".into(),
-        "\"eth1\"".into(),
-        kw.into(),
-        "dport".into(),
-        bind_port.to_string(),
-        "accept".into(),
-        "comment".into(),
-        format!(
-            "\"dslitepunch-{}{}\"",
-            bind_port,
-            if tcp { "-tcp" } else { "" }
-        ),
+        verb.into(),
+        "element".into(),
+        "inet".into(),
+        "fw4".into(),
+        accept_set(tcp).into(),
+        format!("{{ {} }}", r),
     ]
 }
 
-/// The per-slot accept rule text (shared by the grant batch and the
-/// fallback path so the comment and match never drift).
-fn accept_rule(bind_port: u16, tcp: bool) -> String {
-    format!(
-        "insert rule inet fw4 input {}",
-        accept_match(bind_port, tcp).join(" ")
-    )
+/// The two rules that accept the sets, one per protocol. One definition, so
+/// the rules the daemon installs are the rules it checks for. They carry no
+/// comment, which is also what keeps the legacy sweep below off them.
+fn accept_rule_text() -> [String; 2] {
+    [
+        format!("iifname \"eth1\" udp dport @{} accept", ACCEPT_SET_UDP),
+        format!("iifname \"eth1\" tcp dport @{} accept", ACCEPT_SET_TCP),
+    ]
 }
 
-/// Grant a slot datapath atomically: the snat_map pin and the input-accept
-/// in one `nft -f -` batch (one subprocess, all-or-nothing). Falls back to
-/// the per-op functions when the batch fails (e.g. the respawn re-add case
-/// where `add element` EEXISTs — `add_pin` tolerates that by value check,
-/// and `add_input_accept` cleans a stale rule first). The stale-rule edge
-/// (same R re-granted after the revoke) is handled by the fallback; a
-/// duplicate accept is otherwise unreachable because R reuse only follows
-/// a successful revoke.
+/// Handles of the per-port accept rules an older daemon installed: the lines
+/// whose comment names this daemon. The sets' own rules carry no such
+/// comment, so the sweep can never take them.
+fn legacy_rule_handles(listing: &str) -> Vec<u64> {
+    listing
+        .lines()
+        .filter(|l| l.contains("dslitepunch"))
+        .filter_map(|l| l.split_whitespace().last())
+        .filter_map(|t| t.parse::<u64>().ok())
+        .collect()
+}
+
+/// Grant a slot's datapath: the port joins the accept set its protocol uses.
+/// One element operation, addressed by key, so there is nothing to clean up
+/// first and nothing that can be left behind.
 pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
     // The client's own (client, int_port) is deliberately not pinned. That
     // pin made the client's traffic egress through the slot's port, so one
@@ -166,25 +188,20 @@ pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool
     // slot's own punch keeps its tuple through its own bound socket, and the
     // inbound path needs nothing of the client's egress.
     let _ = (client, int_port);
-    // All or nothing: the accept rule alone, in one batch, with the per-op
-    // path as the fallback for the respawn re-add case.
-    let script = format!("{}\n", accept_rule(bind_port, tcp));
-    if run_script(&script).is_ok() {
-        return Ok(());
-    }
     add_input_accept(bind_port, tcp)
 }
 
-/// Revoke a slot datapath atomically: element delete plus rule delete (by
-/// expression — no handle lookup) in one batch; falls back to the per-op
-/// functions.
+/// Revoke a slot's datapath: the port leaves its accept set, and the
+/// snat_map element goes too for the paths that still pin (the arm's
+/// self-pin and the statics).
 pub fn revoke_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
     let script = format!(
         "delete element ip dslp snat_map {{ {} . {} }}\n\
-         delete rule inet fw4 input {}\n",
+         delete element inet fw4 {} {{ {} }}\n",
         client,
         int_port,
-        accept_match(bind_port, tcp).join(" ")
+        accept_set(tcp),
+        bind_port
     );
     if run_script(&script).is_ok() {
         return Ok(());
@@ -221,6 +238,57 @@ pub fn ensure_ruleset() -> io::Result<()> {
             "oifname", "\"eth1\"", "meta", "l4proto", "tcp",
             "snat", "to", "ip", "saddr", ".", "tcp", "sport", "map", "@snat_map",
         ])?;
+    }
+    ensure_accept_sets()?;
+    Ok(())
+}
+
+/// Install the accept sets and their two rules, empty both sets, and take away
+/// any per-port rule an older daemon left behind. Idempotent. The listing is
+/// read once, for the two questions it can answer — is the accept rule already
+/// there, and is there legacy litter — and never for the datapath, which is
+/// what keeps a handle out of every per-slot operation.
+pub fn ensure_accept_sets() -> io::Result<()> {
+    let listing = Command::new("nft")
+        .args(["list", "chain", "inet", "fw4", "input"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    for text in accept_rule_text() {
+        let tcp = text.contains(ACCEPT_SET_TCP);
+        let _ = run(&[
+            "add",
+            "set",
+            "inet",
+            "fw4",
+            accept_set(tcp),
+            "{ type inet_service ; size 65535 ; }",
+        ]);
+        // With no listing there is no way to know whether the rule is already
+        // installed, and a duplicate accept changes nothing about which
+        // packets pass: leave it alone rather than add a second rule.
+        let present = listing
+            .as_deref()
+            .map(|l| l.contains(&text))
+            .unwrap_or(true);
+        if !present {
+            run(&["add", "rule", "inet", "fw4", "input", &text])?;
+        }
+        // a restart must not inherit the last run's accepted ports
+        let _ = run(&["flush", "set", "inet", "fw4", accept_set(tcp)]);
+    }
+    if let Some(l) = listing.as_deref() {
+        for h in legacy_rule_handles(l) {
+            let _ = run(&[
+                "delete",
+                "rule",
+                "inet",
+                "fw4",
+                "input",
+                "handle",
+                &h.to_string(),
+            ]);
+        }
     }
     Ok(())
 }
@@ -368,57 +436,39 @@ pub fn del_pin(client: Ipv4Addr, client_port: u16) -> io::Result<()> {
     ])
 }
 
-/// Per-slot wan input-accept so the relay socket receives on the hub-LAN
-/// interface. Protocol-specific (`udp`/`tcp` dport); unique comment per
-/// slot and proto (`dslitepunch-<R>` / `dslitepunch-<R>-tcp`);
-/// replace-not-dup. The TCP arm is mandatory for the splice: fw4's input
-/// chain drops forwarded TCP NEW silently (the C3 finding).
+/// Open the hub-LAN input for one slot's port: the port joins the accept set
+/// its protocol uses. Two sets, because the TCP arm is mandatory for the
+/// splice (fw4's input chain drops forwarded TCP NEW silently, the C3
+/// finding) and one set for both protocols would open a TCP accept for a UDP
+/// slot's port. An element addressed by key, so the accept can always be
+/// taken away again.
 pub fn add_input_accept(r: u16, tcp: bool) -> io::Result<()> {
-    // delete any stale rule with this match first (idempotent add)
-    let _ = del_input_accept(r, tcp);
-    let mut args: Vec<String> = vec![
-        "insert".into(),
-        "rule".into(),
-        "inet".into(),
-        "fw4".into(),
-        "input".into(),
-    ];
-    args.extend(accept_match(r, tcp));
+    let args = accept_element("add", r, tcp);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run(&refs)
 }
 
-/// Delete a slot's accept rule by its match expression, never by handle. A
-/// handle has to be read out of `nft -a list chain inet fw4 input`, which is
-/// both the listing the libnftables segfaults come from and the reason a
-/// failed delete leaves the rule behind: two accept rules from earlier
-/// daemons are still installed on the test router, one of them for a
-/// protocol this build does not enable. A match needs no listing, so the rule
-/// the daemon installs is always one it can remove. Not present is fine.
+/// Close it again: the port leaves the set. Not present is fine, and cannot
+/// hide a leftover the way a per-port rule could: an element is addressed by
+/// key rather than by a handle read out of `nft -a list`, and the sets are
+/// emptied when the daemon installs them.
 pub fn del_input_accept(r: u16, tcp: bool) -> io::Result<()> {
-    let mut args: Vec<String> = vec![
-        "delete".into(),
-        "rule".into(),
-        "inet".into(),
-        "fw4".into(),
-        "input".into(),
-    ];
-    args.extend(accept_match(r, tcp));
+    let args = accept_element("delete", r, tcp);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // `delete rule` removes the first match. A duplicate can only come from
-    // an older daemon, so it is deleted while one remains, bounded so a
-    // misbehaving nft can never spin here.
-    for _ in 0..4 {
-        if run(&refs).is_err() {
-            break;
-        }
-    }
+    let _ = run(&refs);
     Ok(())
 }
 
-/// Remove the whole ruleset (shutdown / clean restore). Best-effort.
+/// Remove the ruleset (shutdown / clean restore). Best-effort: the daemon's
+/// own table goes wholesale, and the accept sets are emptied, so no port stays
+/// open for a process that is not there. The two accept rules stay installed —
+/// they accept an empty set, which accepts nothing, and leaving them avoids
+/// churn in fw4 on every restart.
 pub fn remove_ruleset() {
     let _ = run(&["delete", "table", "ip", "dslp"]);
+    for tcp in [false, true] {
+        let _ = run(&["flush", "set", "inet", "fw4", accept_set(tcp)]);
+    }
 }
 
 #[cfg(test)]
@@ -431,51 +481,76 @@ mod tests {
     }
 
     #[test]
-    fn a_slots_accept_rule_is_matched_by_expression_never_by_handle() {
-        // The delete must not depend on parsing `nft -a list chain inet fw4
-        // input`: that listing is the path the libnftables segfaults come
-        // from, and a delete that depends on it leaves the rule behind when
-        // it fails. Two such rules from earlier daemons are still installed
-        // on the test router, one of them for a protocol this build does not
-        // even enable. Every discriminator therefore lives in one match, so
-        // `delete rule` finds the rule without a handle.
-        let udp = accept_match(40001, false);
+    fn a_slots_accept_is_a_set_element_never_a_rule_handle() {
+        // `delete rule` by expression is refused by this nft ("syntax error,
+        // unexpected iifname, expecting handle"), so a per-port *rule* could
+        // only be removed by a handle read out of `nft -a list chain inet fw4
+        // input`, and a delete that failed left the rule installed: two accept
+        // rules from earlier daemons were still on the test router. A slot's
+        // accept is an *element* of the set its protocol uses, addressed by
+        // key.
+        assert_eq!(accept_set(false), "dslp_ports_udp");
+        assert_eq!(accept_set(true), "dslp_ports_tcp");
+        let add = accept_element("add", 40001, false);
         assert_eq!(
-            udp,
+            add,
             vec![
-                "iifname",
-                "\"eth1\"",
-                "udp",
-                "dport",
-                "40001",
-                "accept",
-                "comment",
-                "\"dslitepunch-40001\"",
+                "add",
+                "element",
+                "inet",
+                "fw4",
+                "dslp_ports_udp",
+                "{ 40001 }"
             ]
         );
-        let tcp = accept_match(40002, true);
-        assert_eq!(tcp[2], "tcp", "the protocol is in the match");
-        assert!(
-            tcp[7].contains("-tcp"),
-            "the comment is in the match: {:?}",
-            tcp[7]
+        let del = accept_element("delete", 40002, true);
+        assert_eq!(
+            del,
+            vec![
+                "delete",
+                "element",
+                "inet",
+                "fw4",
+                "dslp_ports_tcp",
+                "{ 40002 }"
+            ]
         );
         assert!(
-            !udp.iter().any(|t| t == "-a" || t == "list" || t == "handle"),
-            "a match is not a listing: {:?}",
-            udp
+            !add.iter().any(|t| t == "rule" || t == "handle" || t == "-a"),
+            "an element is not a rule and needs no handle: {:?}",
+            add
         );
     }
 
     #[test]
-    fn the_insert_and_the_delete_share_one_match() {
-        // One definition, so the rule the daemon installs is the rule it can
-        // remove: a drift between the two is a rule that can never be
-        // deleted, and it stays installed until the router reboots.
-        let m = accept_match(40003, false).join(" ");
-        assert_eq!(
-            accept_rule(40003, false),
-            format!("insert rule inet fw4 input {}", m)
+    fn the_two_protocols_use_two_sets() {
+        // One set for both protocols would open a TCP accept for a UDP slot's
+        // port; the TCP arm exists for the splice, not for every slot. And the
+        // sets' own rules must carry no daemon comment, or the legacy sweep
+        // would delete them on the next start.
+        assert_ne!(accept_set(false), accept_set(true));
+        let rules = accept_rule_text();
+        assert_eq!(rules[0], "iifname \"eth1\" udp dport @dslp_ports_udp accept");
+        assert_eq!(rules[1], "iifname \"eth1\" tcp dport @dslp_ports_tcp accept");
+        assert!(
+            !rules.iter().any(|r| r.contains("dslitepunch")),
+            "the sweep must never see the sets' own rules: {:?}",
+            rules
+        );
+    }
+
+    #[test]
+    fn the_legacy_sweep_takes_only_the_daemons_per_port_rules() {
+        // A real listing shape: the sets' two rules, one rule an older daemon
+        // left behind, and fw4's own traffic.
+        let listing = "\t\tiifname \"eth1\" udp dport @dslp_ports_udp accept\n\
+                       \t\tiifname \"eth1\" tcp dport @dslp_ports_tcp accept\n\
+                       \t\tiifname \"eth1\" tcp dport 40002 accept comment \"dslitepunch-40002-tcp\" # handle 137\n\
+                       \t\tct state established accept\n";
+        assert_eq!(legacy_rule_handles(listing), vec![137]);
+        assert!(legacy_rule_handles("").is_empty());
+        assert!(
+            legacy_rule_handles("iifname \"eth1\" udp dport @dslp_ports_udp accept").is_empty()
         );
     }
 
