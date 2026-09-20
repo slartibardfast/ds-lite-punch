@@ -699,9 +699,10 @@ impl UpnpFacade {
                     }
                 }
                 Err(e) => {
-                    // bind failed: roll back nft + table
+                    // bind failed: roll back nft + table. No pin to remove:
+                    // the facade's grant installs none (the arm and the TCP
+                    // holder pin their own flows and clean them up themselves).
                     let _ = nft::del_input_accept(bind_port, proto == Proto::Tcp);
-                    let _ = nft::del_pin(client, int_port);
                     let mut t = self.table.lock().await;
                     t.delete_by_bind_port(bind_port);
                     emiteln!("upnp: slot bind {} failed: {}", bind_port, e);

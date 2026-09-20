@@ -351,11 +351,17 @@ pub fn revoke_statements(bind_port: u16, tcp: bool) -> Vec<String> {
 /// The revoke is read back rather than trusted, because a translation left
 /// behind is not litter: the port can be reallocated to another client, and a
 /// stale translation would deliver that client's traffic to the wrong host.
+///
+/// It removes no pin. The facade installs none, so a pin delete could only
+/// fail and print nft's own error into the log; the paths that do pin — the
+/// arm's self-pin and the TCP holder — remove their own with `del_pin`. This
+/// was the last of the log's error lines, measured on the router on
+/// 2026-09-20: three of them at 21:58, one per expired lease.
 pub fn revoke_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
+    let _ = (client, int_port);
     for stmt in revoke_statements(bind_port, tcp) {
         let _ = run_script(&format!("{}\n", stmt));
     }
-    let _ = del_pin(client, int_port);
     if inbound_set_has(bind_port, tcp) {
         emiteln!(
             "warn: revoke left the inbound translation for {} in {}",
