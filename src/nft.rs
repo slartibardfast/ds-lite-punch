@@ -213,11 +213,29 @@ pub fn inbound_rule_text(tcp: bool) -> String {
     )
 }
 
+/// The argv that installs the prerouting chain. Its own function because the
+/// first deployment of this design left it out, and the failure was total:
+/// the rule could not be added to a chain that did not exist, the install
+/// returned an error, and the daemon refused to run rather than run blind.
+fn inbound_chain_argv() -> Vec<String> {
+    vec![
+        "add".into(),
+        "chain".into(),
+        "ip".into(),
+        "dslp".into(),
+        "prerouting".into(),
+        "{ type nat hook prerouting priority -150 ; policy accept ; }".into(),
+    ]
+}
+
 /// Install the inbound sets, maps, chain and rules. Idempotent, and the sets
 /// are emptied like the accept sets: a restart re-grants every lease it
 /// restored, and a port no lease owns must not survive the process that
 /// wanted it.
 pub fn ensure_inbound() -> io::Result<()> {
+    let argv = inbound_chain_argv();
+    let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let _ = run(&refs); // EEXIST when the chain is already there
     let mut listing = String::new();
     if let Ok(o) = Command::new("nft")
         .args(["list", "chain", "ip", "dslp", "prerouting"])
@@ -877,6 +895,21 @@ mod tests {
             argv
         );
         assert_eq!(argv[5], carrier_probe_rule_text());
+    }
+
+    #[test]
+    fn the_inbound_chain_is_installed_before_its_rule() {
+        let argv = inbound_chain_argv();
+        assert_eq!(argv[0], "add");
+        assert_eq!(argv[1], "chain");
+        assert_eq!(argv[4], "prerouting");
+        assert!(
+            argv[5].contains("nat hook prerouting"),
+            "the translation needs the nat prerouting hook: {:?}",
+            argv
+        );
+        // and it must run ahead of fw4's own dstnat at the hook's default
+        assert!(argv[5].contains("priority -150"), "{:?}", argv);
     }
 
     #[test]
