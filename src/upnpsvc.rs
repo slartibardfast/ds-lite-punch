@@ -3210,24 +3210,33 @@ fn apply_entry(
     // their own real tuples. This is where the supersession lands: the
     // specification's one-holder rule assumes the device owns the external
     // port, and here it does not.
-    if let Some(idx) = es
-        .iter()
-        .position(|e| e.req_ext == req_ext && e.proto == proto && e.owner == owner)
-    {
-        let stray = if es[idx].bind_port != bind_port {
-            Some((es[idx].bind_port, es[idx].client, es[idx].int_port))
-        } else {
-            None
-        };
-        let e = &mut es[idx];
-        e.req_ext = req_ext;
-        e.client = client;
-        e.int_port = int_port;
-        e.bind_port = bind_port;
-        e.granted_lifetime = lifetime;
-        e.expires_at_unix = expires;
-        e.desc = desc;
-        return stray;
+    // A request that names no port carries no handle, and it therefore cannot
+    // take another mapping away. Measured on the router on 2026-09-20: a PCP
+    // lease with a carrier-chosen port was torn down two seconds after it was
+    // granted, because the same client's NAT-PMP leg asked for the same
+    // no-preference key (`req_ext` 0) and its supersession named the PCP
+    // lease's slot. The loser was the client's own mapping, and any client
+    // whose library sends both protocols loses one mapping per request.
+    if req_ext != 0 {
+        if let Some(idx) = es
+            .iter()
+            .position(|e| e.req_ext == req_ext && e.proto == proto && e.owner == owner)
+        {
+            let stray = if es[idx].bind_port != bind_port {
+                Some((es[idx].bind_port, es[idx].client, es[idx].int_port))
+            } else {
+                None
+            };
+            let e = &mut es[idx];
+            e.req_ext = req_ext;
+            e.client = client;
+            e.int_port = int_port;
+            e.bind_port = bind_port;
+            e.granted_lifetime = lifetime;
+            e.expires_at_unix = expires;
+            e.desc = desc;
+            return stray;
+        }
     }
     insert_sorted(
         es,
@@ -4516,6 +4525,32 @@ mod tests {
             rebind.is_ok(),
             "slot socket must be released after revoke (rebind failed: {:?})",
             rebind.err()
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_port_preference_does_not_supersede_another() {
+        // Measured on the router on 2026-09-20: a PCP lease was torn down two
+        // seconds after it was granted, by the same client's NAT-PMP request,
+        // which asks for "any port". A request that names no port carries no
+        // handle, so it cannot take another mapping away.
+        let a = Ipv4Addr::new(192, 168, 21, 11);
+        let mut es = Vec::new();
+        assert_eq!(
+            apply_entry(&mut es, 0, Proto::Udp, a, a, 41010, 40002, 600, 1000, "pcp".to_string()),
+            None
+        );
+        assert_eq!(
+            apply_entry(&mut es, 0, Proto::Udp, a, a, 3074, 40003, 600, 1000, "npmp".to_string()),
+            None,
+            "a no-preference request must not surrender the client's other mapping"
+        );
+        assert_eq!(es.len(), 2, "{:?}", es.len());
+        let binds: Vec<u16> = es.iter().map(|e| e.bind_port).collect();
+        assert!(
+            binds.contains(&40002) && binds.contains(&40003),
+            "{:?}",
+            binds
         );
     }
 

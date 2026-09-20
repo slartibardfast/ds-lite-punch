@@ -29,7 +29,7 @@ mod carrier;
 
 use cdc::CdcKind;
 use mapping::State;
-use nft::{add_input_accept, add_pin, ensure_flow_obs, ensure_ruleset};
+use nft::{ensure_flow_obs, ensure_ruleset};
 use persist::{load_epoch, read_leases, snapshot, write_leases, DEFAULT_DIR};
 use publish::Publisher;
 use slot::{Epoch, LeaseTable, PortAllocator, StaticMapErr};
@@ -740,16 +740,21 @@ async fn main() {
         SocketAddr::V4(v4) => *v4.ip(),
         _ => Ipv4Addr::new(192, 168, 0, 21),
     };
+    // A restored slot gets exactly what a fresh grant installs: the ingress
+    // translation and the accept element. It does not get a pin. The pin's
+    // egress job is the one call/0014 settled against (one game holding two
+    // external tuples at once), and the ingress translation carries the other
+    // job the pin used to do. A restored lease that is pinned keeps that
+    // regress alive while a freshly granted one does not, and the two paths
+    // then disagree about the same slot.
     for s in &slots_snapshot {
-        if let Err(e) = add_pin(s.target, s.target_port, s.bind_port) {
+        if let Err(e) =
+            nft::grant_datapath(s.target, s.target_port, s.bind_port, s.proto == slot::Proto::Tcp)
+        {
             emiteln!(
-                "fatal: nft add_pin {}:{} -> {} failed: {}",
+                "fatal: nft grant_datapath {}:{} -> {} failed: {}",
                 s.target, s.target_port, s.bind_port, e
             );
-            std::process::exit(1);
-        }
-        if let Err(e) = add_input_accept(s.bind_port, s.proto == slot::Proto::Tcp) {
-            emiteln!("fatal: nft input accept for {} failed: {}", s.bind_port, e);
             std::process::exit(1);
         }
     }
