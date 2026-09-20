@@ -329,38 +329,33 @@ pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool
 
 /// The statements that revoke a slot's datapath. Each stands alone: the
 /// elements are deleted one by one, because a batch is all-or-nothing and the
-/// element that is already absent (the arm's own pin, when the arm never made
-/// one) used to cancel the rest of the revoke. Measured on the router on
-/// 2026-09-20: `delete element ip dslp snat_map { 192.168.21.97 . 3074 }`
-/// failed and the accept element stayed.
-pub fn revoke_statements(
-    client: Ipv4Addr,
-    int_port: u16,
-    bind_port: u16,
-    tcp: bool,
-) -> Vec<String> {
+/// element that is already absent used to cancel the rest of the revoke.
+///
+/// There is no `snat_map` statement here, and that is deliberate: the grant
+/// installs an ingress translation and no pin, so a pin delete can only ever
+/// fail. It used to log an error on every revoke while the design never
+/// created what it deleted (measured on the router on 2026-09-20: 54 error
+/// lines in one session). The paths that do pin, the arm's self-pin and the
+/// statics, remove their own with `del_pin`.
+pub fn revoke_statements(bind_port: u16, tcp: bool) -> Vec<String> {
     vec![
         format!("delete element ip dslp {} {{ {} }}", inbound_set(tcp), bind_port),
         format!("delete element ip dslp {} {{ {} }}", inbound_map(tcp), bind_port),
         format!("delete element inet fw4 {} {{ {} }}", accept_set(tcp), bind_port),
-        format!("delete element ip dslp snat_map {{ {} . {} }}", client, int_port),
     ]
 }
 
 /// Revoke a slot's datapath. Every statement runs on its own and a missing
-/// element is not a failure: the pin exists only for the paths that pin (the
-/// arm's self-pin and the statics), so its absence is the ordinary case, and
-/// an all-or-nothing batch let that ordinary case cancel the rest.
+/// element is not a failure.
 ///
 /// The revoke is read back rather than trusted, because a translation left
 /// behind is not litter: the port can be reallocated to another client, and a
 /// stale translation would deliver that client's traffic to the wrong host.
 pub fn revoke_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
-    for stmt in revoke_statements(client, int_port, bind_port, tcp) {
+    for stmt in revoke_statements(bind_port, tcp) {
         let _ = run_script(&format!("{}\n", stmt));
     }
     let _ = del_pin(client, int_port);
-    let _ = del_input_accept(bind_port, tcp);
     if inbound_set_has(bind_port, tcp) {
         emiteln!(
             "warn: revoke left the inbound translation for {} in {}",
@@ -947,11 +942,10 @@ mod tests {
 
     #[test]
     fn a_revoke_undoes_every_element_on_its_own() {
-        let client = Ipv4Addr::new(192, 168, 21, 97);
-        let stmts = revoke_statements(client, 3074, 40002, false);
-        assert_eq!(stmts.len(), 4, "{:?}", stmts);
+        let stmts = revoke_statements(40002, false);
+        assert_eq!(stmts.len(), 3, "{:?}", stmts);
         // each statement stands alone: a batch is all-or-nothing, and an
-        // absent pin used to cancel the rest of the revoke
+        // absent element used to cancel the rest of the revoke
         for s in &stmts {
             assert!(!s.contains('\n'), "one statement per run: {}", s);
             assert!(s.starts_with("delete element "), "{}", s);
@@ -959,7 +953,11 @@ mod tests {
         assert!(stmts[0].contains(&format!("{} {{ 40002 }}", INBOUND_SET_UDP)));
         assert!(stmts[1].contains(&format!("{} {{ 40002 }}", INBOUND_MAP_UDP)));
         assert!(stmts[2].contains(&format!("{} {{ 40002 }}", ACCEPT_SET_UDP)));
-        assert!(stmts[3].contains("snat_map { 192.168.21.97 . 3074 }"));
+        // and nothing deletes a pin the grant never installs: that delete
+        // failed on every revoke and put an error line in the log
+        for s in &stmts {
+            assert!(!s.contains("snat_map"), "{}", s);
+        }
     }
 
     #[test]
