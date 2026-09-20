@@ -25,6 +25,7 @@ mod tcpslot;
 mod upnp;
 mod upnpsvc;
 mod vote;
+mod carrier;
 
 use cdc::CdcKind;
 use mapping::State;
@@ -98,6 +99,14 @@ struct Config {
     upnp_port: u16,
     lan_ip: Ipv4Addr,
     upnp_name: String,
+    /// The carrier watch (call/0033): whether the daemon counts the
+    /// cooperating helper's marked probe, how often the helper is expected to
+    /// send, how many intervals of silence raise `carrier-silent`, and how
+    /// often the counter is read.
+    carrier_probe: bool,
+    carrier_probe_interval: u64,
+    carrier_probe_misses: u64,
+    carrier_probe_poll: u64,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -129,6 +138,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut upnp_port: u16 = upnp::UPNP_DEFAULT_PORT;
     let mut lan_ip = DEFAULT_LAN_IP;
     let mut upnp_name = "ds-lite-punch IGD".to_string();
+    let mut carrier_probe = false;
+    let mut carrier_probe_interval: u64 = 900;
+    let mut carrier_probe_misses: u64 = 3;
+    let mut carrier_probe_poll: u64 = 5;
     // G1 primary = the nft flow_obs mirror (gating test passed 2026-09-02);
     // /proc stays reachable as the fallback (--cdc proc).
     let mut cdc_kind = CdcKind::Nft;
@@ -237,6 +250,28 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
             "--pcp-peer" => {
                 pcp_peer = true;
                 i += 1
+            }
+            "--carrier-probe" => {
+                carrier_probe = true;
+                i += 1
+            }
+            "--carrier-probe-interval" => {
+                carrier_probe_interval = v()?
+                    .parse()
+                    .map_err(|e| format!("--carrier-probe-interval: {}", e))?;
+                i += 2
+            }
+            "--carrier-probe-misses" => {
+                carrier_probe_misses = v()?
+                    .parse()
+                    .map_err(|e| format!("--carrier-probe-misses: {}", e))?;
+                i += 2
+            }
+            "--carrier-probe-poll" => {
+                carrier_probe_poll = v()?
+                    .parse()
+                    .map_err(|e| format!("--carrier-probe-poll: {}", e))?;
+                i += 2
             }
             "--cdc" => {
                 cdc_kind = match v()?.as_str() {
@@ -352,6 +387,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         upnp_port,
         lan_ip,
         upnp_name,
+        carrier_probe,
+        carrier_probe_interval,
+        carrier_probe_misses,
+        carrier_probe_poll,
     })
 }
 
@@ -363,6 +402,8 @@ fn usage() {
          [--max-slots 32] [--max-maps-per-client 16] \
          [--gc-grace-factor 3] [--observation] [--max-rescues 8] \
          [--allowlist PATH] [--hold] [--pcp] [--pcp-peer] \
+         [--carrier-probe] [--carrier-probe-interval 900] \
+         [--carrier-probe-misses 3] [--carrier-probe-poll 5] \
          [--cdc proc|nft|aya] \
          [--upnp-port 49152] [--lan-ip 192.168.21.1] [--upnp-name NAME] \
          [--no-upnp]\n\
@@ -918,6 +959,71 @@ async fn main() {
             cfg.allow.len(),
             cfg.hold
         );
+    }
+
+    // The carrier watch (call/0033): a cooperating helper on the external
+    // vantage sends a marked datagram to the mapping's learned external tuple,
+    // and the datapath counts the mark. The daemon cannot send from a foreign
+    // address, so this is the only way it is told that the carrier still
+    // forwards a stranger's traffic. The counter is read on its own short
+    // cadence while the interval it measures is minutes long.
+    if cfg.carrier_probe {
+        if let Err(e) = nft::ensure_carrier_probe() {
+            emiteln!(
+                "warn: carrier watch install failed (nothing will be counted): {}",
+                e
+            );
+        }
+        let (interval, misses, poll) = (
+            cfg.carrier_probe_interval,
+            cfg.carrier_probe_misses,
+            cfg.carrier_probe_poll,
+        );
+        tokio::spawn(async move {
+            let epoch = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            };
+            let mut watch = carrier::Watch::new(epoch());
+            emitln!(
+                "{{\"event\":\"carrier-watch\",\"counter\":\"{}\",\"interval\":{},\"misses\":{},\"poll\":{}}}",
+                nft::CARRIER_COUNTER,
+                interval,
+                misses,
+                poll
+            );
+            let mut tick = tokio::time::interval(Duration::from_secs(poll.max(1)));
+            loop {
+                tick.tick().await;
+                let now = epoch();
+                let count = match nft::list_carrier_probe() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        emiteln!("warn: carrier watch: counter read failed: {}", e);
+                        continue;
+                    }
+                };
+                for ev in watch.poll(now, count, interval, misses) {
+                    match ev {
+                        carrier::Event::Probe { count } => emitln!(
+                            "{{\"event\":\"carrier-probe\",\"count\":{},\"epoch\":{}}}",
+                            count,
+                            now
+                        ),
+                        carrier::Event::Silent { last_seen, waited } => emitln!(
+                            "{{\"event\":\"carrier-silent\",\"last_probe\":{},\"waited\":{},\"epoch\":{}}}",
+                            last_seen
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "null".to_string()),
+                            waited,
+                            now
+                        ),
+                    }
+                }
+            }
+        });
     }
 
     // The shared port (call/0025's fourth admission, plan/0009 #pcp): PCP and

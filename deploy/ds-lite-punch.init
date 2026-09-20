@@ -85,6 +85,20 @@ start_service() {
     PCPF=
     [ "${PCP:-0}" = "1" ] && PCPF="--pcp"
     [ "${PCP_PEER:-0}" = "1" ] && PCPF="$PCPF --pcp-peer"
+
+    # The carrier watch (call/0033): the counter that records the cooperating
+    # helper's marked probe, and the silence that raises carrier-silent. Off
+    # by default, because arming it obliges the helper (deploy/
+    # carrier-probe.py) to run on a host outside the line: a helper that
+    # stopped and a carrier that stopped look the same to the counter.
+    WATCHF=
+    [ "${CARRIER_PROBE:-0}" = "1" ] && WATCHF="--carrier-probe"
+    [ -n "$CARRIER_PROBE_INTERVAL" ] &&
+        WATCHF="$WATCHF --carrier-probe-interval $CARRIER_PROBE_INTERVAL"
+    [ -n "$CARRIER_PROBE_MISSES" ] &&
+        WATCHF="$WATCHF --carrier-probe-misses $CARRIER_PROBE_MISSES"
+    [ -n "$CARRIER_PROBE_POLL" ] &&
+        WATCHF="$WATCHF --carrier-probe-poll $CARRIER_PROBE_POLL"
     procd_open_instance
     procd_set_param command "$PROG" \
         --bind "$BIND" --target "$TARGET" --stun "$STUN" \
@@ -95,7 +109,7 @@ start_service() {
         --upnp-port "${UPNP_PORT:-49152}" \
         --lan-ip "${LAN_IP:-192.168.21.1}" \
         $NO_UPNP \
-        $ALLOW $PCPF \
+        $ALLOW $PCPF $WATCHF \
         ${OBSERVATION:+--observation}
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1

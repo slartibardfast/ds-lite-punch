@@ -396,6 +396,84 @@ pub fn parse_flow_obs(text: &str) -> Vec<(Ipv4Addr, u16)> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// The carrier-probe counter (call/0033) — the watcher's observation point.
+// ---------------------------------------------------------------------------
+
+/// The named counter the watcher reads. One definition, so the rule the
+/// daemon installs and the counter it reads cannot drift apart.
+pub const CARRIER_COUNTER: &str = "carrier_probe";
+
+/// The rule that counts a marked probe arriving at a slot port, in fw4's
+/// input chain where the accept sets live: a set reference is table-scoped,
+/// so the rule belongs beside `dslp_ports_udp`.
+///
+/// The rule does not terminate, and that is deliberate: the probe is a
+/// datagram like any other, so the accept rules still decide its fate and a
+/// marked packet gains nothing from being recognised. The payload match is
+/// the mark's eight bytes at the start of the transport payload, which for
+/// UDP begins at bit 64 of the transport header.
+pub fn carrier_probe_rule_text() -> String {
+    format!(
+        "iifname \"eth1\" udp dport @{} @th,64,64 0x{:016x} counter name {}",
+        ACCEPT_SET_UDP,
+        crate::carrier::MARK_WORD,
+        CARRIER_COUNTER
+    )
+}
+
+/// Install the counter and its rule. Idempotent, and content-aware: the rule
+/// is added only when the chain does not already carry it.
+pub fn ensure_carrier_probe() -> io::Result<()> {
+    let _ = run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]);
+    let listing = Command::new("nft")
+        .args(["list", "chain", "inet", "fw4", "input"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let text = carrier_probe_rule_text();
+    let present = listing
+        .as_deref()
+        .map(|l| l.contains(&text))
+        .unwrap_or(true);
+    if !present {
+        run(&["add", "rule", "inet", "fw4", "input", &text])?;
+    }
+    Ok(())
+}
+
+/// Read the counter's packet count. An error here is the shape a watch that
+/// was never installed has, and the caller logs it and keeps watching.
+pub fn list_carrier_probe() -> io::Result<u64> {
+    let out = Command::new("nft")
+        .args(["list", "counter", "inet", "fw4", CARRIER_COUNTER])
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("nft list counter {} -> {}", CARRIER_COUNTER, out.status),
+        ));
+    }
+    Ok(parse_carrier_probe(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse the counter's packet count. Pure; a listing with no `packets` line
+/// reads as zero. Hand-rolled, tiny — Kani non-goal, like the rest of the
+/// CLI boundary.
+pub fn parse_carrier_probe(text: &str) -> u64 {
+    text.lines()
+        .find_map(|l| {
+            let mut t = l.split_whitespace();
+            while let Some(w) = t.next() {
+                if w == "packets" {
+                    return t.next().and_then(|n| n.parse::<u64>().ok());
+                }
+            }
+            None
+        })
+        .unwrap_or(0)
+}
+
 /// Pin a console flow: (client_ip, client_port) -> (NAT_ADDR, R).
 /// `nft add element ip dslp snat_map { 10.0.0.5 . 3074 : 192.168.0.21 . 30740 }`
 ///
@@ -596,5 +674,41 @@ mod tests {
         assert!(parse_flow_obs("").is_empty());
         assert!(parse_flow_obs("elements = { }").is_empty());
         assert!(parse_flow_obs("elements = { not-an-ip . x }").is_empty());
+    }
+
+    #[test]
+    fn the_watch_rule_matches_the_mark_and_never_terminates() {
+        let text = carrier_probe_rule_text();
+        assert!(
+            text.contains("@th,64,64"),
+            "the mark sits at the transport payload: {}",
+            text
+        );
+        assert!(
+            text.contains(&format!("0x{:016x}", crate::carrier::MARK_WORD)),
+            "{}",
+            text
+        );
+        assert!(text.contains(&format!("counter name {}", CARRIER_COUNTER)));
+        assert!(text.contains(&format!("@{}", ACCEPT_SET_UDP)));
+        assert!(
+            !text.contains("accept"),
+            "recognising a probe grants nothing: {}",
+            text
+        );
+        assert!(
+            !text.contains("drop"),
+            "recognising a probe grants nothing: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn the_counter_reading_is_parsed_from_a_real_listing() {
+        let live = "table inet fw4 {\n\tcounter carrier_probe {\n\t\tpackets 42 bytes 672\n\t}\n}\n";
+        assert_eq!(parse_carrier_probe(live), 42);
+        assert_eq!(parse_carrier_probe(""), 0);
+        assert_eq!(parse_carrier_probe("counter carrier_probe {\n}\n"), 0);
+        assert_eq!(parse_carrier_probe("packets not-a-number bytes 1"), 0);
     }
 }
