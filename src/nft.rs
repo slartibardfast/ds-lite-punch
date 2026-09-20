@@ -422,8 +422,28 @@ pub fn carrier_probe_rule_text() -> String {
     )
 }
 
+/// The argv that installs the counting rule.
+///
+/// `insert`, not `add`, and that is a fix this rule needed: fw4's input chain
+/// carries accept rules of its own for the same ports, and a rule appended
+/// after an accept is never evaluated for a packet that accept takes. Measured
+/// on the box on 2026-09-20: the marked datagram arrived at the slot port
+/// (`170.9.238.141.41000 > 192.168.0.21.40000`) while the counter stayed at
+/// zero. Inserting puts the count ahead of every decision, and the rule
+/// terminates nothing, so the packet's fate is exactly what it was.
+fn carrier_probe_rule_argv() -> Vec<String> {
+    vec![
+        "insert".into(),
+        "rule".into(),
+        "inet".into(),
+        "fw4".into(),
+        "input".into(),
+        carrier_probe_rule_text(),
+    ]
+}
+
 /// Install the counter and its rule. Idempotent, and content-aware: the rule
-/// is added only when the chain does not already carry it.
+/// is installed only when the chain does not already carry it.
 pub fn ensure_carrier_probe() -> io::Result<()> {
     let _ = run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]);
     let listing = Command::new("nft")
@@ -437,7 +457,9 @@ pub fn ensure_carrier_probe() -> io::Result<()> {
         .map(|l| l.contains(&text))
         .unwrap_or(true);
     if !present {
-        run(&["add", "rule", "inet", "fw4", "input", &text])?;
+        let argv = carrier_probe_rule_argv();
+        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run(&refs)?;
     }
     Ok(())
 }
@@ -701,6 +723,17 @@ mod tests {
             "recognising a probe grants nothing: {}",
             text
         );
+    }
+
+    #[test]
+    fn the_watch_rule_is_evaluated_before_the_accept_rules() {
+        let argv = carrier_probe_rule_argv();
+        assert_eq!(
+            argv[0], "insert",
+            "an appended rule is never evaluated past an accept: {:?}",
+            argv
+        );
+        assert_eq!(argv[5], carrier_probe_rule_text());
     }
 
     #[test]
