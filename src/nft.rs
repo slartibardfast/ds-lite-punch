@@ -36,6 +36,8 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::process::{Command, Stdio};
 
+use crate::publish::emiteln;
+
 /// The NAT address every pinned console flow egresses as: the hub-LAN
 /// address the relay sockets bind. Matches the `--bind` default in main.rs.
 pub const NAT_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 21);
@@ -173,41 +175,181 @@ fn legacy_rule_handles(listing: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Grant a slot's datapath: the port joins the accept set its protocol uses.
-/// One element operation, addressed by key, so there is nothing to clean up
-/// first and nothing that can be left behind.
+/// The set of slot ports that have an inbound translation, one per protocol,
+/// and the map that carries each port to the client tuple that owns it.
+pub const INBOUND_SET_UDP: &str = "dslp_in_udp";
+pub const INBOUND_SET_TCP: &str = "dslp_in_tcp";
+pub const INBOUND_MAP_UDP: &str = "dslp_dnat_udp";
+pub const INBOUND_MAP_TCP: &str = "dslp_dnat_tcp";
+
+fn inbound_set(tcp: bool) -> &'static str {
+    if tcp {
+        INBOUND_SET_TCP
+    } else {
+        INBOUND_SET_UDP
+    }
+}
+
+fn inbound_map(tcp: bool) -> &'static str {
+    if tcp {
+        INBOUND_MAP_TCP
+    } else {
+        INBOUND_MAP_UDP
+    }
+}
+
+/// The prerouting rule that sends an arrival at a slot port to the client that
+/// owns it. `dnat`, and never `snat`, which is the whole point: the client's
+/// own egress keeps its own port (call/0014 measured what the other choice
+/// costs a console), and the arrival is translated at ingress instead.
+pub fn inbound_rule_text(tcp: bool) -> String {
+    let proto = if tcp { "tcp" } else { "udp" };
+    format!(
+        "iifname \"eth1\" {} dport @{} dnat ip to {} dport map @{}",
+        proto,
+        inbound_set(tcp),
+        proto,
+        inbound_map(tcp)
+    )
+}
+
+/// Install the inbound sets, maps, chain and rules. Idempotent, and the sets
+/// are emptied like the accept sets: a restart re-grants every lease it
+/// restored, and a port no lease owns must not survive the process that
+/// wanted it.
+pub fn ensure_inbound() -> io::Result<()> {
+    let mut listing = String::new();
+    if let Ok(o) = Command::new("nft")
+        .args(["list", "chain", "ip", "dslp", "prerouting"])
+        .output()
+    {
+        listing = String::from_utf8_lossy(&o.stdout).into_owned();
+    }
+    for tcp in [false, true] {
+        let _ = run(&[
+            "add",
+            "set",
+            "ip",
+            "dslp",
+            inbound_set(tcp),
+            "{ type inet_service ; size 65535 ; }",
+        ]);
+        let _ = run(&[
+            "add",
+            "map",
+            "ip",
+            "dslp",
+            inbound_map(tcp),
+            "{ type inet_service : ipv4_addr . inet_service ; size 65535 ; }",
+        ]);
+        let text = inbound_rule_text(tcp);
+        if !listing.contains(&text) {
+            run(&["add", "rule", "ip", "dslp", "prerouting", &text])?;
+        }
+        let _ = run(&["flush", "set", "ip", "dslp", inbound_set(tcp)]);
+    }
+    Ok(())
+}
+
+/// The ports a set currently holds. Pure, so the read-back after a revoke is
+/// testable away from the box.
+pub fn parse_port_set(text: &str) -> Vec<u16> {
+    let Some(pos) = text.find("elements = {") else {
+        return Vec::new();
+    };
+    let rest = &text[pos + "elements = {".len()..];
+    rest.split(&[',', '}'][..])
+        .filter_map(|t| t.split_whitespace().next())
+        .filter_map(|t| t.parse::<u16>().ok())
+        .collect()
+}
+
+/// Whether a port still has an inbound translation. The revoke's own
+/// read-back: a leftover would deliver another client's traffic.
+pub fn inbound_set_has(bind_port: u16, tcp: bool) -> bool {
+    let Ok(out) = Command::new("nft")
+        .args(["list", "set", "ip", "dslp", inbound_set(tcp)])
+        .output()
+    else {
+        return false;
+    };
+    parse_port_set(&String::from_utf8_lossy(&out.stdout)).contains(&bind_port)
+}
+
+/// Grant a slot's datapath: the port is accepted on eth1 and translated at
+/// ingress to the client that asked for it.
+///
+/// The client's own tuple is deliberately not pinned into `snat_map`. That
+/// pin made the client's traffic egress through the slot's port, so one game
+/// held two external tuples at once: some flows on its own preserved port and
+/// some on the relay's, which is what a console scores as Strict or Moderate.
+/// Measured live on the router, with a console in game: 14,740 packets of one
+/// flow egressing on the slot's port while its siblings kept their own.
+/// call/0014 settled this: the console's value story is organic, "works
+/// alongside, not enabled by" the relay.
+///
+/// The pin was also the only thing that mapped an arrival at the slot port
+/// back to the client, through that flow's conntrack entry, so removing it
+/// silently broke inbound delivery for every lease whose client had no pinned
+/// flow. Measured on 2026-09-20: a lease's arrival reached eth1 and never
+/// reached the client's socket. The ingress translation is what replaces it:
+/// egress untouched, ingress mapped.
 pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
-    // The client's own (client, int_port) is deliberately not pinned. That
-    // pin made the client's traffic egress through the slot's port, so one
-    // game held two external tuples at once: some flows on its own preserved
-    // port and some on the relay's, which is what a console scores as Strict
-    // or Moderate. Measured live on the router, with a console in game:
-    // 14,740 packets of one flow egressing on the slot's port while its
-    // siblings kept their own. call/0014 settled this: the console's value
-    // story is organic, "works alongside, not enabled by" the relay. The
-    // slot's own punch keeps its tuple through its own bound socket, and the
-    // inbound path needs nothing of the client's egress.
-    let _ = (client, int_port);
+    let script = format!(
+        "add element ip dslp {} {{ {} }}\n\
+         add element ip dslp {} {{ {} : {} . {} }}\n",
+        inbound_set(tcp),
+        bind_port,
+        inbound_map(tcp),
+        bind_port,
+        client,
+        int_port
+    );
+    run_script(&script)?;
     add_input_accept(bind_port, tcp)
 }
 
-/// Revoke a slot's datapath: the port leaves its accept set, and the
-/// snat_map element goes too for the paths that still pin (the arm's
-/// self-pin and the statics).
+/// The statements that revoke a slot's datapath. Each stands alone: the
+/// elements are deleted one by one, because a batch is all-or-nothing and the
+/// element that is already absent (the arm's own pin, when the arm never made
+/// one) used to cancel the rest of the revoke. Measured on the router on
+/// 2026-09-20: `delete element ip dslp snat_map { 192.168.21.97 . 3074 }`
+/// failed and the accept element stayed.
+pub fn revoke_statements(
+    client: Ipv4Addr,
+    int_port: u16,
+    bind_port: u16,
+    tcp: bool,
+) -> Vec<String> {
+    vec![
+        format!("delete element ip dslp {} {{ {} }}", inbound_set(tcp), bind_port),
+        format!("delete element ip dslp {} {{ {} }}", inbound_map(tcp), bind_port),
+        format!("delete element inet fw4 {} {{ {} }}", accept_set(tcp), bind_port),
+        format!("delete element ip dslp snat_map {{ {} . {} }}", client, int_port),
+    ]
+}
+
+/// Revoke a slot's datapath. Every statement runs on its own and a missing
+/// element is not a failure: the pin exists only for the paths that pin (the
+/// arm's self-pin and the statics), so its absence is the ordinary case, and
+/// an all-or-nothing batch let that ordinary case cancel the rest.
+///
+/// The revoke is read back rather than trusted, because a translation left
+/// behind is not litter: the port can be reallocated to another client, and a
+/// stale translation would deliver that client's traffic to the wrong host.
 pub fn revoke_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
-    let script = format!(
-        "delete element ip dslp snat_map {{ {} . {} }}\n\
-         delete element inet fw4 {} {{ {} }}\n",
-        client,
-        int_port,
-        accept_set(tcp),
-        bind_port
-    );
-    if run_script(&script).is_ok() {
-        return Ok(());
+    for stmt in revoke_statements(client, int_port, bind_port, tcp) {
+        let _ = run_script(&format!("{}\n", stmt));
     }
     let _ = del_pin(client, int_port);
     let _ = del_input_accept(bind_port, tcp);
+    if inbound_set_has(bind_port, tcp) {
+        emiteln!(
+            "warn: revoke left the inbound translation for {} in {}",
+            bind_port,
+            inbound_set(tcp)
+        );
+    }
     Ok(())
 }
 
@@ -240,6 +382,7 @@ pub fn ensure_ruleset() -> io::Result<()> {
         ])?;
     }
     ensure_accept_sets()?;
+    ensure_inbound()?;
     Ok(())
 }
 
@@ -734,6 +877,65 @@ mod tests {
             argv
         );
         assert_eq!(argv[5], carrier_probe_rule_text());
+    }
+
+    #[test]
+    fn the_inbound_rule_translates_at_ingress_and_never_at_egress() {
+        for tcp in [false, true] {
+            let text = inbound_rule_text(tcp);
+            let proto = if tcp { "tcp" } else { "udp" };
+            assert!(text.contains("dnat"), "{}", text);
+            assert!(
+                !text.contains("snat"),
+                "the client's egress keeps its own port: {}",
+                text
+            );
+            assert!(text.contains(&format!("{} dport @{}", proto, inbound_set(tcp))));
+            assert!(text.contains(&format!("map @{}", inbound_map(tcp))));
+            assert!(text.contains("iifname \"eth1\""));
+        }
+    }
+
+    #[test]
+    fn a_grant_translates_the_port_to_the_client_that_owns_it() {
+        let client = Ipv4Addr::new(192, 168, 21, 11);
+        let script = format!(
+            "add element ip dslp {} {{ {} }}\nadd element ip dslp {} {{ {} : {} . {} }}\n",
+            INBOUND_SET_UDP,
+            40002,
+            INBOUND_MAP_UDP,
+            40002,
+            client,
+            41010
+        );
+        assert!(script.contains("dslp_in_udp { 40002 }"));
+        assert!(script.contains("dslp_dnat_udp { 40002 : 192.168.21.11 . 41010 }"));
+    }
+
+    #[test]
+    fn a_revoke_undoes_every_element_on_its_own() {
+        let client = Ipv4Addr::new(192, 168, 21, 97);
+        let stmts = revoke_statements(client, 3074, 40002, false);
+        assert_eq!(stmts.len(), 4, "{:?}", stmts);
+        // each statement stands alone: a batch is all-or-nothing, and an
+        // absent pin used to cancel the rest of the revoke
+        for s in &stmts {
+            assert!(!s.contains('\n'), "one statement per run: {}", s);
+            assert!(s.starts_with("delete element "), "{}", s);
+        }
+        assert!(stmts[0].contains(&format!("{} {{ 40002 }}", INBOUND_SET_UDP)));
+        assert!(stmts[1].contains(&format!("{} {{ 40002 }}", INBOUND_MAP_UDP)));
+        assert!(stmts[2].contains(&format!("{} {{ 40002 }}", ACCEPT_SET_UDP)));
+        assert!(stmts[3].contains("snat_map { 192.168.21.97 . 3074 }"));
+    }
+
+    #[test]
+    fn a_sets_ports_are_parsed_for_the_revoke_readback() {
+        let live = "table ip dslp {\n\tset dslp_in_udp {\n\t\ttype inet_service\n\t\telements = { 40002, 40003 }\n\t}\n}\n";
+        assert_eq!(parse_port_set(live), vec![40002, 40003]);
+        assert!(parse_port_set("").is_empty());
+        assert!(parse_port_set("elements = { }").is_empty());
+        assert_eq!(parse_port_set("elements = { 40002 }"), vec![40002]);
     }
 
     #[test]
