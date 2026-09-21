@@ -1,1 +1,5 @@
 /target/
+
+# A harness's scratch: the review tool writes .qwen/tmp/ here, and an untracked
+# tree like that is how it got swept toward a commit once already.
+/.qwen/
