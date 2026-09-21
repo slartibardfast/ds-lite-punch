@@ -566,22 +566,37 @@ pub fn parse_flow_obs(text: &str) -> Vec<(Ipv4Addr, u16)> {
 /// daemon installs and the counter it reads cannot drift apart.
 pub const CARRIER_COUNTER: &str = "carrier_probe";
 
-/// The rule that counts a marked probe arriving at a slot port, in fw4's
-/// input chain where the accept sets live: a set reference is table-scoped,
-/// so the rule belongs beside `dslp_ports_udp`.
+/// The rule that counts a marked probe, for one chain. The chain decides how
+/// much the rule can say about the port.
 ///
-/// The rule does not terminate, and that is deliberate: the probe is a
-/// datagram like any other, so the accept rules still decide its fate and a
-/// marked packet gains nothing from being recognised. The payload match is
-/// the mark's eight bytes at the start of the transport payload, which for
-/// UDP begins at bit 64 of the transport header.
-pub fn carrier_probe_rule_text() -> String {
-    format!(
-        "iifname \"eth1\" udp dport @{} @th,64,64 0x{:016x} counter name {}",
-        ACCEPT_SET_UDP,
-        crate::carrier::MARK_WORD,
-        CARRIER_COUNTER
-    )
+/// In the input chain the arrival is still addressed to the slot's bind port, so
+/// the rule matches that port through the accept set, which sits beside it in
+/// this table because a set reference is table-scoped.
+///
+/// In the forward chain the destination port is the client's already, because
+/// the ingress translation has rewritten it. Measured on the router on
+/// 2026-09-21: with a port match there the counter stayed at zero while the
+/// marked datagram arrived, and the translation had moved the packet to the
+/// client's port before the hook. The mark alone is the probe's identity, so the
+/// forward rule asks for eth1 and the mark.
+///
+/// Neither rule terminates, and that is deliberate: the probe is a datagram like
+/// any other, so the accept and forward rules still decide its fate, and a
+/// marked packet gains nothing from being recognised. The payload match is the
+/// mark's eight bytes at the start of the transport payload, which for UDP
+/// begins at bit 64 of the transport header.
+pub fn carrier_probe_rule_text(chain: &str) -> String {
+    let mark = format!("@th,64,64 0x{:016x}", crate::carrier::MARK_WORD);
+    match chain {
+        "forward" => format!(
+            "iifname \"eth1\" udp {} counter name {}",
+            mark, CARRIER_COUNTER
+        ),
+        _ => format!(
+            "iifname \"eth1\" udp dport @{} {} counter name {}",
+            ACCEPT_SET_UDP, mark, CARRIER_COUNTER
+        ),
+    }
 }
 
 /// The chains a counting rule is installed in. Both are real, and which one
@@ -611,7 +626,7 @@ fn carrier_probe_rule_argv(chain: &str) -> Vec<String> {
         "inet".into(),
         "fw4".into(),
         chain.into(),
-        carrier_probe_rule_text(),
+        carrier_probe_rule_text(chain),
     ]
 }
 
@@ -620,13 +635,13 @@ fn carrier_probe_rule_argv(chain: &str) -> Vec<String> {
 /// adds nothing and a chain that already counts keeps counting.
 pub fn ensure_carrier_probe() -> io::Result<()> {
     let _ = run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]);
-    let text = carrier_probe_rule_text();
     for chain in CARRIER_CHAINS {
         let listing = Command::new("nft")
             .args(["list", "chain", "inet", "fw4", chain])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let text = carrier_probe_rule_text(chain);
         let present = listing
             .as_deref()
             .map(|l| l.contains(&text))
@@ -876,29 +891,54 @@ mod tests {
 
     #[test]
     fn the_watch_rule_matches_the_mark_and_never_terminates() {
-        let text = carrier_probe_rule_text();
+        for chain in CARRIER_CHAINS {
+            let text = carrier_probe_rule_text(chain);
+            assert!(
+                text.contains("@th,64,64"),
+                "the mark sits at the transport payload: {}",
+                text
+            );
+            assert!(
+                text.contains(&format!("0x{:016x}", crate::carrier::MARK_WORD)),
+                "{}",
+                text
+            );
+            assert!(text.contains(&format!("counter name {}", CARRIER_COUNTER)));
+            assert!(
+                !text.contains("accept"),
+                "recognising a probe grants nothing: {}",
+                text
+            );
+            assert!(
+                !text.contains("drop"),
+                "recognising a probe grants nothing: {}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn the_input_rule_names_the_slot_port_and_the_forward_rule_cannot() {
+        // The arrival reaches the input chain still addressed to the slot's bind
+        // port, and the ingress translation rewrites it to the client's port
+        // before the forward hook. A port match in the forward rule therefore
+        // matches nothing: measured on the router on 2026-09-21, with both rules
+        // installed and the marked datagram arriving, the counter stayed at zero
+        // until the forward rule stopped asking for the port.
+        let input = carrier_probe_rule_text("input");
         assert!(
-            text.contains("@th,64,64"),
-            "the mark sits at the transport payload: {}",
-            text
-        );
-        assert!(
-            text.contains(&format!("0x{:016x}", crate::carrier::MARK_WORD)),
+            input.contains(&format!("dport @{}", ACCEPT_SET_UDP)),
             "{}",
-            text
+            input
         );
-        assert!(text.contains(&format!("counter name {}", CARRIER_COUNTER)));
-        assert!(text.contains(&format!("@{}", ACCEPT_SET_UDP)));
+        let forward = carrier_probe_rule_text("forward");
         assert!(
-            !text.contains("accept"),
-            "recognising a probe grants nothing: {}",
-            text
+            !forward.contains("dport"),
+            "the forward hook sees the client's port, not the slot's: {}",
+            forward
         );
-        assert!(
-            !text.contains("drop"),
-            "recognising a probe grants nothing: {}",
-            text
-        );
+        assert!(forward.contains("iifname \"eth1\""));
+        assert!(forward.contains("@th,64,64"));
     }
 
     #[test]
@@ -909,7 +949,7 @@ mod tests {
             "an appended rule is never evaluated past an accept: {:?}",
             argv
         );
-        assert_eq!(argv[5], carrier_probe_rule_text());
+        assert_eq!(argv[5], carrier_probe_rule_text("input"));
     }
 
     #[test]
@@ -922,7 +962,7 @@ mod tests {
             let argv = carrier_probe_rule_argv(chain);
             assert_eq!(argv[0], "insert", "{:?}", argv);
             assert_eq!(argv[4], chain, "{:?}", argv);
-            assert_eq!(argv[5], carrier_probe_rule_text());
+            assert_eq!(argv[5], carrier_probe_rule_text(chain));
         }
         assert!(CARRIER_CHAINS.contains(&"input"));
         assert!(CARRIER_CHAINS.contains(&"forward"));
