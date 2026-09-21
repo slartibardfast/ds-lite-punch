@@ -580,6 +580,12 @@ pub const CARRIER_COUNTER: &str = "carrier_probe";
 /// client's port before the hook. The mark alone is the probe's identity, so the
 /// forward rule asks for eth1 and the mark.
 ///
+/// The protocol is named `meta l4proto udp` there, and that spelling is load
+/// bearing: a bare `udp` before a payload expression makes nft expect a UDP
+/// header field and refuse the rule outright — "syntax error, unexpected @,
+/// expecting length or checksum or sport or dport" — so the rule was never
+/// installed and the watch counted nothing through two releases.
+///
 /// Neither rule terminates, and that is deliberate: the probe is a datagram like
 /// any other, so the accept and forward rules still decide its fate, and a
 /// marked packet gains nothing from being recognised. The payload match is the
@@ -589,7 +595,7 @@ pub fn carrier_probe_rule_text(chain: &str) -> String {
     let mark = format!("@th,64,64 0x{:016x}", crate::carrier::MARK_WORD);
     match chain {
         "forward" => format!(
-            "iifname \"eth1\" udp {} counter name {}",
+            "iifname \"eth1\" meta l4proto udp {} counter name {}",
             mark, CARRIER_COUNTER
         ),
         _ => format!(
@@ -597,6 +603,23 @@ pub fn carrier_probe_rule_text(chain: &str) -> String {
             ACCEPT_SET_UDP, mark, CARRIER_COUNTER
         ),
     }
+}
+
+/// The handles of this chain's rules that name the counter and are not the rule
+/// this build installs.
+///
+/// An install that only adds leaves an older build's rule in place, and a rule
+/// that is merely different counts nothing. Measured on the router on
+/// 2026-09-21: a stale forward rule and two stale input variants survived two
+/// releases, and the counter stayed at zero while the probes arrived. Replacing
+/// them is how the watch converges on the one rule it means.
+pub fn carrier_probe_stale_handles(listing: &str, text: &str) -> Vec<u64> {
+    listing
+        .lines()
+        .filter(|l| l.contains(CARRIER_COUNTER) && !l.contains(text))
+        .filter_map(|l| l.rsplit("handle ").next())
+        .filter_map(|h| h.trim().parse::<u64>().ok())
+        .collect()
 }
 
 /// The chains a counting rule is installed in. Both are real, and which one
@@ -642,6 +665,19 @@ pub fn ensure_carrier_probe() -> io::Result<()> {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         let text = carrier_probe_rule_text(chain);
+        if let Some(l) = listing.as_deref() {
+            for h in carrier_probe_stale_handles(l, &text) {
+                let _ = run(&[
+                    "delete",
+                    "rule",
+                    "inet",
+                    "fw4",
+                    chain,
+                    "handle",
+                    &h.to_string(),
+                ]);
+            }
+        }
         let present = listing
             .as_deref()
             .map(|l| l.contains(&text))
@@ -939,6 +975,37 @@ mod tests {
         );
         assert!(forward.contains("iifname \"eth1\""));
         assert!(forward.contains("@th,64,64"));
+    }
+
+    #[test]
+    fn the_forward_rule_names_the_protocol_the_way_nft_accepts() {
+        // A bare `udp` before a payload expression is a syntax error, so this
+        // rule was never installed and the watch counted nothing. Measured on the
+        // router on 2026-09-21: "syntax error, unexpected @, expecting length or
+        // checksum or sport or dport", with the counter at zero while the probes
+        // arrived.
+        let forward = carrier_probe_rule_text("forward");
+        assert!(forward.contains("meta l4proto udp"), "{}", forward);
+        assert!(
+            !forward.contains("\"eth1\" udp @th"),
+            "a bare protocol keyword before the payload is refused: {}",
+            forward
+        );
+    }
+
+    #[test]
+    fn a_stale_rule_is_named_by_its_handle_and_the_current_one_is_not() {
+        let current = carrier_probe_rule_text("forward");
+        let listing = format!(
+            "\t\tiifname \"eth1\" udp dport @dslp_ports_udp @th,64,64 0x64736c702d707262 counter name \"carrier_probe\" # handle 17665\n\t\t{} # handle 17669\n",
+            current
+        );
+        assert_eq!(carrier_probe_stale_handles(&listing, &current), vec![17665]);
+        assert!(carrier_probe_stale_handles("", &current).is_empty());
+        assert_eq!(
+            carrier_probe_stale_handles(&listing, "nothing matches this").len(),
+            2
+        );
     }
 
     #[test]
