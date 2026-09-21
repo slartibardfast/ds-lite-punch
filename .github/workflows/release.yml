@@ -46,8 +46,17 @@ jobs:
             echo "::error::no artifact to release: $ARTIFACT is missing or empty"
             exit 1
           fi
+          # Draft first, then publish, because immutable releases are enabled on
+          # this repository: a freshly created release is frozen immediately, and
+          # an upload to it answers
+          #   HTTP 422: Cannot upload assets to an immutable release
+          # (measured on 2026-09-21, on the release this step first ran for). A
+          # draft is mutable, so the assets land and the release is published
+          # once they have.
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" \
+              --draft \
               --title "ds-lite-punch $GITHUB_REF_NAME" \
               --notes "The musl-static release artifact for $GITHUB_REF_NAME, built from this tag inside the toolchain image recorded in the host's .host-software. artifact-record.txt carries the sha256 that record anchors."
           gh release upload "$GITHUB_REF_NAME" "$ARTIFACT" artifact-record.txt --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false
