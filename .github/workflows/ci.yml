@@ -16,6 +16,12 @@ on:
   schedule:
     - cron: "23 6 * * 1" # weekly, so drift finds us before a release does
 
+# A stranger's pull request runs these jobs. The default token is read-only for
+# a public repository, and saying so here keeps that true if the setting ever
+# changes: nothing in this lane needs to write.
+permissions:
+  contents: read
+
 env:
   # One definition of the toolchain, by digest. The same value is what the host
   # records in `.host-software`; a tag would be movable and a moved toolchain

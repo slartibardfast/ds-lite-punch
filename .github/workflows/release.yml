@@ -1,0 +1,53 @@
+# The release lane.
+#
+# A version bump MUST carry a matching annotated tag, and the tag IS the
+# release: this job builds the artifact from the tagged commit inside the same
+# digest-pinned image the host's record names, prints the line the record uses,
+# and attaches both to the release.
+#
+# A release asset is the point. Actions artifacts always need a token, even in
+# a public repository: measured 2026-09-20, an anonymous listing answered 200
+# and an anonymous download answered 401. A release asset is anonymously
+# downloadable, so this is what makes the bytes a stranger can fetch the same
+# bytes the host's pin describes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  TOOLCHAIN: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
+  ARTIFACT: target/x86_64-unknown-linux-musl/release/ds-lite-punch
+
+permissions:
+  contents: write # the one job that creates a release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the release artifact in the pinned toolchain
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'cargo build --release --locked --target x86_64-unknown-linux-musl'
+      # The hash is printed in the form `.host-software` records, so a reader
+      # can compare the release with the anchor rather than trust a title.
+      - name: Record the artifact hash
+        run: |
+          printf 'artifact = %s %s\n' "$ARTIFACT" "$(sha256sum "$ARTIFACT" | cut -d' ' -f1)" | tee artifact-record.txt
+          cat artifact-record.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach the binary and the line that records it to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -s "$ARTIFACT" ]; then
+            echo "::error::no artifact to release: $ARTIFACT is missing or empty"
+            exit 1
+          fi
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" \
+              --title "ds-lite-punch $GITHUB_REF_NAME" \
+              --notes "The musl-static release artifact for $GITHUB_REF_NAME, built from this tag inside the toolchain image recorded in the host's .host-software. artifact-record.txt carries the sha256 that record anchors."
+          gh release upload "$GITHUB_REF_NAME" "$ARTIFACT" artifact-record.txt --clobber
