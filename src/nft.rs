@@ -584,44 +584,58 @@ pub fn carrier_probe_rule_text() -> String {
     )
 }
 
-/// The argv that installs the counting rule.
+/// The chains a counting rule is installed in. Both are real, and which one
+/// applies is a property of the datapath rather than of the probe: an arrival
+/// whose destination is the router itself traverses the input chain, and the
+/// ingress translation sends a slot port's arrival to its client, which
+/// traverses the forward chain. Measured on the router on 2026-09-21: with the
+/// rule in the input chain alone the marked datagram arrived at the slot port
+/// (`170.9.238.141.41001 > 192.168.0.21.40000`) and the counter stayed at zero,
+/// because the translation introduced by this same work had already turned the
+/// arrival into forwarded traffic.
+pub const CARRIER_CHAINS: [&str; 2] = ["input", "forward"];
+
+/// The argv that installs the counting rule in one chain.
 ///
-/// `insert`, not `add`, and that is a fix this rule needed: fw4's input chain
-/// carries accept rules of its own for the same ports, and a rule appended
-/// after an accept is never evaluated for a packet that accept takes. Measured
-/// on the box on 2026-09-20: the marked datagram arrived at the slot port
-/// (`170.9.238.141.41000 > 192.168.0.21.40000`) while the counter stayed at
-/// zero. Inserting puts the count ahead of every decision, and the rule
-/// terminates nothing, so the packet's fate is exactly what it was.
-fn carrier_probe_rule_argv() -> Vec<String> {
+/// `insert`, not `add`, and that is a fix this rule needed: fw4's chains carry
+/// accept rules of their own for the same ports, and a rule appended after an
+/// accept is never evaluated for a packet that accept takes. Measured on the
+/// box on 2026-09-20: the marked datagram arrived at the slot port while the
+/// counter stayed at zero. Inserting puts the count ahead of every decision,
+/// and the rule terminates nothing, so the packet's fate is exactly what it
+/// was.
+fn carrier_probe_rule_argv(chain: &str) -> Vec<String> {
     vec![
         "insert".into(),
         "rule".into(),
         "inet".into(),
         "fw4".into(),
-        "input".into(),
+        chain.into(),
         carrier_probe_rule_text(),
     ]
 }
 
-/// Install the counter and its rule. Idempotent, and content-aware: the rule
-/// is installed only when the chain does not already carry it.
+/// Install the counter and its rules. Idempotent, and content-aware: a rule is
+/// installed only when its chain does not already carry it, so a second call
+/// adds nothing and a chain that already counts keeps counting.
 pub fn ensure_carrier_probe() -> io::Result<()> {
     let _ = run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]);
-    let listing = Command::new("nft")
-        .args(["list", "chain", "inet", "fw4", "input"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
     let text = carrier_probe_rule_text();
-    let present = listing
-        .as_deref()
-        .map(|l| l.contains(&text))
-        .unwrap_or(true);
-    if !present {
-        let argv = carrier_probe_rule_argv();
-        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        run(&refs)?;
+    for chain in CARRIER_CHAINS {
+        let listing = Command::new("nft")
+            .args(["list", "chain", "inet", "fw4", chain])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let present = listing
+            .as_deref()
+            .map(|l| l.contains(&text))
+            .unwrap_or(true);
+        if !present {
+            let argv = carrier_probe_rule_argv(chain);
+            let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            run(&refs)?;
+        }
     }
     Ok(())
 }
@@ -889,13 +903,29 @@ mod tests {
 
     #[test]
     fn the_watch_rule_is_evaluated_before_the_accept_rules() {
-        let argv = carrier_probe_rule_argv();
+        let argv = carrier_probe_rule_argv("input");
         assert_eq!(
             argv[0], "insert",
             "an appended rule is never evaluated past an accept: {:?}",
             argv
         );
         assert_eq!(argv[5], carrier_probe_rule_text());
+    }
+
+    #[test]
+    fn the_watch_counts_in_both_the_input_and_forward_paths() {
+        // Measured on the router on 2026-09-21: the ingress translation sends a
+        // slot port's arrival to its client, which makes it forwarded traffic, so
+        // a counting rule in the input chain alone sees nothing at all. The
+        // counter stayed at zero while the marked datagram arrived.
+        for chain in CARRIER_CHAINS {
+            let argv = carrier_probe_rule_argv(chain);
+            assert_eq!(argv[0], "insert", "{:?}", argv);
+            assert_eq!(argv[4], chain, "{:?}", argv);
+            assert_eq!(argv[5], carrier_probe_rule_text());
+        }
+        assert!(CARRIER_CHAINS.contains(&"input"));
+        assert!(CARRIER_CHAINS.contains(&"forward"));
     }
 
     #[test]
