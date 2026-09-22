@@ -114,3 +114,16 @@ The plans, the decisions and the record are in the host repository:
 | procd | the service manager on the router |
 | pin | the source commit that the host record names |
 | artifact | the release binary that the lane builds from the pin |
+
+## Documentation
+
+The operator pages cover the install, the configuration, the running of the
+daemon, the upgrade and the troubleshooting:
+<https://slartibardfast.github.io/ds-lite-punch/>
+
+The manual page is generated from the same definition as `--help`, and it ships
+in every release as `ds-lite-punch.8`.
+
+## License
+
+Released into the public domain under the Unlicense. See [LICENSE](LICENSE).
