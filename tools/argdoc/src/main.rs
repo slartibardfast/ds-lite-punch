@@ -348,6 +348,29 @@ fn cli(version: &str) -> Command {
         )
 }
 
+/// clap_mangen renders `after_long_help` as an EXTRA section. The help text
+/// needs that block, because an operator reading `--help` wants the exit status
+/// and the pointer to the manual; the manual does not, because the authored
+/// sections below state the same things properly. Drop it.
+fn drop_extra(roff: &str) -> String {
+    let mut out = String::with_capacity(roff.len());
+    let mut skipping = false;
+    for line in roff.lines() {
+        if line == ".SH EXTRA" {
+            skipping = true;
+            continue;
+        }
+        if skipping && line.starts_with(".SH ") {
+            skipping = false;
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn main() -> std::io::Result<()> {
     let root = repo_root();
     let version = crate_version(&root);
@@ -360,12 +383,14 @@ fn main() -> std::io::Result<()> {
     let help_path = root.join("src/help.txt");
     std::fs::write(&help_path, &help)?;
 
-    let mut man = Vec::new();
+    let mut rendered = Vec::new();
     clap_mangen::Man::new(cmd)
         .section("8")
         .manual("System Manager's Manual")
         .source(format!("ds-lite-punch {}", version))
-        .render(&mut man)?;
+        .render(&mut rendered)?;
+    let rendered = String::from_utf8(rendered).expect("clap_mangen writes utf-8");
+    let mut man = drop_extra(&rendered).into_bytes();
     man.extend_from_slice(include_bytes!("man-sections.roff"));
     let man_path = root.join("deploy/man/ds-lite-punch.8");
     if let Some(dir) = man_path.parent() {

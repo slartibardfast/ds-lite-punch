@@ -1192,6 +1192,43 @@ mod tests {
         );
     }
 
+    /// Undo clap_mangen's roff escapes, so the page's text can be read.
+    fn roff_text(roff: &str) -> String {
+        roff.replace("\\fB", " ")
+            .replace("\\fR", " ")
+            .replace("\\fI", " ")
+            .replace("\\*(Aq", "'")
+            .replace("\\-", "-")
+    }
+
+    /// The manual page comes from the same clap definition as the help text, so
+    /// it names the same flags, and the sections `tools/argdoc` appends have to
+    /// survive a regeneration. clap_mangen leaves `--help` to the page itself,
+    /// which is why that one flag is not an entry in its OPTIONS.
+    #[test]
+    fn the_man_page_names_the_flags_and_keeps_its_appended_sections() {
+        let man = roff_text(include_str!("../deploy/man/ds-lite-punch.8"));
+        let named = flag_tokens(&man);
+        for f in parser_flags_from_source() {
+            assert!(
+                named.contains(&f) || HIDDEN.contains(&f.as_str()) || f == "-h" || f == "--help",
+                "the manual does not name {}",
+                f
+            );
+        }
+        for section in ["ENVIRONMENT", "FILES", "LOG EVENTS", "LIMITS", "SEE ALSO"] {
+            assert!(
+                man.contains(&format!(".SH {}", section)),
+                "the manual lost its {} section, so a regeneration dropped it",
+                section
+            );
+        }
+        assert!(
+            !man.contains(".SH EXTRA"),
+            "clap_mangen's EXTRA block is back, and the appended sections already cover it"
+        );
+    }
+
     /// The multi-instance CLI contract (plan/0004 B3): `--static-map` is
     /// repeatable and order-preserving, the legacy pair is sugar for one entry
     /// and cannot be combined with it, and every malformed shape names itself.
