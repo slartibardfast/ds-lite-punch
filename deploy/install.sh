@@ -6,6 +6,7 @@ set -e
 BIN=/usr/bin/ds-lite-punch
 INIT=/etc/init.d/ds-lite-punch
 ENV=/etc/ds-lite-punch.env
+MAN=/usr/share/man/man8/ds-lite-punch.8
 
 [ -x "$BIN" ] || { echo "error: $BIN not present (scp the binary first)"; exit 1; }
 
@@ -14,6 +15,15 @@ chmod 755 "$INIT"
 if [ ! -f "$ENV" ]; then
     cp ds-lite-punch.env "$ENV"
     echo "installed default $ENV — edit BIND/TARGET for your console"
+fi
+
+# The manual page, generated with the binary by tools/argdoc. It travels with
+# the release as well, so an operator who has only the binary can still read it.
+if [ -f man/ds-lite-punch.8 ]; then
+    mkdir -p /usr/share/man/man8
+    cp man/ds-lite-punch.8 "$MAN"
+    chmod 644 "$MAN"
+    echo "installed $MAN (read it with: man ds-lite-punch)"
 fi
 
 # The hold's allowlist (call/0025): created empty and left empty, so the
@@ -33,3 +43,16 @@ echo "== service status =="
 pgrep -fl ds-lite-punch || echo "NOT RUNNING"
 echo "== tuple =="
 cat /run/ds-lite-punch/tuple 2>/dev/null || echo "no tuple yet"
+
+cat <<'EOF'
+== what to do next ==
+1. Name the devices that get the hold in /etc/ds-lite-punch.allow, one IPv4
+   address per line.  The file is installed empty, so no device is held until
+   you name one, and a held flow costs about half a packet a second.
+2. Seed the first DeviceProtection identity in /etc/ds-lite-punch.acl, then
+   restart the service.  Until the store has an identity, every role-gated
+   action answers 606.
+3. Read the mapping the carrier is holding: cat /run/ds-lite-punch/tuple
+4. Read the daemon's events: logread | grep ds-lite-punch
+5. Read the manual page: man ds-lite-punch
+EOF
