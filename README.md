@@ -66,7 +66,7 @@ and an empty upload fails the job. The test router runs the bytes from the lane
 
 1. **The lobby case.** A console in a lobby sends no traffic. The keepalive must
    survive that silence on a real console. This test needs the operator
-   ([plan/0009](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0009-mapping-hold-and-signalling/README.md)).
+   ([plan/0009](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0009-mapping-keepalive-and-signalling/README.md)).
 2. **The Kani suite on a larger host.** The full suite waits for a host with
    more memory
    ([call/0019](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0019-facade-kani-deferred-to-larger-host.md)).
