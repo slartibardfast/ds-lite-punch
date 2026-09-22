@@ -1,6 +1,6 @@
 [package]
 name = "ds-lite-punch"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 description = "CGNAT-aware UDP relay for the Virgin Media ds-lite line: keeps the AFTR mapping alive with STUN keepalives and forwards inbound UDP to a br-lan target, preserving the peer source."
 
