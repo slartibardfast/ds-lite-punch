@@ -1,0 +1,187 @@
+.SH ENVIRONMENT
+The service reads
+.B /etc/ds-lite-punch.env
+at start and turns its keys into the flags above. The defaults named here are
+the shipped file's own. A key that is unset keeps the flag's default.
+.TP
+.B BIND
+The relay socket, as \fIip:port\fR, on the CGNAT-facing address. Becomes
+\fB--bind\fR.
+.TP
+.B TARGET
+The local endpoint inbound datagrams are forwarded to. Becomes \fB--target\fR.
+.TP
+.B STUN
+Comma-separated STUN servers. Becomes \fB--stun\fR.
+.TP
+.B INTERVAL
+Seconds between the STUN writes. Becomes \fB--interval\fR.
+.TP
+.B GATEWAY
+Next hop used to route STUN out the line that holds the mapping. Becomes
+\fB--gateway\fR.
+.TP
+.B UPNP_PORT
+Port the facade serves on. Becomes \fB--upnp-port\fR.
+.TP
+.B LAN_IP
+Local address the facade binds and joins SSDP on. Becomes \fB--lan-ip\fR.
+.TP
+.B UPNP
+\fB1\fR leaves the facade on, and \fB0\fR turns it off. Becomes \fB--no-upnp\fR.
+.TP
+.B DEVICE_PROTECTION_ACL
+Path of the DeviceProtection seed, or \fBnone\fR to disable the seed. The file
+is copied into the state directory at start when no store exists yet, which is
+how the first identity is created. The format is one tab-separated row per
+entry, the same as the store the daemon keeps.
+.TP
+.B ALLOWLIST
+Path of the file naming the devices whose flows get the hold. Becomes
+\fB--allowlist\fR.
+.TP
+.B HOLD
+\fB1\fR holds the named devices' flows, and \fB0\fR leaves the arm reporting
+them. Becomes \fB--hold\fR.
+.TP
+.B OBSERVATION
+\fB1\fR turns the observation arm on. Becomes \fB--observation\fR.
+.TP
+.B PCP
+\fB1\fR answers PCP and NAT-PMP on UDP 5351. Becomes \fB--pcp\fR.
+.TP
+.B PCP_PEER
+\fB1\fR answers the PCP PEER opcode. Becomes \fB--pcp-peer\fR.
+.TP
+.B CARRIER_PROBE
+\fB1\fR arms the carrier watch. Becomes \fB--carrier-probe\fR.
+.TP
+.B CARRIER_PROBE_INTERVAL
+Seconds expected between the helper's probes. Becomes
+\fB--carrier-probe-interval\fR.
+.TP
+.B CARRIER_PROBE_MISSES
+Intervals of silence that raise the alarm. Becomes \fB--carrier-probe-misses\fR.
+.TP
+.B CARRIER_PROBE_POLL
+Seconds between readings of the counter. Becomes \fB--carrier-probe-poll\fR.
+.PP
+Three keys are read by the service and appear in no shipped environment file,
+so they are set by editing \fB/etc/init.d/ds-lite-punch\fR:
+.TP
+.B SLOT_RANGE
+Port range the slot engine allocates from. Default \fB30000-39999\fR. Becomes
+\fB--slot-port-range\fR.
+.TP
+.B MAX_SLOTS
+Maximum concurrent slots. Default \fB32\fR. Becomes \fB--max-slots\fR.
+.TP
+.B MAX_MAPS_PER_CLIENT
+Maximum mappings one client may hold. Default \fB16\fR. Becomes
+\fB--max-maps-per-client\fR.
+.PP
+The facade's friendly name has no environment key. Set \fB--upnp-name\fR on the
+command line in the service script to change it.
+.SH FILES
+.TP
+.B /etc/ds-lite-punch.env
+The configuration. Every key above.
+.TP
+.B /etc/init.d/ds-lite-punch
+The procd service. It reads the configuration, seeds the DeviceProtection
+store, and installs the legacy input rule.
+.TP
+.B /usr/bin/ds-lite-punch
+The daemon.
+.TP
+.B /etc/ds-lite-punch.allow
+The devices whose flows get the hold, one IPv4 address per line, with # for
+comments. It is installed empty, and no device is held until you name one.
+.TP
+.B /etc/ds-lite-punch.acl
+The DeviceProtection seed. It is copied to \fBdp.tsv\fR in the state directory
+at start when no store exists.
+.TP
+.B /run/ds-lite-punch/tuple
+The mapping's learned external address and port, as the carrier reports it.
+Read this file to see what the line currently holds.
+.TP
+.B /run/ds-lite-punch/leases.tsv
+The facade's live leases.
+.TP
+.B /run/ds-lite-punch/upnp.tsv
+The facade's own state, including the mapping it reports to control points.
+.TP
+.B /run/ds-lite-punch/dp.tsv
+The DeviceProtection store: users and identities. The directory is on a
+temporary filesystem, so this store is seeded again from
+\fB/etc/ds-lite-punch.acl\fR after a reboot.
+.SH LOG EVENTS
+Every event is one line of JSON on syslog, written by the daemon and readable
+with \fBlogread\fR. The event name is the value of its \fBevent\fR field.
+.TP
+.B start
+The configuration the daemon started with: \fBbind\fR, \fBtarget\fR,
+\fBstun_servers\fR and \fBslots\fR.
+.TP
+.B tuple
+The mapping the carrier is holding, learned by STUN: \fBip\fR and \fBport\fR,
+and \fBslot\fR when the mapping belongs to a held slot.
+.TP
+.B upnp
+The facade is serving: \fBlan\fR and the device's \fBudn\fR.
+.TP
+.B pcp
+The PCP and NAT-PMP listener is serving: \fBbind\fR and whether PEER is
+answered.
+.TP
+.B hold
+The hold's admission and its state: \fBdevices\fR and whether its ruleset is in
+force.
+.TP
+.B observe
+The observation arm's reading: \fBcdc\fR, \fBmax_rescues\fR, \fBallowed\fR and
+\fBhold\fR.
+.TP
+.B carrier-watch
+The watch is armed: \fBcounter\fR, \fBinterval\fR, \fBmisses\fR and \fBpoll\fR.
+.TP
+.B carrier-probe
+A probe from the helper was counted: \fBcount\fR and \fBepoch\fR.
+.TP
+.B carrier-silent
+The counter stopped rising for the configured number of intervals:
+\fBlast_probe\fR, \fBwaited\fR and \fBepoch\fR. The helper and the carrier look
+alike from here, so check the helper first.
+.PP
+Other lines carry an event name and a \fBdetail\fR field, for state a slot or a
+flow passed through.
+.SH LIMITS
+The carrier chooses the external port. A request for a port is a key, and the
+carrier may answer with a different one.
+.PP
+The carrier drops an idle mapping. On this line the measured windows are five
+to ten seconds for UDP and 120 to 300 seconds for TCP, which is why the daemon
+writes on a two second cadence.
+.PP
+One client holds one mapping on one port.
+.PP
+The hold costs about half a packet a second per held flow at the default
+cadence, written and reimbursed on the local side. Treat the allowlist as a
+budget as well as an admission.
+.PP
+The daemon's own firewall rules are installed at startup. A reload of the
+router's firewall rebuilds that firewall's tables, and the daemon's rules
+inside them go with the rebuild. Restart the service after a firewall reload,
+and read the log for the rules the daemon reports installing.
+.SH SEE ALSO
+.BR /etc/ds-lite-punch.env ,
+.BR /etc/init.d/ds-lite-punch
+.PP
+The operator pages carry the install, the configure, the operate, the upgrade
+and the troubleshoot procedures:
+\fBhttps://slartibardfast.github.io/ds-lite-punch/\fR
+.PP
+The plans, the decisions and the measured results for this component are in the
+host repository:
+\fBhttps://github.com/slartibardfast/agentic-ds-lite-punch\fR

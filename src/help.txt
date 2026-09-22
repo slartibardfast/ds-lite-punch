@@ -1,0 +1,99 @@
+The daemon keeps one external mapping alive on a ds-lite line by writing to it, learns the mapping's external address and port with STUN, and forwards inbound UDP and TCP to a target on the local network with the peer's source address preserved. It answers UPnP IGD, PCP and NAT-PMP on the LAN, and it can report on the carrier's filtering from outside the line.
+
+Usage: ds-lite-punch --static-map R=ip:port [OPTIONS]
+       ds-lite-punch --bind ip:port --target ip:port [OPTIONS]
+
+Options:
+      --static-map <R=IP:PORT>
+          Hold the mapping for slot port R, forwarding inbound datagrams to ip:port on the local network. Repeatable, one entry per instance. Either this or the legacy --bind/--target pair is required.
+
+      --bind <IP:PORT>
+          Legacy single-map form: the relay socket on the CGNAT-facing address, which is the tuple the carrier maps. Requires --target.
+
+      --target <IP:PORT>
+          Legacy single-map form: the local endpoint inbound datagrams are forwarded to, with the peer's source address preserved. Requires --bind.
+
+      --stun <HOST:PORT,...>
+          STUN servers, comma-separated as host:port, tried in order and rotated when one falls silent. Default: stun.l.google.com:19302,stun.cloudflare.com:3478.
+
+      --interval <SECS>
+          Seconds between the STUN writes that keep the mapping alive. The writes are what the carrier sees, so this is the cadence the mapping's lifetime depends on. Default 2, minimum 1.
+
+      --gateway <IP>
+          Next hop used to route STUN out the line that holds the mapping. Without it the default route wins and STUN reports the wrong nat. Default 192.168.0.1.
+
+      --state-dir <PATH>
+          Directory for the live state: the learned external tuple, the facade's leases, and the DeviceProtection store. It is expected to be on a temporary filesystem, so its contents do not survive a reboot. Default /run/ds-lite-punch.
+
+      --slot-port-range <LO-HI>
+          Port range the slot engine allocates from, written LO-HI. Ports in it must not overlap the relay socket. Default 30000-39999.
+
+      --max-slots <N>
+          Maximum concurrent slots. Default 32.
+
+      --max-maps-per-client <N>
+          Maximum mappings one client may hold at a time. Default 16.
+
+      --gc-grace-factor <N>
+          Grace multiple applied to a slot's lifetime before it is collected. Default 3.
+
+      --max-rescues <N>
+          Maximum rescue attempts before a slot is abandoned. Default 8.
+
+      --observation
+          Report the named devices' live flows and touch nothing. This is the stage a new device is admitted from, before --hold arms the arm.
+
+      --allowlist <PATH>
+          File of IPv4 addresses, one per line, with # for comments. These are the devices the hold acts for. The list is a budget as well as an admission: a held flow costs about half a packet a second at the default cadence. The path is read at startup, so a typo fails the start.
+
+      --hold
+          Hold the named devices' flows: the RFC conntrack lifetimes, plus the daemon's own writes to keep them alive. Without this flag the allowlist is reported on and nothing is touched.
+
+      --cdc <proc|nft|aya>
+          How conntrack entries are removed: proc, nft, or aya. The nft backend is the default and the one this line is measured with.
+
+      --pcp
+          Answer PCP (RFC 6887) and NAT-PMP (RFC 6886) on UDP 5351, on the local network only, riding the same slot engine as the UPnP facade. Off by default.
+
+      --pcp-peer
+          Answer the PCP PEER opcode with the mapping's own tuple. The datapath is endpoint-independent, so that opcode installs nothing and is otherwise refused.
+
+      --upnp-port <N>
+          Port the UPnP IGD facade serves on. Default 49152.
+
+      --lan-ip <IP>
+          Local address the facade binds its HTTP service to and joins the SSDP group on. Default 192.168.21.1.
+
+      --upnp-name <NAME>
+          Friendly name the facade reports in its device description. Default `ds-lite-punch IGD`.
+
+      --no-upnp
+          Turn the UPnP IGD facade off. Use it when another device on the local network already answers SSDP.
+
+      --carrier-probe
+          Count the cooperating helper's marked probe, and raise carrier-silent after the configured number of intervals with none. Arming this obliges the helper to run, because a helper that stopped and a carrier that stopped look the same to the counter.
+
+      --carrier-probe-interval <SECS>
+          Seconds expected between the helper's probes. Default 900.
+
+      --carrier-probe-misses <N>
+          Intervals of silence that raise carrier-silent. Default 3.
+
+      --carrier-probe-poll <SECS>
+          Seconds between readings of the counter's value. Default 5.
+
+  -h, --help
+          Print this text and exit.
+
+  -V, --version
+          Print version
+
+EXIT STATUS
+  0   the daemon ran, or --help or --version was printed
+  2   the command line was rejected, and the message says why
+
+ENVIRONMENT
+  The procd service reads /etc/ds-lite-punch.env and turns its keys into the flags above. The key-by-key mapping is in the manual page's ENVIRONMENT section, which also names the three keys only the service reads.
+
+SEE ALSO
+  man 8 ds-lite-punch, /etc/ds-lite-punch.env
