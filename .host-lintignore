@@ -1,0 +1,13 @@
+# Paths excluded from the prose audit (`host-lint --docs`), one per line.
+#
+# The two trees below are archived third-party text: the DeviceProtection:1 and
+# WANIPConnection:2 service specifications, transcribed from the published
+# documents and kept here as the reference the facade is built against. They are
+# records of another document, so a finding in them is that document's finding,
+# and rewording one would change what was transcribed. The host repository's own
+# record layer is excluded for the same reason.
+#
+# Everything else is authored here and stays scanned: README.md, docs/index.md,
+# the operator pages under docs/operators/, and deploy/.
+docs/upnp-dp1/
+docs/upnp-wip2/

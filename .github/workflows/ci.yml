@@ -71,3 +71,49 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ds-lite-punch
             artifact-record.txt
           if-no-files-found: error
+
+  # The operator surfaces are generated from one definition, and a generated
+  # file can leave that definition behind with no one noticing. This job holds
+  # the two generated artifacts to it, holds the manual page to the renderer,
+  # holds the authored docs' links, and holds their register.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: The generated help text and manual page match their definition
+        run: |
+          # The generator is a dev tool and it builds for the host, not for the
+          # router. The crate tree's .cargo/config.toml sends every cargo
+          # command to musl, so the target is named here. Regenerate, then fail
+          # if either committed artifact moved: a hand-edited help text, or a
+          # flag added to the definition and not regenerated, is caught here.
+          cargo run --quiet --manifest-path tools/argdoc/Cargo.toml --target x86_64-unknown-linux-gnu
+          git diff --exit-code -- src/help.txt deploy/man/ds-lite-punch.8
+      - name: The manual page renders without a warning
+        run: |
+          # groff writes a warning to stderr and still exits 0, so the check is
+          # that it has nothing to say. A macro it cannot read is caught the
+          # same way.
+          groff -man -ww -Tascii deploy/man/ds-lite-punch.8 > /dev/null 2> groff.txt
+          if [ -s groff.txt ]; then
+            cat groff.txt
+            echo "::error::groff reports the manual page"
+            exit 1
+          fi
+      - name: Every relative link in the authored docs resolves
+        run: sh tools/link-check.sh
+      - name: The authored docs carry no prose tropes
+        run: |
+          # Pinned to the host-lint tag the host repository references, since
+          # this repository keeps no submodule for the tool. The audit reads
+          # what this repository tracks, and `.host-lintignore` names the two
+          # archived specification transcriptions, which are records of another
+          # document.
+          #
+          # Build it from /tmp: cargo finds its config from the working
+          # directory, and the component's .cargo/config.toml would otherwise
+          # aim this build at musl, which the runner has no linker for.
+          git clone --quiet --depth 1 --branch v0.22.0 \
+            https://github.com/connollydavid/host-lint /tmp/host-lint
+          (cd /tmp && cargo build --quiet --release --manifest-path /tmp/host-lint/Cargo.toml)
+          /tmp/host-lint/target/release/host-lint --docs .
