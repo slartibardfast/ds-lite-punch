@@ -106,8 +106,16 @@ at start when no store exists.
 The mapping's learned external address and port, as the carrier reports it.
 Read this file to see what the line currently holds.
 .TP
+.B /run/ds-lite-punch/tuple-R
+The same external tuple for the held slot whose port is R, one file per slot.
+.TP
+.B /run/ds-lite-punch/upnp-ident
+The facade's own identity, the uuid it reports to control points. It is stable
+across restarts of the daemon.
+.TP
 .B /run/ds-lite-punch/leases.tsv
-The facade's live leases.
+The facade's live leases. The file is written when the facade has leases to
+keep.
 .TP
 .B /run/ds-lite-punch/upnp.tsv
 The facade's own state, including the mapping it reports to control points.
@@ -115,7 +123,7 @@ The facade's own state, including the mapping it reports to control points.
 .B /run/ds-lite-punch/dp.tsv
 The DeviceProtection store: users and identities. The directory is on a
 temporary filesystem, so this store is seeded again from
-\fB/etc/ds-lite-punch.acl\fR after a reboot.
+\fB/etc/ds-lite-punch.acl\fR at start when it is absent.
 .SH LOG EVENTS
 Every event is one line of JSON on syslog, written by the daemon and readable
 with \fBlogread\fR. The event name is the value of its \fBevent\fR field.
