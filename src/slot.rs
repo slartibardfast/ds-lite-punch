@@ -15,7 +15,7 @@
 //!   - epoch never decreases for a fixed `created_unix` and restarts near 0
 //!     after a simulated reboot (tmpfs loss).
 //!
-//! Interim `dead_code` allowance (p2-slot-engine): consumers land
+//! Interim `dead_code` allowance (p2-slot-engine): consumers appear
 //! incrementally — nft element calls (B4), persistence (B6), GC timer (B9),
 //! PCP/UPnP facades (D/E). Remove this allow when the B10 merge gate runs
 //! `cargo build -D warnings`.
@@ -1107,7 +1107,7 @@ mod tests {
     fn a_static_is_the_operators_and_is_never_the_slot_that_moves() {
         // call/0030: a static mapping is the operator's configuration, and
         // the same rule that releases a console's mapping leaves the
-        // configured relay alone. A device's flow that lands on a static's
+        // configured relay alone. A device's flow that takes a static's
         // port is still a collision, and the log is where it becomes
         // visible, but the port is not the daemon's to take: yielding it
         // would put the operator's own relay on a port they never chose, and

@@ -15,17 +15,17 @@
 //! Both the nft mirror and the proc read feed the same Kani-proven `obs`
 //! predicate; the mirror's 15 s kernel expiry is the silence detector, the
 //! proc table provides identity (host, host_port) for fresh tuples.
-use crate::obs::{scan, ObsCtx, RescueCandidate};
+use crate::obs::{scan, ObsCtx, RefreshCandidate};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use crate::publish::{emiteln};
 
 /// One live candidate: the shadow-bind tuple (`bind_tuple`, alias of
-/// `obs::RescueCandidate`) + the br-lan flow origin (`host`/`host_port`,
+/// `obs::RefreshCandidate`) + the br-lan flow origin (`host`/`host_port`,
 /// the pin key).
-pub type Candidate = RescueCandidate;
+pub type Candidate = RefreshCandidate;
 
-/// br-lan prefix (hosts eligible for rescue) and the hub-LAN NAT address
+/// br-lan prefix (hosts eligible for refresh) and the hub-LAN NAT address
 /// flows egress from — defaults matching `obs::brlan_ctx`.
 pub const BR_LAN: (Ipv4Addr, u8) = (Ipv4Addr::new(192, 168, 21, 0), 24);
 pub const VM_NAT: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 21);
@@ -43,7 +43,7 @@ pub enum CdcKind {
 /// engine now reads the lease table across an await while it holds one, so
 /// the trait carries both bounds the runtime needs.
 pub trait Cdc: Send + Sync {
-    /// Live candidates this tick. Cheap by contract: capped at the rescue
+    /// Live candidates this tick. Cheap by contract: capped at the refresh
     /// budget, no blocking beyond a kernel table read, 2 s cadence.
     fn tick(&mut self) -> Vec<Candidate>;
     fn name(&self) -> &'static str;
@@ -58,18 +58,18 @@ pub struct ProcCdc {
     brlan: (Ipv4Addr, u8),
     vm_nat: Ipv4Addr,
     held: Vec<(Ipv4Addr, u16)>,
-    max_rescues: u32,
+    max_refresh_attempts: u32,
 }
 
 impl ProcCdc {
     /// held = inner tuples static/lease slots own (I1: never capture one).
-    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_rescues: u32, allowed: Vec<Ipv4Addr>) -> Self {
+    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
         ProcCdc {
             path: PROC_PATH.to_string(),
             brlan: BR_LAN,
             vm_nat: VM_NAT,
             held,
-            max_rescues,
+            max_refresh_attempts,
             allowed,
         }
     }
@@ -89,8 +89,8 @@ impl Cdc for ProcCdc {
             vm_nat: self.vm_nat,
             allowed: &self.allowed,
             held: &self.held,
-            max_rescues: self.max_rescues,
-            rescues_so_far: 0,
+            max_refresh_attempts: self.max_refresh_attempts,
+            refresh_attempts_so_far: 0,
         };
         scan(&f, &ctx)
     }
@@ -110,17 +110,17 @@ impl Cdc for ProcCdc {
 pub struct NftCdc {
     known: HashMap<(Ipv4Addr, u16), Candidate>,
     held: Vec<(Ipv4Addr, u16)>,
-    max_rescues: u32,
+    max_refresh_attempts: u32,
     /// The allowlist, as for the proc backend.
     allowed: Vec<Ipv4Addr>,
 }
 
 impl NftCdc {
-    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_rescues: u32, allowed: Vec<Ipv4Addr>) -> Self {
+    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
         NftCdc {
             known: HashMap::new(),
             held,
-            max_rescues,
+            max_refresh_attempts,
             allowed,
         }
     }
@@ -145,7 +145,7 @@ impl Cdc for NftCdc {
             proc_text.as_deref(),
             &mut self.known,
             &self.held,
-            self.max_rescues,
+            self.max_refresh_attempts,
             &self.allowed,
         )
     }
@@ -165,7 +165,7 @@ fn reconcile(
     proc_text: Option<&str>,
     known: &mut HashMap<(Ipv4Addr, u16), Candidate>,
     held: &[(Ipv4Addr, u16)],
-    max_rescues: u32,
+    max_refresh_attempts: u32,
     allowed: &[Ipv4Addr],
 ) -> Vec<Candidate> {
     let fresh: Vec<(Ipv4Addr, u16)> = live
@@ -179,9 +179,9 @@ fn reconcile(
                 brlan: BR_LAN,
                 vm_nat: VM_NAT,
                 held,
-                max_rescues,
+                max_refresh_attempts,
                 allowed,
-                rescues_so_far: 0,
+                refresh_attempts_so_far: 0,
             };
             for c in scan(f, &ctx) {
                 if fresh.contains(&c.bind_tuple) {
@@ -224,7 +224,7 @@ mod tests {
             brlan: BR_LAN,
             vm_nat: VM_NAT,
             held: Vec::new(),
-            max_rescues: 8,
+            max_refresh_attempts: 8,
             allowed: Vec::new(),
         };
         let cands = cdc.tick();
@@ -243,7 +243,7 @@ mod tests {
             brlan: BR_LAN,
             vm_nat: VM_NAT,
             held: vec![(VM_NAT, 54322)],
-            max_rescues: 8,
+            max_refresh_attempts: 8,
             allowed: Vec::new(),
         };
         assert!(cdc.tick().is_empty(), "I1: held tuple never surfaces");
@@ -262,10 +262,10 @@ mod tests {
             brlan: BR_LAN,
             vm_nat: VM_NAT,
             held: Vec::new(),
-            max_rescues: 2,
+            max_refresh_attempts: 2,
             allowed: Vec::new(),
         };
-        assert_eq!(cdc.tick().len(), 2, "scan caps at the rescue budget");
+        assert_eq!(cdc.tick().len(), 2, "scan caps at the refresh budget");
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
             brlan: BR_LAN,
             vm_nat: VM_NAT,
             held: Vec::new(),
-            max_rescues: 8,
+            max_refresh_attempts: 8,
             allowed: Vec::new(),
         };
         assert!(cdc.tick().is_empty(), "unreadable table -> empty tick, not panic");

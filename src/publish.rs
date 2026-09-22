@@ -131,7 +131,7 @@ impl Publisher {
 
     /// A mapping's tuple file goes when the mapping does. The file is the
     /// *learned* tuple, so one that outlives its mapping is a lie a client can
-    /// act on: a later mapping that lands on the same bind port would be
+    /// act on: a later mapping that takes the same bind port would be
     /// answered with the dead port. The box found this on 2026-09-17, with
     /// three revoked slots still carrying their old tuples.
     pub fn remove_slot(&self, bind_port: u16) {

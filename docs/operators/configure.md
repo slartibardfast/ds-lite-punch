@@ -55,7 +55,7 @@ responders on UDP 1900 make both unreliable.
 ## PCP and NAT-PMP
 
 PCP (RFC 6887) and NAT-PMP (RFC 6886) listen on UDP 5351, on the local network
-only, and ride the same slot engine as the facade.
+only, and use the same slot engine as the facade.
 
 | Key | Default | What it does |
 |---|---|---|
@@ -114,7 +114,7 @@ line in `/etc/init.d/ds-lite-punch` when you need them:
 | `--upnp-name` | `ds-lite-punch IGD` | The friendly name the facade reports. |
 | `--cdc` | `nft` | How conntrack entries are removed: `proc`, `nft` or `aya`. |
 | `--gc-grace-factor` | `3` | A multiplier on a slot's lifetime before collection. |
-| `--max-rescues` | `8` | Attempts to rescue a slot before it is abandoned. |
+| `--max-refresh-attempts` | `8` | The hold's budget: refresh attempts for one flow whose conntrack entry has gone, and the number of flows the hold keeps at once. |
 
 ## Several mappings at once
 

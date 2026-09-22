@@ -44,8 +44,8 @@ Maximum mappings one client may hold at a time. Default 16.
 \fB\-\-gc\-grace\-factor\fR \fI<N>\fR
 Grace multiple applied to a slot\*(Aqs lifetime before it is collected. Default 3.
 .TP
-\fB\-\-max\-rescues\fR \fI<N>\fR
-Maximum rescue attempts before a slot is abandoned. Default 8.
+\fB\-\-max\-refresh\-attempts\fR \fI<N>\fR
+The hold\*(Aqs budget. It bounds the refresh attempts for one flow whose conntrack entry has gone, and the number of flows the hold keeps at once. Default 8.
 .TP
 \fB\-\-observation\fR
 Report the named devices\*(Aq live flows and touch nothing. This is the stage a new device is admitted from, before \-\-hold arms the arm.
@@ -60,7 +60,7 @@ Hold the named devices\*(Aq flows: the RFC conntrack lifetimes, plus the daemon\
 How conntrack entries are removed: proc, nft, or aya. The nft backend is the default and the one this line is measured with.
 .TP
 \fB\-\-pcp\fR
-Answer PCP (RFC 6887) and NAT\-PMP (RFC 6886) on UDP 5351, on the local network only, riding the same slot engine as the UPnP facade. Off by default.
+Answer PCP (RFC 6887) and NAT\-PMP (RFC 6886) on UDP 5351, on the local network only, using the same slot engine as the UPnP facade. Off by default.
 .TP
 \fB\-\-pcp\-peer\fR
 Answer the PCP PEER opcode with the mapping\*(Aqs own tuple. The datapath is endpoint\-independent, so that opcode installs nothing and is otherwise refused.

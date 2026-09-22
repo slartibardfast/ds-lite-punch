@@ -3,7 +3,7 @@
 //! Background: the engine claims a flow whose conntrack entry occupies the
 //! exact 5-tuple `(NAT, R_nat) ⇄ <server>` that the shadow keepalive must
 //! use. The kernel then NAPT's the shadow's keepalives to a fresh ephemeral
-//! port (measured on this box 2026-09-02: 41077 → 1024) — the rescue
+//! port (measured on this box 2026-09-02: 41077 → 1024) — the refresh
 //! refreshes the WRONG mapping while the observed one dies at the AFTR TTL.
 //!
 //! The brief's G8.4 mechanism for that is deleting the observed entry

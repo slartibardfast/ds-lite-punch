@@ -179,11 +179,15 @@ fn cli(version: &str) -> Command {
                 ),
         )
         .arg(
-            Arg::new("max-rescues")
-                .long("max-rescues")
+            Arg::new("max-refresh-attempts")
+                .long("max-refresh-attempts")
                 .value_name("N")
-                .help("Maximum rescue attempts before a slot is abandoned.")
-                .long_help("Maximum rescue attempts before a slot is abandoned. Default 8."),
+                .help("The hold's budget: refresh attempts for one flow, and flows held at once.")
+                .long_help(
+                    "The hold's budget. It bounds the refresh attempts for one flow whose \
+                     conntrack entry has gone, and the number of flows the hold keeps at once. \
+                     Default 8.",
+                ),
         )
         .arg(
             Arg::new("observation")
@@ -235,7 +239,7 @@ fn cli(version: &str) -> Command {
                 .help("Answer PCP and NAT-PMP on UDP 5351, on the local network.")
                 .long_help(
                     "Answer PCP (RFC 6887) and NAT-PMP (RFC 6886) on UDP 5351, on the local \
-                     network only, riding the same slot engine as the UPnP facade. Off by \
+                     network only, using the same slot engine as the UPnP facade. Off by \
                      default.",
                 ),
         )

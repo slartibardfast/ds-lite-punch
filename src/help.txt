@@ -37,8 +37,8 @@ Options:
       --gc-grace-factor <N>
           Grace multiple applied to a slot's lifetime before it is collected. Default 3.
 
-      --max-rescues <N>
-          Maximum rescue attempts before a slot is abandoned. Default 8.
+      --max-refresh-attempts <N>
+          The hold's budget. It bounds the refresh attempts for one flow whose conntrack entry has gone, and the number of flows the hold keeps at once. Default 8.
 
       --observation
           Report the named devices' live flows and touch nothing. This is the stage a new device is admitted from, before --hold arms the arm.
@@ -53,7 +53,7 @@ Options:
           How conntrack entries are removed: proc, nft, or aya. The nft backend is the default and the one this line is measured with.
 
       --pcp
-          Answer PCP (RFC 6887) and NAT-PMP (RFC 6886) on UDP 5351, on the local network only, riding the same slot engine as the UPnP facade. Off by default.
+          Answer PCP (RFC 6887) and NAT-PMP (RFC 6886) on UDP 5351, on the local network only, using the same slot engine as the UPnP facade. Off by default.
 
       --pcp-peer
           Answer the PCP PEER opcode with the mapping's own tuple. The datapath is endpoint-independent, so that opcode installs nothing and is otherwise refused.

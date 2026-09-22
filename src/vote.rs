@@ -22,7 +22,7 @@
 //!
 //! Interim `dead_code` allowance (p2-slot-engine): `confirmed()` is
 //! consumed by the E3 facade; publication reads the Churn tuple directly.
-//! Remove this allow when the facades land (D/E) and the merge-gate build
+//! Remove this allow when the facades are finished (D/E) and the merge-gate build
 //! runs `cargo build -D warnings`.
 #![allow(dead_code)]
 use std::net::Ipv4Addr;

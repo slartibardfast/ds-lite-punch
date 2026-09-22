@@ -1,24 +1,24 @@
-//! Observation rescue engine (brief v2, Phase G — G3–G5 runtime).
+//! Observation refresh engine (brief v2, Phase G — G3–G5 runtime).
 //!
-//! One tokio task per rescued flow, mirroring `run_slot` (same one-poll-loop
+//! One tokio task per refreshed flow, mirroring `run_slot` (same one-poll-loop
 //! shape, tokio DECIDED): the engine's 2 s tick drives *lifecycle* (claim /
 //! budget / exit) from the selected `Cdc` backend; each claimed flow gets a
 //! spawned task owning its shadow socket — keepalive tick + recv loop in the
 //! task, decisions in the engine.
 //!
-//! Rescue sequence (G3, exact order):
+//! Refresh sequence (G3, exact order):
 //!   (b) bind shadow socket (NAT addr, R_nat) — C5 PASS, shadow-bind proven;
 //!   (c) install the SELF-PIN `(NAT, R_nat) -> (NAT, R_nat)` — the shadow
 //!       keepalive flows must egress as `(NAT, R_nat)` to refresh the
 //!       observed AFTR mapping. Without it the kernel NAPT's them to a
 //!       fresh ephemeral port the moment the observed conntrack entry lives
-//!       (measured 41077 → 1024 on-box 2026-09-02) and the rescue refreshes
+//!       (measured 41077 → 1024 on-box 2026-09-02) and the refresh targets
 //!       the WRONG mapping. An explicit (addr, port) snat via the map
 //!       bypasses that remap; the entry-delete alternative was bisected
 //!       (CT_DELETE, all encodings) and rejected EINVAL by this 6.12
 //!       ImmortalWrt kernel — see ct.rs;
 //!   (d) add pin element (host, host_port) → R_nat — host wake-up flows
-//!       land on the same AFTR inner tuple;
+//!       reach the same AFTR inner tuple;
 //!   (e) input accept for R_nat (B4-parallel — a promotion datagram is a
 //!       NEW inbound flow fw4's `ct state established` won't cover);
 //!   (f) STUN keepalive from the shadow socket every tick — EIM refreshes
@@ -73,9 +73,9 @@ pub fn claim_allowed(
     bind: (Ipv4Addr, u16),
     held: &[(Ipv4Addr, u16)],
     active: usize,
-    max_rescues: u32,
+    max_refresh_attempts: u32,
 ) -> bool {
-    !held.contains(&bind) && (active as u64) < (max_rescues as u64)
+    !held.contains(&bind) && (active as u64) < (max_refresh_attempts as u64)
 }
 
 /// G5 exit decision. Pure; Kani-proven (the exit state machine).
@@ -95,7 +95,7 @@ pub fn exit_due(
 }
 
 /// Pin/unpin + forward-path accept operations — real impl drives nft; tests
-/// inject no-ops. The accept is B4-parallel: inbound to a rescued tuple that
+/// inject no-ops. The accept is B4-parallel: inbound to a refreshed tuple that
 /// is NOT part of an established flow (the promotion datagram) would be
 /// rejected by fw4's `ct state established` input policy without a per-port
 /// accept (slot accepts exist the same way; observation shadows install
@@ -136,7 +136,7 @@ impl PinOps for NftPins {
     }
 }
 
-/// One rescued flow.
+/// One refreshed flow.
 struct ObsSlot {
     host: Ipv4Addr,
     host_port: u16,
@@ -171,7 +171,7 @@ struct ObsSlot {
 pub struct ObservationEngine {
     cdc: Box<dyn Cdc>,
     held: Vec<(Ipv4Addr, u16)>,
-    max_rescues: u32,
+    max_refresh_attempts: u32,
     grace_ticks: u32,
     servers: Vec<SocketAddrV4>,
     publisher: Arc<Publisher>,
@@ -214,7 +214,7 @@ impl ObservationEngine {
     pub fn new(
         cdc: Box<dyn Cdc>,
         held: Vec<(Ipv4Addr, u16)>,
-        max_rescues: u32,
+        max_refresh_attempts: u32,
         grace_ticks: u32,
         servers: Vec<SocketAddrV4>,
         publisher: Arc<Publisher>,
@@ -223,7 +223,7 @@ impl ObservationEngine {
         ObservationEngine {
             cdc,
             held,
-            max_rescues,
+            max_refresh_attempts,
             grace_ticks,
             servers,
             publisher,
@@ -326,7 +326,7 @@ impl ObservationEngine {
         // Claims (G3): fresh candidates only, through the I1 + budget gate.
         for c in &live {
             if self.slots.iter().any(|s| s.bind_tuple == c.bind_tuple) {
-                continue; // already rescued
+                continue; // already refreshed
             }
             let (_, quiet) = self
                 .young
@@ -341,7 +341,7 @@ impl ObservationEngine {
                 // one device's churn cannot spend another device's capacity
                 continue;
             }
-            if !claim_allowed(c.bind_tuple, &held, self.slots.len(), self.max_rescues) {
+            if !claim_allowed(c.bind_tuple, &held, self.slots.len(), self.max_refresh_attempts) {
                 // R5: a tuple a slot holds is refused rather than captured,
                 // and the refusal is reported. A device's flow on a slot's
                 // tuple is the late collision (call/0028), and the log is
@@ -367,7 +367,7 @@ impl ObservationEngine {
             };
             // G3(c): self-pin — the shadow's keepalive traffic must egress
             // as (NAT, R_nat) or the kernel NAPT's it elsewhere and the
-            // rescue refreshes the wrong mapping (measured 41077 → 1024).
+            // refresh targets the wrong mapping (measured 41077 → 1024).
             if let Err(e) = self.pins.add(c.bind_tuple.0, c.bind_tuple.1, c.bind_tuple.1) {
                 emiteln!("warn: shadow self-pin {} failed: {}", c.bind_tuple.1, e);
                 drop(sock);
@@ -403,7 +403,7 @@ impl ObservationEngine {
                 external.clone(),
             );
             self.publisher.log_transition(
-                "rescue",
+                "refresh",
                 &format!(
                     "claim {}:{} -> {}:{} -> {} (cdc {})",
                     c.host,
@@ -534,7 +534,7 @@ impl ObservationEngine {
                 self.pins.unaccept(gone.bind_tuple.1);
                 let silent_s = unix_now().saturating_sub(gone.last_seen_unix);
                 self.publisher.log_transition(
-                    "rescue-exit",
+                    "refresh-exit",
                     &format!(
                         "{}:{} (reason {:?}, last seen {}s ago)",
                         gone.host, gone.host_port, r, silent_s
@@ -1048,7 +1048,7 @@ mod verify {
         let active: usize = kani::any();
         let max: u32 = kani::any();
         if claim_allowed(bind, &held, active, max) {
-            assert!(!held.contains(&bind), "claim never lands on a held tuple");
+            assert!(!held.contains(&bind), "claim never takes a held tuple");
             assert!((active as u64) < (max as u64), "claim never exceeds budget");
         }
     }

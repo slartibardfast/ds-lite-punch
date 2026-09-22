@@ -3,7 +3,7 @@
 //! The fourth admission path (call/0025): a LAN-only listener on UDP 5351
 //! carrying both protocols, as the design's own implementation notes specify
 //! (plan/0004 section 7). Only the codec lives here; the admission itself
-//! rides the same slot engine as the UPnP facade and the observation arm, so
+//! uses the same slot engine as the UPnP facade and the observation arm, so
 //! a mapping created in this dialect is indistinguishable from one created by
 //! `AddPortMapping` except in the wire format it is described with.
 //!

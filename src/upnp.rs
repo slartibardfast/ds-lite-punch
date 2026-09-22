@@ -558,7 +558,7 @@ pub fn service_of_path(path: &[u8]) -> Option<SoapService> {
 /// plus GetCommonLinkProperties on the WANCommonInterfaceConfig:1 service.
 /// DeviceProtection:1's thirteen actions (the authoritative surface,
 /// docs/upnp-dp1/TRANSCRIPTION.md) and the WANIPConnection:2-only actions
-/// ride the same table (plan/0008 #v2-service-set).
+/// use the same table (plan/0008 #v2-service-set).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoapAction {
     GetExternalIpAddress,
@@ -702,7 +702,7 @@ pub fn soapaction_is_v2(v: &[u8]) -> bool {
 
 /// The envelope-namespace prefix (the `ns=NN` token) of an M-POST MAN
 /// header, or None when the MAN header is absent or names a foreign
-/// namespace. The action then rides the `<NN>SOAPACTION` header. The MAN
+/// namespace. The action then uses the `<NN>SOAPACTION` header. The MAN
 /// value is `"<envelope-ns>";ns=NN`: only the URL is quoted, so a leading
 /// quote is dropped before the prefix match.
 pub fn mpost_ns(head: &[u8]) -> Option<&[u8]> {
@@ -859,7 +859,7 @@ pub fn classify(head: &[u8]) -> ReqClass {
         find_header(head, b"SOAPACTION")
     } else {
         // M-POST parity: the MAN namespace selects the service; the action
-        // rides the <ns>SOAPACTION header — same action table as POST.
+        // uses the <ns>SOAPACTION header — same action table as POST.
         let Some(ns) = mpost_ns(head) else {
             return ReqClass::SoapInvalidAction;
         };
@@ -1419,7 +1419,7 @@ mod tests {
         // after the SOAPACTION value. The GENA markers now run on both
         // transports, so a fabricated SID/NT/CALLBACK line must classify
         // as the marker on POST and M-POST alike (E3 same-dispatch), and
-        // any other fabricated line must land on the same class both ways.
+        // any other fabricated line must fall in the same class both ways.
         // This is the corner the mpost_post_parity Kani harness covers
         // symbolically; its concrete witnesses are pinned here.
         let cases: [&[u8]; 4] = [

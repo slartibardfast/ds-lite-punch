@@ -214,7 +214,7 @@ mod verify {
         kani::assume(cut < full.len());
         let truncated = &full[..cut];
         if let Some(t) = parse_mapped(truncated) {
-            // A truncated buffer can only still parse if the cut landed after
+            // A truncated buffer can only still parse if the cut falls after
             // the complete attribute — i.e. nothing was actually removed from
             // the attribute itself.
             assert_eq!(t, (Ipv4Addr::from(ip), port));

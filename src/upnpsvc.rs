@@ -47,7 +47,7 @@ const HTTP_CONN_CAP: usize = 16;
 const IGD_V2_ENABLED: bool = true;
 /// plan/0008 R6: the per-control-point discovery window. 1 s is the UDA
 /// default for a missing MX, so a deferred ssdp:all response always
-/// lands inside its own allowed response window.
+/// falls inside its own allowed response window.
 const DISCOVERY_DEBOUNCE_MS: u64 = 1000;
 /// The versioned description URLs (plan/0008's LOCATION design).
 const DOC_V1: &str = "/igd/v1/rootDesc.xml";
@@ -518,7 +518,7 @@ impl UpnpFacade {
         tokio::spawn(async move {
             let v2 = burst_resolves_v2(rx, Duration::from_millis(DISCOVERY_DEBOUNCE_MS)).await;
             let loc = if v2 { DOC_V2 } else { DOC_V1 };
-            // the deferred answer lands at the window deadline, which is
+            // the deferred answer goes out at the window deadline, which is
             // at most the assumed MX floor (1 s); no extra jitter needed
             let resp = upnp::msearch_response(
                 SearchTarget::All,
@@ -712,7 +712,7 @@ impl UpnpFacade {
         }
 
         // Record / refresh the control-plane entry (one entry per internal
-        // key — client, int, proto; the requested port rides the re-Add).
+        // key — client, int, proto; the requested port survives the re-Add).
         // A re-Add that moved the mapping to a new slot surrenders the
         // same client's previous entry at that port, so delete/enumerate
         // always resolve to the slot the control point actually owns.
@@ -1120,7 +1120,7 @@ impl UpnpFacade {
     }
 
     /// One upsert attempt. A retry after pressure eviction is the caller's
-    /// business (at most one eviction per Add).
+    /// responsibility (at most one eviction per Add).
     async fn upsert_once(
         &self,
         proto: Proto,
@@ -1593,7 +1593,7 @@ impl UpnpFacade {
     /// SystemUpdateID moves when a mapping appears or goes. A re-key of the
     /// datapath tuple deliberately does not move it: the reported port is the
     /// requested label (call/0022), so no event may invent a port change
-    /// (call/0025). What a re-key can show is the address, and that rides
+    /// (call/0025). What a re-key can show is the address, and that is reported through
     /// ExternalIPAddress on the tuple path.
     async fn bump_update_id(&self) {
         let mut g = self.gena.lock().await;
@@ -1940,7 +1940,7 @@ impl UpnpFacade {
             &persist::snapshot(&slots, now),
         );
         self.publisher.note_write("leases.tsv", w);
-        // the control-plane index (req_ext key) rides its own file
+        // the control-plane index (req_ext key) has its own file
         let es = self.entries.lock().await;
         let mut out = String::new();
         for e in es.iter() {
@@ -3160,8 +3160,8 @@ fn insert_sorted(es: &mut Vec<FacadeEntry>, e: FacadeEntry) {
 }
 
 /// The control-plane entry for a grant: one entry per internal
-/// (proto, client, int_port) tuple, riding the external port the control
-/// point last used ("the requested port rides the re-Add"). Returns the
+/// (proto, client, int_port) tuple, using the external port the control
+/// point last used ("the requested port survives the re-Add"). Returns the
 /// stray slot a same-client replace leaves behind — that client's previous
 /// entry at the requested port, whose datapath the caller must tear down —
 /// or None when no slot changed owner. Another client's entry at the same
@@ -3181,7 +3181,7 @@ fn apply_entry(
 ) -> Option<(u16, Ipv4Addr, u16)> {
     let expires = now_unix.saturating_add(u64::from(lifetime));
     // Same internal tuple: the upsert refreshed the existing slot in place
-    // — the entry rides to the newly requested external port, bind
+    // — the entry moves to the newly requested external port, bind
     // untouched, nothing torn down.
     if let Some(idx) = es
         .iter()
@@ -3208,7 +3208,7 @@ fn apply_entry(
     // facade's datapath never binds it (the AFTR dictates the real tuple
     // on the ds-lite uplink, and our own slot ranges do on an IPv4 NAT we
     // control), so two clients may each hold 3074 with their own slots and
-    // their own real tuples. This is where the supersession lands: the
+    // their own real tuples. This is where the supersession takes effect: the
     // specification's one-holder rule assumes the device owns the external
     // port, and here it does not.
     // A request that names no port carries no handle, and it therefore cannot
@@ -3877,7 +3877,7 @@ const PORT_LISTING_OPEN: &str = r#"<p:PortMappingList xmlns:p="urn:schemas-upnp-
 
 /// The wrapper that carries the fragment as the value of
 /// GetListOfPortMappings' NewPortListing OUT argument: A_ARG_TYPE_PortListing
-/// is a string holding an XML document, so the fragment rides in a CDATA
+/// is a string holding an XML document, so the fragment is carried in a CDATA section
 /// section inside the argument element rather than as the response's own
 /// children, where no control point would find it under that name. The
 /// reference server emits the same wrapper, and the reference client
@@ -4574,7 +4574,7 @@ mod tests {
         assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         // A re-adds the SAME internal tuple at a new requested port: the
-        // entry rides the port, the same slot, nothing torn down.
+        // the entry keeps the port, the same slot, nothing torn down.
         assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].req_ext, 3075);
@@ -5113,7 +5113,7 @@ mod tests {
             .expect("a populated range lists");
         assert!(
             listing.starts_with("<NewPortListing><![CDATA["),
-            "the fragment rides as the NewPortListing argument value: {}",
+            "the fragment is carried as the NewPortListing argument value: {}",
             listing
         );
         assert!(listing.contains(
@@ -6037,7 +6037,7 @@ mod tests {
 
         // a bare ssdp:all is deferred, then answered from v1 because no
         // :2 arrived inside the window. The deadline is the implementation
-        // parameter: the deferred answer lands at receive + the debounce,
+        // parameter: the deferred answer goes out at receive + the debounce,
         // with no further jitter (section 12 constraint 3).
         let t0 = std::time::Instant::now();
         probe.send_to(msearch("ssdp:all", "1").as_bytes(), addr).await.unwrap();
@@ -6058,7 +6058,7 @@ mod tests {
         );
         assert!(
             waited >= Duration::from_millis(900) && waited <= Duration::from_millis(1800),
-            "the deferred answer lands at the debounce deadline, not before and not much after: {:?}",
+            "the deferred answer goes out at the debounce deadline, not before and not much after: {:?}",
             waited
         );
 
@@ -6310,7 +6310,7 @@ mod ifindex_probe {
         // value, which is what a control point reads it from.
         assert!(
             listed.contains("<NewPortListing><![CDATA[<p:PortMappingList"),
-            "the listing rides as the NewPortListing argument value: {}",
+            "the listing is carried as the NewPortListing argument value: {}",
             listed
         );
         assert!(
@@ -6476,7 +6476,7 @@ mod ifindex_probe {
 
         // the v2 SCPD carries the authoritative 13, not the superseded names
         // (the R5 mount gate keeps /igd/v2/* unserved until the complete
-        // service set lands, so the document itself is asserted here; the
+        // service set is complete, so the document itself is asserted here; the
         // wired GET check lives with the gate-off integration harness)
         let scpd = String::from_utf8_lossy(SCPD_DP.as_bytes());
         for name in [
@@ -7470,7 +7470,7 @@ mod ifindex_probe {
 
     /// A revoked mapping takes its tuple file with it (found on the box,
     /// 2026-09-17: slots 40003-40005 carried dead tuples from mappings long
-    /// gone, and a fresh grant that landed on one of those ports was answered
+    /// gone, and a fresh grant that took one of those ports was answered
     /// with the dead tuple). The file is the *learned* tuple, so a file that
     /// outlives its mapping is a lie a client can act on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

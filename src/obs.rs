@@ -1,4 +1,4 @@
-//! Observation rescue engine (brief v2, Phase G) — G1/G2/G9.
+//! Observation refresh engine (brief v2, Phase G) — G1/G2/G9.
 //!
 //! G1 CDC: `/proc/net/nf_conntrack` polling. C4 measured (2026-08-31): on
 //! this ImmortalWrt 6.12.35 build, netlink conntrack events DO NOT reach
@@ -14,11 +14,11 @@
 //!   && dst off-LAN (not br-lan, not hub-LAN, not loopback/private-local)
 //!   && flow is bidirectional (reply seen — a peer cares about this flow)
 //!   && flow egresses the VM line (reply dst == the hub-LAN NAT address:
-//!      only flows through the AFTR have a CGNAT mapping to rescue; vdsl4
+//!      only flows through the AFTR have a CGNAT mapping to refresh; vdsl4
 //!      flows are directly routable and need nothing)
 //!   && inner tuple (NAT addr, reply dport) NOT held by a static/lease
 //!      slot (I1 — observation never captures a held tuple)
-//!   && rescues for this flow < --max-rescues
+//!   && refreshes for this flow < --max-refresh-attempts
 //! No hostname/MAC/port allowlists — review rejects any.
 //!
 //! G9: the predicate's truth table is Kani-proven. Parsing itself is
@@ -90,23 +90,23 @@ impl CtEntry {
 #[derive(Clone, Copy, Debug)]
 pub struct ObsCtx<'a> {
     /// The allowlist (call/0025). A named device's flow is admitted on its
-    /// own outbound tuple: the mapping a console's NAT type rides is the one
+    /// own outbound tuple: the mapping a console's NAT type depends on is the one
     /// its own packets create, and once it goes quiet only our writes can
     /// keep it alive, so an unanswered flow is exactly the one that needs us
     /// (call/0029). An unnamed flow keeps the reply requirement, where the
     /// heuristic is all there is to go on.
     pub allowed: &'a [Ipv4Addr],
-    /// br-lan prefix (hosts eligible for rescue). Default 192.168.21.0/24.
+    /// br-lan prefix (hosts eligible for refresh). Default 192.168.21.0/24.
     pub brlan: (Ipv4Addr, u8),
     /// hub-LAN NAT address — only flows egressing the VM line (AFTR) have
-    /// a CGNAT mapping to rescue.
+    /// a CGNAT mapping to refresh.
     pub vm_nat: Ipv4Addr,
     /// Inner tuples already held by static/lease slots (I1).
     pub held: &'a [(Ipv4Addr, u16)],
-    /// per-flow rescue budget
-    pub max_rescues: u32,
-    /// number of rescues so far for the candidate flow
-    pub rescues_so_far: u32,
+    /// per-flow refresh budget
+    pub max_refresh_attempts: u32,
+    /// number of refreshes so far for the candidate flow
+    pub refresh_attempts_so_far: u32,
 }
 
 impl<'a> ObsCtx<'a> {
@@ -136,7 +136,7 @@ impl<'a> ObsCtx<'a> {
 }
 
 /// G2 predicate. Pure; Kani-provable.
-pub fn should_rescue(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
+pub fn should_refresh(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
     if !e.is_udp() {
         return false;
     }
@@ -152,7 +152,7 @@ pub fn should_rescue(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
         return false;
     }
     // VM line only: the reply's destination is the hub-LAN NAT address,
-    // so the flow crossed the AFTR and has a CGNAT mapping to rescue.
+    // so the flow crossed the AFTR and has a CGNAT mapping to refresh.
     if e.reply_dst != ctx.vm_nat {
         return false;
     }
@@ -160,18 +160,18 @@ pub fn should_rescue(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
     if ctx.is_held(e.nat_src()) {
         return false;
     }
-    if ctx.rescues_so_far >= ctx.max_rescues {
+    if ctx.refresh_attempts_so_far >= ctx.max_refresh_attempts {
         return false;
     }
     true
 }
 
-/// A flow the observation engine has decided to rescue. The shadow socket
+/// A flow the observation engine has decided to refresh. The shadow socket
 /// binds `nat_src` = (192.168.0.21, R_nat) and STUN-keepalives it; a pin
 /// element `(orig_src, orig_sport) -> R_nat` goes in after C5 (shadow-bind
 /// proven) so all future traffic from that host port shares the tuple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RescueCandidate {
+pub struct RefreshCandidate {
     /// inner tuple the shadow socket will bind — the flow's post-NAT
     /// (source, port) as the AFTR sees it
     pub bind_tuple: (Ipv4Addr, u16),
@@ -181,32 +181,32 @@ pub struct RescueCandidate {
     /// Peer side of the observed flow (reply src) — the other half of the
     /// conntrack orig tuple the claim deletes (netlink CT_DELETE, see
     /// engine.rs: without the delete the kernel NAPT's the shadow
-    /// keepalives to an ephemeral port and the rescue refreshes the wrong
+    /// keepalives to an ephemeral port and the refresh targets the wrong
     /// tuple; measured 41077 → 1024 on-box, 2026-09-02).
     pub peer: (Ipv4Addr, u16),
 }
 
-/// Scan `/proc/net/nf_conntrack` and collect eligible rescue candidates.
+/// Scan `/proc/net/nf_conntrack` and collect eligible refresh candidates.
 /// Returns candidates in stable (line) order. Never allocates per line
 /// beyond the return list.
-pub fn scan(f: &str, ctx: &ObsCtx<'_>) -> Vec<RescueCandidate> {
+pub fn scan(f: &str, ctx: &ObsCtx<'_>) -> Vec<RefreshCandidate> {
     let mut out = Vec::new();
-    let mut rescues = 0u32;
+    let mut refreshes = 0u32;
     for line in f.lines() {
         let Some(e) = parse_line(line) else {
             continue;
         };
         let mut c = *ctx;
-        c.rescues_so_far = rescues;
-        if should_rescue(&e, &c) {
-            out.push(RescueCandidate {
+        c.refresh_attempts_so_far = refreshes;
+        if should_refresh(&e, &c) {
+            out.push(RefreshCandidate {
                 bind_tuple: e.nat_src(),
                 host: e.orig_src,
                 host_port: e.orig_sport,
                 peer: (e.reply_src, e.reply_sport),
             });
-            rescues += 1;
-            if rescues >= ctx.max_rescues {
+            refreshes += 1;
+            if refreshes >= ctx.max_refresh_attempts {
                 break;
             }
         }
@@ -282,9 +282,9 @@ pub fn brlan_ctx() -> ObsCtx<'static> {
         brlan: (Ipv4Addr::new(192, 168, 21, 0), 24),
         vm_nat: Ipv4Addr::new(192, 168, 0, 21),
         held: &[],
-        max_rescues: 8,
+        max_refresh_attempts: 8,
         allowed: &[],
-        rescues_so_far: 0,
+        refresh_attempts_so_far: 0,
     }
 }
 
@@ -312,8 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unreplied_flow_from_a_named_device_is_rescued() {
-        // call/0029: the mapping a console's NAT type rides is the one its
+    fn an_unreplied_flow_from_a_named_device_is_refreshed() {
+        // call/0029: the mapping a console's NAT type depends on is the one its
         // own packets create, and its flows to game peers are frequently
         // unanswered. A named device is admitted on that tuple; an unnamed
         // one is not.
@@ -326,19 +326,19 @@ mod tests {
             allowed: &named,
             ..brlan_ctx()
         };
-        assert!(should_rescue(&e, &ctx), "a named device is admitted unanswered");
+        assert!(should_refresh(&e, &ctx), "a named device is admitted unanswered");
         assert!(
-            !should_rescue(&e, &brlan_ctx()),
+            !should_refresh(&e, &brlan_ctx()),
             "without the list the reply requirement stands"
         );
     }
 
     #[test]
-    fn an_unreplied_flow_from_an_unnamed_device_is_not_rescued() {
+    fn an_unreplied_flow_from_an_unnamed_device_is_not_refreshed() {
         let e = parse_line(GOOD).unwrap();
         // no reply seen → predicate false (wait for a reply; mapping matters
         // to a peer)
-        assert!(!should_rescue(&e, &brlan_ctx()));
+        assert!(!should_refresh(&e, &brlan_ctx()));
     }
 
     fn replied_line() -> String {
@@ -350,34 +350,34 @@ mod tests {
     }
 
     #[test]
-    fn replied_vm_line_flow_is_rescued() {
+    fn replied_vm_line_flow_is_refreshed() {
         let line = replied_line();
         let e = parse_line(&line).unwrap();
         assert!(e.has_seen_reply());
         assert!(e.assured);
-        assert!(should_rescue(&e, &brlan_ctx()));
+        assert!(should_refresh(&e, &brlan_ctx()));
     }
 
     #[test]
-    fn vdsl4_flow_not_rescued() {
+    fn vdsl4_flow_not_refreshed() {
         // reply dst = the vdsl4 public IP (not the VM NAT): no AFTR mapping
         let line = GOOD
             .replace("dst=192.168.0.21", "dst=84.203.115.61")
             .replace("[UNREPLIED]", "")
             .replace("packets=0 bytes=0 mark=", "[ASSURED] packets=3 bytes=210 mark=");
         let e = parse_line(&line).unwrap();
-        assert!(!should_rescue(&e, &brlan_ctx()));
+        assert!(!should_refresh(&e, &brlan_ctx()));
     }
 
     #[test]
-    fn tcp_flow_not_rescued() {
+    fn tcp_flow_not_refreshed() {
         // TCP is out of scope until C3 measured.
         let line = GOOD
             .replace("udp      17", "tcp       6")
             .replace("packets=0 bytes=0 mark=", "[ASSURED] packets=3 bytes=210 mark=");
         let e = parse_line(&line).unwrap();
         assert!(!e.is_udp());
-        assert!(!should_rescue(&e, &brlan_ctx()));
+        assert!(!should_refresh(&e, &brlan_ctx()));
     }
 
     #[test]
@@ -388,30 +388,30 @@ mod tests {
             .replace("[UNREPLIED]", "")
             .replace("packets=0 bytes=0 mark=", "[ASSURED] packets=3 bytes=210 mark=");
         let e = parse_line(&line).unwrap();
-        assert!(!should_rescue(&e, &brlan_ctx()));
+        assert!(!should_refresh(&e, &brlan_ctx()));
     }
 
     #[test]
-    fn held_tuple_never_rescued() {
+    fn held_tuple_never_refreshed() {
         // I1: a lease/static slot already holds (192.168.0.21, 54322)
         let line = replied_line();
         let e = parse_line(&line).unwrap();
         let mut ctx = brlan_ctx();
         const HELD: [(Ipv4Addr, u16); 1] = [(Ipv4Addr::new(192, 168, 0, 21), 54322)];
         ctx.held = &HELD;
-        assert!(!should_rescue(&e, &ctx));
+        assert!(!should_refresh(&e, &ctx));
     }
 
     #[test]
-    fn rescue_budget_respected() {
+    fn refresh_budget_respected() {
         let line = replied_line();
         let e = parse_line(&line).unwrap();
         let mut ctx = brlan_ctx();
-        ctx.max_rescues = 8;
-        ctx.rescues_so_far = 8;
-        assert!(!should_rescue(&e, &ctx));
-        ctx.rescues_so_far = 7;
-        assert!(should_rescue(&e, &ctx));
+        ctx.max_refresh_attempts = 8;
+        ctx.refresh_attempts_so_far = 8;
+        assert!(!should_refresh(&e, &ctx));
+        ctx.refresh_attempts_so_far = 7;
+        assert!(should_refresh(&e, &ctx));
     }
 
     #[test]
@@ -443,10 +443,10 @@ mod tests {
 
     #[test]
     fn scan_respects_global_budget() {
-        // two eligible lines but max_rescues=1 -> only the first is taken
+        // two eligible lines but max_refresh_attempts=1 -> only the first is taken
         let good = replied_line();
         let mut ctx = brlan_ctx();
-        ctx.max_rescues = 1;
+        ctx.max_refresh_attempts = 1;
         let found = scan(&format!("{}\n{}", good, good), &ctx);
         assert_eq!(found.len(), 1);
     }
@@ -490,13 +490,13 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             held: &HELD,
-            max_rescues: 8,
-            rescues_so_far: 0,
+            max_refresh_attempts: 8,
+            refresh_attempts_so_far: 0,
         };
         // force UDP-ness off symbolically
         e.proto = kani::any();
         if e.proto != 17 {
-            assert!(!should_rescue(&e, &ctx), "non-UDP must never rescue");
+            assert!(!should_refresh(&e, &ctx), "non-UDP must never refresh");
         }
     }
 
@@ -507,11 +507,11 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             held: &HELD,
-            max_rescues: 8,
-            rescues_so_far: 0,
+            max_refresh_attempts: 8,
+            refresh_attempts_so_far: 0,
         };
-        if should_rescue(&e, &ctx) {
-            assert!(ctx.is_brlan(e.orig_src), "rescue implies br-lan src");
+        if should_refresh(&e, &ctx) {
+            assert!(ctx.is_brlan(e.orig_src), "refresh implies br-lan src");
         }
     }
 
@@ -522,12 +522,12 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             held: &HELD,
-            max_rescues: 8,
-            rescues_so_far: 0,
+            max_refresh_attempts: 8,
+            refresh_attempts_so_far: 0,
         };
-        if should_rescue(&e, &ctx) {
-            assert!(e.has_seen_reply(), "rescue implies bidirectional");
-            assert_eq!(e.reply_dst, NAT, "rescue implies VM-line egress");
+        if should_refresh(&e, &ctx) {
+            assert!(e.has_seen_reply(), "refresh implies bidirectional");
+            assert_eq!(e.reply_dst, NAT, "refresh implies VM-line egress");
         }
     }
 
@@ -538,27 +538,27 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             held: &HELD,
-            max_rescues: 8,
-            rescues_so_far: 0,
+            max_refresh_attempts: 8,
+            refresh_attempts_so_far: 0,
         };
-        ctx.rescues_so_far = 8;
-        assert!(!should_rescue(&e, &ctx), "budget exhausted -> never rescue");
+        ctx.refresh_attempts_so_far = 8;
+        assert!(!should_refresh(&e, &ctx), "budget exhausted -> never refresh");
     }
 
     #[kani::proof]
-    fn held_never_rescued() {
+    fn held_never_refreshed() {
         let e = any_entry();
         const HELD1: [(Ipv4Addr, u16); 1] = [(NAT, 54322)];
         let ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
             held: &HELD1,
-            max_rescues: 8,
-            rescues_so_far: 0,
+            max_refresh_attempts: 8,
+            refresh_attempts_so_far: 0,
         };
         let tuple = e.nat_src();
         if tuple == (NAT, 54322) {
-            assert!(!should_rescue(&e, &ctx), "I1: held tuple never rescued");
+            assert!(!should_refresh(&e, &ctx), "I1: held tuple never refreshed");
         }
     }
 }

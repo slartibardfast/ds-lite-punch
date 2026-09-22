@@ -19,7 +19,7 @@
 //!
 //! Interim `dead_code` allowance (p2-slot-engine): `read_leases` is the
 //! B8 respawn-restore reader, wired in the next phase. Remove the
-//! `#![allow(dead_code)]` when B8 lands and the merge-gate build runs
+//! `#![allow(dead_code)]` when B8 is done and the merge-gate build runs
 //! `cargo build -D warnings`.
 use std::fs;
 use std::io::Write;

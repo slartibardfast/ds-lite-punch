@@ -79,7 +79,7 @@ struct Config {
     max_maps_per_client: u16,
     gc_grace_factor: u32,
     observation: bool,
-    max_rescues: u32,
+    max_refresh_attempts: u32,
     cdc: CdcKind,
     /// The allowlist (call/0025): the devices the hold acts for. Empty means
     /// nobody, and the observation arm keeps the admission it already had.
@@ -129,7 +129,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut max_maps_per_client: u16 = 16;
     let mut gc_grace_factor: u32 = 3;
     let mut observation = false;
-    let mut max_rescues: u32 = 8;
+    let mut max_refresh_attempts: u32 = 8;
     let mut allow = Vec::new();
     let mut hold = false;
     let mut pcp = false;
@@ -217,8 +217,8 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 observation = true;
                 i += 1
             }
-            "--max-rescues" => {
-                max_rescues = v()?.parse().map_err(|e| format!("--max-rescues: {}", e))?;
+            "--max-refresh-attempts" => {
+                max_refresh_attempts = v()?.parse().map_err(|e| format!("--max-refresh-attempts: {}", e))?;
                 i += 2
             }
             "--allowlist" => {
@@ -383,7 +383,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         max_maps_per_client,
         gc_grace_factor,
         observation,
-        max_rescues,
+        max_refresh_attempts,
         cdc: cdc_kind,
         allow,
         hold,
@@ -908,7 +908,7 @@ async fn main() {
         }
     }
 
-    // Phase G: observation rescue engine (--observation). The selected CDC
+    // Phase G: observation refresh engine (--observation). The selected CDC
     // produces live candidate flows; the engine claims them with shadow
     // sockets that keep the AFTR mapping alive and forward inbound to the
     // host P1-style (see engine.rs). Default CDC = the nft `flow_obs`
@@ -923,7 +923,7 @@ async fn main() {
             .map(|s| (bind_ip, s.bind_port))
             .collect();
         let cdc: Box<dyn cdc::Cdc> = match cfg.cdc {
-            cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(held.clone(), cfg.max_rescues, cfg.allow.clone())),
+            cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(held.clone(), cfg.max_refresh_attempts, cfg.allow.clone())),
             cdc::CdcKind::Nft => {
                 // The mirror is part of the daemon's ruleset but only when
                 // the observation engine is enabled — the production daemon
@@ -932,7 +932,7 @@ async fn main() {
                     emiteln!("fatal: nft flow_obs mirror install failed: {}", e);
                     std::process::exit(1);
                 }
-                Box::new(cdc::NftCdc::new(held.clone(), cfg.max_rescues, cfg.allow.clone()))
+                Box::new(cdc::NftCdc::new(held.clone(), cfg.max_refresh_attempts, cfg.allow.clone()))
             }
             cdc::CdcKind::Aya => {
                 emiteln!("fatal: --cdc aya is not built yet");
@@ -943,7 +943,7 @@ async fn main() {
         let mut engine = engine::ObservationEngine::new(
             cdc,
             held,
-            cfg.max_rescues,
+            cfg.max_refresh_attempts,
             engine::DEFAULT_GRACE_TICKS,
             servers,
             publisher.clone(),
@@ -963,9 +963,9 @@ async fn main() {
             engine.run().await;
         });
         emitln!(
-            "{{\"event\":\"observe\",\"cdc\":\"{}\",\"max_rescues\":{},\"allowed\":{},\"hold\":{}}}",
+            "{{\"event\":\"observe\",\"cdc\":\"{}\",\"max_refresh_attempts\":{},\"allowed\":{},\"hold\":{}}}",
             cdc_name,
-            cfg.max_rescues,
+            cfg.max_refresh_attempts,
             cfg.allow.len(),
             cfg.hold
         );
@@ -1037,7 +1037,7 @@ async fn main() {
     }
 
     // The shared port (call/0025's fourth admission, plan/0009 #pcp): PCP and
-    // NAT-PMP on UDP 5351, LAN-only, riding the same slot engine as every
+    // NAT-PMP on UDP 5351, LAN-only, using the same slot engine as every
     // other admission. It is opt-in because PCP's semantics are entirely
     // private to this daemon (plan/0004 section 7), and it needs the facade,
     // which owns the grant machinery.

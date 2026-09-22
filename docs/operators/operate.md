@@ -49,7 +49,7 @@ logread | grep ds-lite-punch
 | `upnp` | `lan`, `udn` | the facade is serving |
 | `pcp` | `bind`, `peer` | the PCP and NAT-PMP listener is serving |
 | `hold` | `devices`, `ruleset_in_force` | the hold's admission and its state |
-| `observe` | `cdc`, `max_rescues`, `allowed`, `hold` | the observation arm's reading |
+| `observe` | `cdc`, `max_refresh_attempts`, `allowed`, `hold` | the observation arm's reading |
 | `carrier-watch` | `counter`, `interval`, `misses`, `poll` | the watch is armed |
 | `carrier-probe` | `count`, `epoch` | a probe from the helper was counted |
 | `carrier-silent` | `last_probe`, `waited`, `epoch` | the count stopped rising |
