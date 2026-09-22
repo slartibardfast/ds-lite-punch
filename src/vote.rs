@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(v.confirmed(), Some((A, 40000)));
         // after heal, the old disagreeing server still participates: it must
         // re-report the new value before churn can happen - and now B is the
-        // value under test with server 1 as the only holder -> Disagree.
+        // value under test, with server 1 the only server on the old value -> Disagree.
         assert!(matches!(v.observe(1, (B, 50000)), VoteDecision::Disagree(_)));
     }
 }

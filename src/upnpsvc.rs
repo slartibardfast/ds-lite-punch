@@ -579,7 +579,7 @@ impl UpnpFacade {
     /// requester on the same port gets its own entry beside it, because
     /// the port is a per-client label rather than a resource this device
     /// allocates (call/0022, which supersedes the specification's
-    /// one-holder rule for this line).
+    /// one-mapping rule for this line).
     async fn allocate_exact(
         &self,
         req: MappingReq,
@@ -701,7 +701,7 @@ impl UpnpFacade {
                 Err(e) => {
                     // bind failed: roll back nft + table. No pin to remove:
                     // the facade's grant installs none (the arm and the TCP
-                    // holder pin their own flows and clean them up themselves).
+                    // connection pin their own flows and clean them up themselves).
                     let _ = nft::del_input_accept(bind_port, proto == Proto::Tcp);
                     let mut t = self.table.lock().await;
                     t.delete_by_bind_port(bind_port);
@@ -1202,7 +1202,7 @@ impl UpnpFacade {
         let publisher = self.publisher.clone();
         let servers = self.cfg.servers.clone();
         let bind_ip = self.cfg.bind_ip;
-        let h2 = tokio::spawn(tcpslot::run_holder(bind_ip, bind_port, servers, vote, publisher));
+        let h2 = tokio::spawn(tcpslot::run_connection(bind_ip, bind_port, servers, vote, publisher));
         Ok(vec![h1, h2])
     }
 
@@ -1247,8 +1247,8 @@ impl UpnpFacade {
         }
         {
             // Only the caller's own entry goes. This retained on
-            // (req_ext, proto) alone, which was the one-holder rule: deleting
-            // one holder drained every client's entry at that port (the
+            // (req_ext, proto) alone, which was the one-mapping rule: deleting
+            // one entry drained every client's entry at that port (the
             // deployed bench found it, the router's delete taking the
             // workstation's mapping with it).
             let mut es = self.entries.lock().await;
@@ -1298,8 +1298,8 @@ impl UpnpFacade {
         // The index addresses this list directly. It used to index a list of
         // (req_ext, proto) keys and then look the entry up by those two
         // fields, which is no longer unique now that several clients may hold
-        // one requested port: both indexes rendered the first holder, so a
-        // two-holder table enumerated as two copies of the earlier entry.
+        // one requested port: both indexes rendered the first entry, so a
+        // two-entry table enumerated as two copies of the earlier entry.
         // The bench for the client matrix found it.
         let e = visible
             .get(index as usize)
@@ -2928,8 +2928,8 @@ fn entry_within(c: Contain, e: &FacadeEntry) -> bool {
 /// preference expressed.
 fn preferred_port(entries: &[FacadeEntry], req_ext: u16, proto: Proto) -> u16 {
     // A preferred port is honoured. It used to be moved aside when another
-    // client held it, which was the one-holder rule; with a per-client label
-    // (call/0022) another client's holder is no obstacle, and the only request
+    // client held it, which was the one-mapping rule; with a per-client label
+    // (call/0022) another client's entry is no obstacle, and the only request
     // that has to be resolved is the wildcard, which states no preference.
     // On an uplink where this device owns the real port, the datapath decides
     // whether the preference can be bound; the label is the control point's
@@ -3197,19 +3197,19 @@ fn apply_entry(
     }
     // The same client's own mapping at the same requested port, with a
     // different internal tuple: the upsert granted a NEW slot, so that
-    // client's previous entry must surrender the port: one holder per
+    // client's previous entry must surrender the port: one entry per
     // client per port, because the port is that client's handle and a
     // client cannot hold two mappings under one handle. An entry whose bind_port
     // already IS the new slot is a stale index row — refresh it in place
     // rather than tear it down.
     //
-    // Another client's holder at the same requested port is NOT an
+    // Another client's entry at the same requested port is NOT an
     // occupant to evict. The requested port is a per-client label: the
     // facade's datapath never binds it (the AFTR dictates the real tuple
     // on the ds-lite uplink, and our own slot ranges do on an IPv4 NAT we
     // control), so two clients may each hold 3074 with their own slots and
     // their own real tuples. This is where the supersession takes effect: the
-    // specification's one-holder rule assumes the device owns the external
+    // specification's one-mapping rule assumes the device owns the external
     // port, and here it does not.
     // A request that names no port carries no handle, and it therefore cannot
     // take another mapping away. Measured on the router on 2026-09-20: a PCP
@@ -4563,7 +4563,7 @@ mod tests {
         // slot — delete tore down the wrong datapath and the live mapping
         // became unenumerable. One entry per internal tuple, and, since the
         // requested port is a per-client label, one entry per client per
-        // requested port: another client's holder is not an occupant to
+        // requested port: another client's entry is not an occupant to
         // evict, which is the multiple-console case.
         let now = 1_700_000_000u64;
         let a = Ipv4Addr::new(192, 168, 21, 50);
@@ -4580,7 +4580,7 @@ mod tests {
         assert_eq!(es[0].req_ext, 3075);
         assert_eq!(es[0].bind_port, 30000);
         // A claims 3075/UDP with a different internal tuple: A's own entry
-        // at that port surrenders it: one holder per client per port,
+        // at that port surrenders it: one entry per client per port,
         // because the port is that client's handle.
         assert_eq!(
             apply_entry(&mut es, 3075, Proto::Udp, a, a, 6000, 30005, 3600, now, d("client-a")),
@@ -4840,7 +4840,7 @@ mod tests {
             "the requester deletes its own mapping"
         );
 
-        // the enumeration renders each holder as itself: two clients hold
+        // the enumeration renders each entry as itself: two clients hold
         // 1024/UDP here, so index 1 must not render index 0's entry (the
         // defect the deployed bench caught; the index addresses the visible
         // list rather than a (port, protocol) key)
@@ -4884,10 +4884,10 @@ mod tests {
         assert!(
             holders.iter().any(|x| x.contains("a-owns-1024"))
                 && holders.iter().any(|x| x.contains("b-owns-1024")),
-            "each index renders its own holder, not the first one twice"
+            "each index renders its own entry, not the first one twice"
         );
 
-        // and a delete of one holder leaves the other standing
+        // and a delete of one entry leaves the other standing
         assert!(
             facade.delete_mapping(1024, Proto::Udp, a, None).await.is_ok(),
             "A deletes the mapping it made"
@@ -4953,31 +4953,31 @@ mod tests {
             expires_at_unix: 0,
             desc: String::new(),
         };
-        let held = vec![e(5000, Proto::Udp, a), e(5001, Proto::Udp, b)];
+        let owned = vec![e(5000, Proto::Udp, a), e(5001, Proto::Udp, b)];
 
         // preferred: the port is a per-client label (call/0022), so another
-        // client's holder is no obstacle and the preference is honoured
-        assert_eq!(preferred_port(&held, 5000, Proto::Udp), 5000);
+        // client's entry is no obstacle and the preference is honoured
+        assert_eq!(preferred_port(&owned, 5000, Proto::Udp), 5000);
         // a wildcard states no preference, so it allocates
-        assert_eq!(preferred_port(&held, 0, Proto::Udp), ANY_PORT_BASE);
+        assert_eq!(preferred_port(&owned, 0, Proto::Udp), ANY_PORT_BASE);
         // the requester's own port is honoured, so a re-Add refreshes
-        assert_eq!(preferred_port(&held, 5001, Proto::Udp), 5001);
+        assert_eq!(preferred_port(&owned, 5001, Proto::Udp), 5001);
         // a free port is honoured
-        assert_eq!(preferred_port(&held, 8100, Proto::Udp), 8100);
+        assert_eq!(preferred_port(&owned, 8100, Proto::Udp), 8100);
 
         // exact: the same request on the same state adds beside the other
-        // client's holder, which is the supersession call/0022 records; the
-        // earlier holder keeps its mapping.
-        let mut es = held.clone();
+        // client's entry, which is the supersession call/0022 records; the
+        // earlier entry keeps its mapping.
+        let mut es = owned.clone();
         assert_eq!(
             apply_entry(&mut es, 5000, Proto::Udp, b, b, 7000, 30010, 3600, 1_700_000_000, "b".into()),
             None,
-            "exact adds beside the other client's holder rather than evicting it"
+            "exact adds beside the other client's entry rather than evicting it"
         );
         assert_eq!(es.len(), 3, "two clients now hold 5000/UDP");
         assert!(
             es.iter().any(|x| x.req_ext == 5000 && x.client == a),
-            "the earlier holder keeps its mapping"
+            "the earlier entry keeps its mapping"
         );
         assert!(es.iter().any(|x| x.req_ext == 5000 && x.client == b));
     }

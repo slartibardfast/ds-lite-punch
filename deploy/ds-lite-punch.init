@@ -68,15 +68,15 @@ start_service() {
     NO_UPNP=
     [ "${UPNP:-1}" = "1" ] || NO_UPNP=--no-upnp
 
-    # The hold's admission (call/0025): the allowlist names the devices whose
-    # flows get the RFC lifetimes, and HOLD=1 turns the arm from reporting
-    # them to holding them. The conntrack policy lands in the daemon's own
+    # The keepalive's admission (call/0025): the allowlist names the devices whose
+    # flows get the RFC lifetimes, and KEEPALIVE=1 turns the arm from reporting
+    # them to keeping them alive. The conntrack policy lands in the daemon's own
     # table (ip dslp), so cleanup_nft's table delete reverts it with the rest
     # of the datapath and no firewall include has to be kept in step.
     ALLOW=
     if [ -n "$ALLOWLIST" ] && [ -f "$ALLOWLIST" ]; then
         ALLOW="--allowlist $ALLOWLIST"
-        [ "${HOLD:-0}" = "1" ] && ALLOW="$ALLOW --hold"
+        [ "${KEEPALIVE:-0}" = "1" ] && ALLOW="$ALLOW --keepalive"
     fi
 
     # The shared port (plan/0009 #pcp): PCP and NAT-PMP on UDP 5351. Off by

@@ -99,7 +99,7 @@ The installer does these things:
 2. Writes the sample configuration to `/etc/ds-lite-punch.env`, and only when no
    file is there yet.
 3. Creates `/etc/ds-lite-punch.allow` as an empty file. That file names the
-   devices the hold acts for.
+   devices the keepalive acts for.
 4. Puts the manual page at `/usr/share/man/man8/ds-lite-punch.8`.
 5. Enables the service, restarts it, and prints the status, the mapping, and the
    next steps.
@@ -157,7 +157,7 @@ A<TAB>name<TAB>alias-or-dash<TAB>id-hex32<TAB>roles
 
 ## Where to go next
 
-- [Configure](configure.md) the daemon: the keys, the facade, the hold, and the
+- [Configure](configure.md) the daemon: the keys, the facade, the keepalive, and the
   carrier watch.
 - [Operate](operate.md) it: the state files, the log events, and how to check a
   mapping from outside the line.

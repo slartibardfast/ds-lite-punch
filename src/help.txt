@@ -20,7 +20,7 @@ Options:
           Seconds between the STUN writes that keep the mapping alive. The writes are what the carrier sees, so this is the cadence the mapping's lifetime depends on. Default 2, minimum 1.
 
       --gateway <IP>
-          Next hop used to route STUN out the line that holds the mapping. Without it the default route wins and STUN reports the wrong nat. Default 192.168.0.1.
+          Next hop used to route STUN out the line the mapping is on. Without it the default route wins and STUN reports the wrong nat. Default 192.168.0.1.
 
       --state-dir <PATH>
           Directory for the live state: the learned external tuple, the facade's leases, and the DeviceProtection store. It is expected to be on a temporary filesystem, so its contents do not survive a reboot. Default /run/ds-lite-punch.
@@ -32,22 +32,22 @@ Options:
           Maximum concurrent slots. Default 32.
 
       --max-maps-per-client <N>
-          Maximum mappings one client may hold at a time. Default 16.
+          Maximum mappings per client. Default 16.
 
       --gc-grace-factor <N>
           Grace multiple applied to a slot's lifetime before it is collected. Default 3.
 
       --max-refresh-attempts <N>
-          The hold's budget. It bounds the refresh attempts for one flow whose conntrack entry has gone, and the number of flows the hold keeps at once. Default 8.
+          The keepalive's budget. It bounds the refresh attempts for one flow whose conntrack entry has gone, and the number of flows kept alive at once. Default 8.
 
       --observation
-          Report the named devices' live flows and touch nothing. This is the stage a new device is admitted from, before --hold arms the arm.
+          Report the named devices' live flows and touch nothing. This is the stage a new device is admitted from, before --keepalive arms the arm.
 
       --allowlist <PATH>
-          File of IPv4 addresses, one per line, with # for comments. These are the devices the hold acts for. The list is a budget as well as an admission: a held flow costs about half a packet a second at the default cadence. The path is read at startup, so a typo fails the start.
+          File of IPv4 addresses, one per line, with # for comments. These are the devices the keepalive acts for. The list is a budget as well as an admission: a flow kept alive costs about half a packet a second at the default cadence. The path is read at startup, so a typo fails the start.
 
-      --hold
-          Hold the named devices' flows: the RFC conntrack lifetimes, plus the daemon's own writes to keep them alive. Without this flag the allowlist is reported on and nothing is touched.
+      --keepalive
+          Keep the named devices' mappings alive: the RFC conntrack lifetimes, plus the daemon's own writes on the device's behalf. Without this flag the allowlist is reported on and nothing is touched.
 
       --cdc <proc|nft|aya>
           How conntrack entries are removed: proc, nft, or aya. The nft backend is the default and the one this line is measured with.

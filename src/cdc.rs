@@ -57,18 +57,18 @@ pub struct ProcCdc {
     path: String,
     brlan: (Ipv4Addr, u8),
     vm_nat: Ipv4Addr,
-    held: Vec<(Ipv4Addr, u16)>,
+    owned: Vec<(Ipv4Addr, u16)>,
     max_refresh_attempts: u32,
 }
 
 impl ProcCdc {
     /// held = inner tuples static/lease slots own (I1: never capture one).
-    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
+    pub fn new(owned: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
         ProcCdc {
             path: PROC_PATH.to_string(),
             brlan: BR_LAN,
             vm_nat: VM_NAT,
-            held,
+            owned,
             max_refresh_attempts,
             allowed,
         }
@@ -88,7 +88,7 @@ impl Cdc for ProcCdc {
             brlan: self.brlan,
             vm_nat: self.vm_nat,
             allowed: &self.allowed,
-            held: &self.held,
+            owned: &self.owned,
             max_refresh_attempts: self.max_refresh_attempts,
             refresh_attempts_so_far: 0,
         };
@@ -109,17 +109,17 @@ impl Cdc for ProcCdc {
 /// Steady state does zero proc reads.
 pub struct NftCdc {
     known: HashMap<(Ipv4Addr, u16), Candidate>,
-    held: Vec<(Ipv4Addr, u16)>,
+    owned: Vec<(Ipv4Addr, u16)>,
     max_refresh_attempts: u32,
     /// The allowlist, as for the proc backend.
     allowed: Vec<Ipv4Addr>,
 }
 
 impl NftCdc {
-    pub fn new(held: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
+    pub fn new(owned: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
         NftCdc {
             known: HashMap::new(),
-            held,
+            owned,
             max_refresh_attempts,
             allowed,
         }
@@ -144,7 +144,7 @@ impl Cdc for NftCdc {
             &live,
             proc_text.as_deref(),
             &mut self.known,
-            &self.held,
+            &self.owned,
             self.max_refresh_attempts,
             &self.allowed,
         )
@@ -164,7 +164,7 @@ fn reconcile(
     live: &[(Ipv4Addr, u16)],
     proc_text: Option<&str>,
     known: &mut HashMap<(Ipv4Addr, u16), Candidate>,
-    held: &[(Ipv4Addr, u16)],
+    owned: &[(Ipv4Addr, u16)],
     max_refresh_attempts: u32,
     allowed: &[Ipv4Addr],
 ) -> Vec<Candidate> {
@@ -178,7 +178,7 @@ fn reconcile(
             let ctx = ObsCtx {
                 brlan: BR_LAN,
                 vm_nat: VM_NAT,
-                held,
+                owned,
                 max_refresh_attempts,
                 allowed,
                 refresh_attempts_so_far: 0,
@@ -223,7 +223,7 @@ mod tests {
             path,
             brlan: BR_LAN,
             vm_nat: VM_NAT,
-            held: Vec::new(),
+            owned: Vec::new(),
             max_refresh_attempts: 8,
             allowed: Vec::new(),
         };
@@ -237,16 +237,16 @@ mod tests {
 
     #[test]
     fn proc_tick_filters_held_tuples() {
-        let path = temp_table("held", &format!("{}\n", replied(GOOD)));
+        let path = temp_table("owned", &format!("{}\n", replied(GOOD)));
         let mut cdc = ProcCdc {
             path,
             brlan: BR_LAN,
             vm_nat: VM_NAT,
-            held: vec![(VM_NAT, 54322)],
+            owned: vec![(VM_NAT, 54322)],
             max_refresh_attempts: 8,
             allowed: Vec::new(),
         };
-        assert!(cdc.tick().is_empty(), "I1: held tuple never surfaces");
+        assert!(cdc.tick().is_empty(), "I1: owned tuple never surfaces");
     }
 
     #[test]
@@ -261,7 +261,7 @@ mod tests {
             path,
             brlan: BR_LAN,
             vm_nat: VM_NAT,
-            held: Vec::new(),
+            owned: Vec::new(),
             max_refresh_attempts: 2,
             allowed: Vec::new(),
         };
@@ -274,7 +274,7 @@ mod tests {
             path: "/nonexistent/nf_conntrack".to_string(),
             brlan: BR_LAN,
             vm_nat: VM_NAT,
-            held: Vec::new(),
+            owned: Vec::new(),
             max_refresh_attempts: 8,
             allowed: Vec::new(),
         };

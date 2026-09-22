@@ -28,7 +28,7 @@ again after a reboot.
 | File | What it holds |
 |---|---|
 | `tuple` | the mapping's external address and port |
-| `tuple-R` | the same for the held slot whose port is `R`, one file per slot |
+| `tuple-R` | the same for the slot whose port is `R`, one file per slot |
 | `upnp-ident` | the facade's own identity, the uuid it reports to control points |
 | `leases.tsv` | the facade's live leases, written when it has any |
 | `upnp.tsv` | the facade's own state |
@@ -45,11 +45,11 @@ logread | grep ds-lite-punch
 | Event | Fields | What it means |
 |---|---|---|
 | `start` | `bind`, `target`, `stun_servers`, `slots` | the configuration the daemon started with |
-| `tuple` | `ip`, `port`, and `slot` for a held slot | the mapping the carrier is holding |
+| `tuple` | `ip`, `port`, and `slot` when a slot owns it | the mapping the carrier has |
 | `upnp` | `lan`, `udn` | the facade is serving |
 | `pcp` | `bind`, `peer` | the PCP and NAT-PMP listener is serving |
-| `hold` | `devices`, `ruleset_in_force` | the hold's admission and its state |
-| `observe` | `cdc`, `max_refresh_attempts`, `allowed`, `hold` | the observation arm's reading |
+| `keepalive` | `devices`, `ruleset_in_force` | the keepalive's admission and its state |
+| `observe` | `cdc`, `max_refresh_attempts`, `allowed`, `keepalive` | the observation arm's reading |
 | `carrier-watch` | `counter`, `interval`, `misses`, `poll` | the watch is armed |
 | `carrier-probe` | `count`, `epoch` | a probe from the helper was counted |
 | `carrier-silent` | `last_probe`, `waited`, `epoch` | the count stopped rising |
@@ -72,10 +72,10 @@ ip rule show
 
 | Where | What it is |
 |---|---|
-| `table ip dslp` | the daemon's own table: the sets and maps for the slot ports, the prerouting translation, and the hold's conntrack policy |
+| `table ip dslp` | the daemon's own table: the sets and maps for the slot ports, the prerouting translation, and the keepalive's conntrack policy |
 | `inet fw4` | the accept rules the daemon inserts for the slot ports, each marked with the comment `dslitepunch-R` |
 | `ip rule`, priority `25100` | the policy route the relay's own egress uses, over table `1001` |
-| `ip route`, table `1001` | the source route that keeps the relay's replies on the line that holds the mapping |
+| `ip route`, table `1001` | the source route that keeps the relay's replies on the line the mapping is on |
 
 The daemon also adds one host route per STUN server, through `GATEWAY`, so the
 STUN writes leave by the right line.

@@ -16,8 +16,8 @@
 //!   && flow egresses the VM line (reply dst == the hub-LAN NAT address:
 //!      only flows through the AFTR have a CGNAT mapping to refresh; vdsl4
 //!      flows are directly routable and need nothing)
-//!   && inner tuple (NAT addr, reply dport) NOT held by a static/lease
-//!      slot (I1 — observation never captures a held tuple)
+//!   && inner tuple (NAT addr, reply dport) not owned by a static/lease
+//!      slot (I1 — observation never captures an owned tuple)
 //!   && refreshes for this flow < --max-refresh-attempts
 //! No hostname/MAC/port allowlists — review rejects any.
 //!
@@ -84,7 +84,7 @@ impl CtEntry {
     }
 }
 
-/// Immutable decision context. `'a` borrows the held-tuple slice so the
+/// Immutable decision context. `'a` borrows the owned-tuple slice so the
 /// runtime can hand a live slot list per scan (the engine owns the slab;
 /// the Kani harnesses use `'static` const arrays).
 #[derive(Clone, Copy, Debug)]
@@ -101,8 +101,8 @@ pub struct ObsCtx<'a> {
     /// hub-LAN NAT address — only flows egressing the VM line (AFTR) have
     /// a CGNAT mapping to refresh.
     pub vm_nat: Ipv4Addr,
-    /// Inner tuples already held by static/lease slots (I1).
-    pub held: &'a [(Ipv4Addr, u16)],
+    /// Inner tuples already owned by static/lease slots (I1).
+    pub owned: &'a [(Ipv4Addr, u16)],
     /// per-flow refresh budget
     pub max_refresh_attempts: u32,
     /// number of refreshes so far for the candidate flow
@@ -130,8 +130,8 @@ impl<'a> ObsCtx<'a> {
             || (v & 0xff00_0000) == 0x7f00_0000
     }
 
-    pub fn is_held(&self, tuple: (Ipv4Addr, u16)) -> bool {
-        self.held.iter().any(|h| *h == tuple)
+    pub fn is_owned(&self, tuple: (Ipv4Addr, u16)) -> bool {
+        self.owned.iter().any(|h| *h == tuple)
     }
 }
 
@@ -157,7 +157,7 @@ pub fn should_refresh(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
         return false;
     }
     // I1: never capture a tuple a static/lease slot holds.
-    if ctx.is_held(e.nat_src()) {
+    if ctx.is_owned(e.nat_src()) {
         return false;
     }
     if ctx.refresh_attempts_so_far >= ctx.max_refresh_attempts {
@@ -281,7 +281,7 @@ pub fn brlan_ctx() -> ObsCtx<'static> {
     ObsCtx {
         brlan: (Ipv4Addr::new(192, 168, 21, 0), 24),
         vm_nat: Ipv4Addr::new(192, 168, 0, 21),
-        held: &[],
+        owned: &[],
         max_refresh_attempts: 8,
         allowed: &[],
         refresh_attempts_so_far: 0,
@@ -392,13 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn held_tuple_never_refreshed() {
+    fn owned_tuple_never_refreshed() {
         // I1: a lease/static slot already holds (192.168.0.21, 54322)
         let line = replied_line();
         let e = parse_line(&line).unwrap();
         let mut ctx = brlan_ctx();
-        const HELD: [(Ipv4Addr, u16); 1] = [(Ipv4Addr::new(192, 168, 0, 21), 54322)];
-        ctx.held = &HELD;
+        const OWNED: [(Ipv4Addr, u16); 1] = [(Ipv4Addr::new(192, 168, 0, 21), 54322)];
+        ctx.owned = &OWNED;
         assert!(!should_refresh(&e, &ctx));
     }
 
@@ -481,7 +481,7 @@ mod verify {
 
     const BR: (Ipv4Addr, u8) = (Ipv4Addr::new(192, 168, 21, 0), 24);
     const NAT: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 21);
-    const HELD: [(Ipv4Addr, u16); 0] = [];
+    const OWNED: [(Ipv4Addr, u16); 0] = [];
 
     #[kani::proof]
     fn predicate_requires_udp() {
@@ -489,7 +489,7 @@ mod verify {
         let ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
-            held: &HELD,
+            owned: &OWNED,
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -506,7 +506,7 @@ mod verify {
         let ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
-            held: &HELD,
+            owned: &OWNED,
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -521,7 +521,7 @@ mod verify {
         let ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
-            held: &HELD,
+            owned: &OWNED,
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -537,7 +537,7 @@ mod verify {
         let mut ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
-            held: &HELD,
+            owned: &OWNED,
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -548,17 +548,17 @@ mod verify {
     #[kani::proof]
     fn held_never_refreshed() {
         let e = any_entry();
-        const HELD1: [(Ipv4Addr, u16); 1] = [(NAT, 54322)];
+        const OWNED1: [(Ipv4Addr, u16); 1] = [(NAT, 54322)];
         let ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
-            held: &HELD1,
+            held: &OWNED1,
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
         let tuple = e.nat_src();
         if tuple == (NAT, 54322) {
-            assert!(!should_refresh(&e, &ctx), "I1: held tuple never refreshed");
+            assert!(!should_refresh(&e, &ctx), "I1: owned tuple never refreshed");
         }
     }
 }

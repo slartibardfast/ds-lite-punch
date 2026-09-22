@@ -60,10 +60,10 @@ pub const DEFAULT_GRACE_TICKS: u32 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitReason {
     /// A static/lease slot claims the inner tuple (I1).
-    HeldBySlot,
+    OwnedBySlot,
     /// Entry gone from the CDC and no inbound within grace — flow dead.
     Stale,
-    /// The device itself stopped answering on the LAN (call/0029): a hold
+    /// The device itself stopped answering on the LAN (call/0029): a keepalive
     /// for a device that is off or asleep releases nothing anyone uses.
     DeviceGone,
 }
@@ -71,11 +71,11 @@ pub enum ExitReason {
 /// I1 + G2 budget gate before claiming a candidate. Pure; Kani-proven.
 pub fn claim_allowed(
     bind: (Ipv4Addr, u16),
-    held: &[(Ipv4Addr, u16)],
+    owned: &[(Ipv4Addr, u16)],
     active: usize,
     max_refresh_attempts: u32,
 ) -> bool {
-    !held.contains(&bind) && (active as u64) < (max_refresh_attempts as u64)
+    !owned.contains(&bind) && (active as u64) < (max_refresh_attempts as u64)
 }
 
 /// G5 exit decision. Pure; Kani-proven (the exit state machine).
@@ -83,10 +83,10 @@ pub fn exit_due(
     missing_ticks: u32,
     grace_ticks: u32,
     ticks_since_inbound: u32,
-    held_now: bool,
+    owned_now: bool,
 ) -> Option<ExitReason> {
-    if held_now {
-        return Some(ExitReason::HeldBySlot);
+    if owned_now {
+        return Some(ExitReason::OwnedBySlot);
     }
     if missing_ticks >= grace_ticks && ticks_since_inbound >= grace_ticks {
         return Some(ExitReason::Stale);
@@ -170,7 +170,7 @@ struct ObsSlot {
 
 pub struct ObservationEngine {
     cdc: Box<dyn Cdc>,
-    held: Vec<(Ipv4Addr, u16)>,
+    owned: Vec<(Ipv4Addr, u16)>,
     max_refresh_attempts: u32,
     grace_ticks: u32,
     servers: Vec<SocketAddrV4>,
@@ -184,7 +184,7 @@ pub struct ObservationEngine {
     pub allow: Vec<Ipv4Addr>,
     /// Whether the arm holds (claims, keeps alive, promotes) or only reports.
     /// The log-only stage is how the allowlist is read against the AFTR's
-    /// real behaviour before a device is held.
+    /// real behaviour before a device's mapping is kept alive.
     pub hold: bool,
     /// Tuples already reported in log-only mode, so the line appears once per
     /// flow rather than once per tick.
@@ -202,7 +202,7 @@ pub struct ObservationEngine {
     probe_cursor: usize,
     /// The per-device hold cap.
     per_host: u32,
-    /// Candidates not yet held, with the device's last packet count and how
+    /// Candidates not yet kept alive, with the device's last packet count and how
     /// many ticks it has been quiet. A flow is claimed when it has been quiet
     /// long enough to need us, which is what keeps a device's capacity for
     /// the mappings that matter.
@@ -213,7 +213,7 @@ impl ObservationEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cdc: Box<dyn Cdc>,
-        held: Vec<(Ipv4Addr, u16)>,
+        owned: Vec<(Ipv4Addr, u16)>,
         max_refresh_attempts: u32,
         grace_ticks: u32,
         servers: Vec<SocketAddrV4>,
@@ -222,7 +222,7 @@ impl ObservationEngine {
     ) -> Self {
         ObservationEngine {
             cdc,
-            held,
+            owned,
             max_refresh_attempts,
             grace_ticks,
             servers,
@@ -256,18 +256,18 @@ impl ObservationEngine {
 
     /// The tuples an allocation holds right now: the static snapshot plus
     /// whatever the lease table has granted since (call/0027 R1).
-    async fn held_now(&self) -> Vec<(Ipv4Addr, u16)> {
-        let mut held = self.held.clone();
+    async fn owned_now(&self) -> Vec<(Ipv4Addr, u16)> {
+        let mut owned = self.owned.clone();
         if let Some(t) = &self.alloc {
             for s in t.lock().await.slots() {
-                held.push((self.bind_ip, s.bind_port));
+                owned.push((self.bind_ip, s.bind_port));
             }
         }
-        held
+        owned
     }
 
     async fn tick(&mut self) {
-        let held = self.held_now().await;
+        let owned = self.owned_now().await;
         let live: Vec<crate::cdc::Candidate> = self.cdc.tick();
 
         // The admission (call/0025): a configured allowlist narrows this arm
@@ -278,7 +278,7 @@ impl ObservationEngine {
             live
         } else {
             live.into_iter()
-                .filter(|c| crate::hold::allowed(&self.allow, c.host))
+                .filter(|c| crate::keepalive::allowed(&self.allow, c.host))
                 .collect()
         };
         if !self.hold {
@@ -333,7 +333,7 @@ impl ObservationEngine {
                 .get(&c.bind_tuple)
                 .copied()
                 .unwrap_or((c.host_port as u64, 0));
-            if quiet < HOLD_AFTER_TICKS {
+            if quiet < KEEPALIVE_AFTER_TICKS {
                 // the device is still refreshing this flow: it needs nothing
                 continue;
             }
@@ -341,12 +341,12 @@ impl ObservationEngine {
                 // one device's churn cannot spend another device's capacity
                 continue;
             }
-            if !claim_allowed(c.bind_tuple, &held, self.slots.len(), self.max_refresh_attempts) {
+            if !claim_allowed(c.bind_tuple, &owned, self.slots.len(), self.max_refresh_attempts) {
                 // R5: a tuple a slot holds is refused rather than captured,
                 // and the refusal is reported. A device's flow on a slot's
                 // tuple is the late collision (call/0028), and the log is
                 // where it becomes visible; the device keeps the inbound.
-                if held.contains(&c.bind_tuple) && self.reported.insert(c.bind_tuple) {
+                if owned.contains(&c.bind_tuple) && self.reported.insert(c.bind_tuple) {
                     self.publisher.log_transition(
                         "collision-reported",
                         &format!(
@@ -433,7 +433,7 @@ impl ObservationEngine {
             });
         }
 
-        // Liveness pass: what keeps a hold alive is the device or a peer,
+        // Liveness pass: what keeps a keepalive alive is the device or a peer,
         // never our own writes. The device's own packet count comes from the
         // connection table (our egress appears there with the NAT address as
         // its origin, so it cannot be mistaken for the device's), and a peer
@@ -513,13 +513,13 @@ impl ObservationEngine {
                     s.stop.clone(),
                 )
             };
-            let held_now = held.contains(&t);
+            let owned_now = owned.contains(&t);
             let (quiet, misses) = {
                 let s = &self.slots[i];
                 (s.quiet_ticks, s.dev_misses)
             };
             let reason = release_reason(
-                held_now,
+                owned_now,
                 misses,
                 quiet,
                 missing,
@@ -564,35 +564,35 @@ fn observe_report(
 /// A candidate is claimed only once its device has been quiet this long: a
 /// flow the device is refreshing needs nothing from us, and claiming it would
 /// spend the device's own capacity on churn (call/0029). Five to ten seconds
-/// is well inside the uplink's measured reaping window, so the hold starts
+/// is well inside the uplink's measured reaping window, so the keepalive starts
 /// before the mapping can lapse.
-const HOLD_AFTER_TICKS: u32 = 3;
+const KEEPALIVE_AFTER_TICKS: u32 = 3;
 /// A hold is released when both sides have left it alone this long. Generous
-/// on purpose: a lobby is silence, and silence is what the hold is for, so
+/// on purpose: a lobby is silence, and silence is what the keepalive is for, so
 /// this is a backstop behind the device-presence probe rather than a
 /// liveness rule.
 const LONG_QUIET_TICKS: u32 = 150;
-/// Consecutive failed LAN probes before a hold is released as abandoned.
+/// Consecutive failed LAN probes before a keepalive is released as abandoned.
 const DEV_MISSES_TO_RELEASE: u8 = 3;
 /// Probe one slot's device every this many ticks, so the tick never blocks
 /// on more than one probe.
 const PROBE_EVERY_TICKS: u64 = 3;
 
-/// The one place a hold's end is decided. A hold yields to a slot, ends when
+/// The one place a keepalive's end is decided. A keepalive yields to a slot, ends when
 /// its device stops answering on the LAN, and otherwise ends only when both
 /// sides have left the tuple alone for the long window: going quiet is what a
 /// hold is for, so quiet is never by itself a reason to release one
 /// (call/0029). Pure, so the policy is testable without a clock.
 fn release_reason(
-    held_now: bool,
+    owned_now: bool,
     misses: u8,
     quiet: u32,
     missing: u32,
     since_inbound: u32,
     long_quiet: u32,
 ) -> Option<ExitReason> {
-    if held_now {
-        return Some(ExitReason::HeldBySlot);
+    if owned_now {
+        return Some(ExitReason::OwnedBySlot);
     }
     if misses >= DEV_MISSES_TO_RELEASE {
         return Some(ExitReason::DeviceGone);
@@ -621,7 +621,7 @@ fn device_packets(proc_text: &str, bind: (Ipv4Addr, u16), host: Ipv4Addr) -> u64
 }
 
 /// Per-device budget: one device's churn must not spend another's capacity.
-/// Pure; the caller passes the holds grouped by host.
+/// Pure; the caller passes the keepalives grouped by host.
 fn host_budget_ok(host: Ipv4Addr, slots: &[ObsSlot], per_host: u32) -> bool {
     let mine = slots.iter().filter(|s| s.host == host).count() as u64;
     mine < per_host as u64
@@ -751,7 +751,7 @@ mod tests {
         fn unaccept(&self, _r: u16) {}
     }
 
-    /// Tick until a candidate has been quiet long enough to be held: the arm
+    /// Tick until a candidate has been quiet long enough to keep alive: the arm
     /// holds what a device has stopped refreshing, so a fresh flow needs a
     /// few ticks before it is old enough, and a flow the device keeps
     /// refreshing is never claimed at all.
@@ -770,10 +770,10 @@ mod tests {
         }
     }
 
-    fn engine(cdc: Box<dyn Cdc>, held: Vec<(Ipv4Addr, u16)>, max: u32, grace: u32) -> ObservationEngine {
+    fn engine(cdc: Box<dyn Cdc>, owned: Vec<(Ipv4Addr, u16)>, max: u32, grace: u32) -> ObservationEngine {
         ObservationEngine::new(
             cdc,
-            held,
+            owned,
             max,
             grace,
             Vec::new(),
@@ -793,9 +793,9 @@ mod tests {
         // the test's runtime, and cargo runs tests in parallel
         let c = cand((LO, 54322), HOST, 54322);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), Vec::new(), 8, 3);
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1);
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await; // same candidate again: no duplicate claim
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await; // same candidate again: no duplicate claim
         assert_eq!(e.slots.len(), 1);
         assert_eq!(e.slots[0].missing_ticks, 0);
     }
@@ -805,7 +805,7 @@ mod tests {
         let c1 = cand((LO, 54324), HOST, 54324);
         let c2 = cand((LO, 54325), HOST, 54325);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c1, c2] }), Vec::new(), 1, 3);
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "budget 1 blocks the second claim");
     }
 
@@ -813,15 +813,15 @@ mod tests {
     async fn held_candidate_not_claimed() {
         let c = cand((LO, 54326), HOST, 54326);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), vec![(LO, 54326)], 8, 3);
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
-        assert!(e.slots.is_empty(), "I1: held tuple never claimed");
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
+        assert!(e.slots.is_empty(), "I1: owned tuple never claimed");
     }
 
     #[tokio::test]
     async fn a_quiet_hold_is_kept_not_released() {
         // The rule this milestone changed: an entry gone from the change data
         // capture with no inbound is what a lobby looks like, and it is the
-        // state a hold exists to survive. The old rule released on exactly
+        // state a keepalive exists to survive. The old rule released on exactly
         // those two counters.
         let h = HOST;
         let mut e = engine(
@@ -830,7 +830,7 @@ mod tests {
             8,
             3,
         );
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "the flow is held");
         {
             let s = &mut e.slots[0];
@@ -840,10 +840,10 @@ mod tests {
             s.dev_misses = 0;
         }
         e.tick().await;
-        assert_eq!(e.slots.len(), 1, "quiet is what the hold is for");
+        assert_eq!(e.slots.len(), 1, "quiet is what the keepalive is for");
     }
 
-    // ---- the allowlist and the hold (call/0025, plan/0009 #snoop) ----
+    // ---- the allowlist and the keepalive (call/0025, plan/0009 #snoop) ----
 
     #[tokio::test]
     async fn a_device_outside_the_allowlist_is_never_claimed() {
@@ -860,7 +860,7 @@ mod tests {
         }), Vec::new(), 8, 3);
         e.allow = vec![named];
         e.hold = true;
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "only the named device's flow is held");
         assert_eq!(e.slots[0].host, named);
     }
@@ -876,7 +876,7 @@ mod tests {
         }), Vec::new(), 8, 3);
         e.allow = vec![named];
         e.hold = false;
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "log-only: nothing claimed");
         assert!(e.reported.contains(&(LO, 54342)), "but it is reported");
         // a device outside the list is not even reported
@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn a_quiet_hold_is_kept_and_a_gone_device_is_not() {
-        // Quiet is what a hold is for: neither the device nor a peer touching
+        // Quiet is what a keepalive is for: neither the device nor a peer touching
         // the tuple is the normal case for a lobby, and it must not end the
         // hold. Only the device's disappearance, a slot's claim, or the long
         // backstop does.
@@ -921,7 +921,7 @@ mod tests {
         );
         assert_eq!(
             release_reason(true, 0, 9, 9, 9, long),
-            Some(ExitReason::HeldBySlot),
+            Some(ExitReason::OwnedBySlot),
             "a slot's claim takes the tuple"
         );
         assert_eq!(
@@ -945,7 +945,7 @@ mod tests {
             3,
         );
         e.per_host = 1;
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "a lone flow from a named device is held");
         // a second flow from the same device is refused by that device's own
         // cap, which is the point: the churn cannot spend another's capacity
@@ -958,7 +958,7 @@ mod tests {
             3,
         );
         e2.per_host = 1;
-        age(&mut e2, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e2, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e2.slots.len(), 1, "one device's churn spends its own budget");
         // another device still has its own capacity
         let mut e3 = engine(
@@ -970,7 +970,7 @@ mod tests {
             3,
         );
         e3.per_host = 1;
-        age(&mut e3, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e3, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e3.slots.len(), 2, "each device has its own capacity");
     }
 
@@ -1015,18 +1015,18 @@ mod tests {
         );
         e.alloc = Some(Arc::new(Mutex::new(t)));
         e.bind_ip = LO;
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "an allocation's tuple is not this arm's");
     }
 
     #[tokio::test]
-    async fn slot_claimed_by_holder_exits() {
+    async fn slot_claimed_by_connection_exits() {
         let c = cand((LO, 54328), HOST, 54328);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), Vec::new(), 8, 3);
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1);
-        e.held.push((LO, 54328)); // a static/lease slot claims the tuple
-        age(&mut e, HOLD_AFTER_TICKS as usize + 1).await;
+        e.owned.push((LO, 54328)); // a static/lease slot claims the tuple
+        age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert!(e.slots.is_empty(), "I1: engine exits once a slot holds the tuple");
     }
 }
@@ -1044,11 +1044,11 @@ mod verify {
         let bind = (any_ip(), kani::any::<u16>());
         let h0 = (any_ip(), kani::any::<u16>());
         let h1 = (any_ip(), kani::any::<u16>());
-        let held = [h0, h1];
+        let owned = [h0, h1];
         let active: usize = kani::any();
         let max: u32 = kani::any();
-        if claim_allowed(bind, &held, active, max) {
-            assert!(!held.contains(&bind), "claim never takes a held tuple");
+        if claim_allowed(bind, &owned, active, max) {
+            assert!(!owned.contains(&bind), "claim never takes an owned tuple");
             assert!((active as u64) < (max as u64), "claim never exceeds budget");
         }
     }
@@ -1058,15 +1058,15 @@ mod verify {
         let missing: u32 = kani::any();
         let grace: u32 = kani::any();
         let idle: u32 = kani::any();
-        let held_now: bool = kani::any();
-        match exit_due(missing, grace, idle, held_now) {
-            Some(ExitReason::HeldBySlot) => assert!(held_now),
+        let owned_now: bool = kani::any();
+        match exit_due(missing, grace, idle, owned_now) {
+            Some(ExitReason::OwnedBySlot) => assert!(owned_now),
             Some(ExitReason::Stale) => {
-                assert!(!held_now);
+                assert!(!owned_now);
                 assert!(missing >= grace, "stale requires the entry gone past grace");
                 assert!(idle >= grace, "stale requires inbound silence past grace");
             }
-            None => assert!(!held_now && (missing < grace || idle < grace)),
+            None => assert!(!owned_now && (missing < grace || idle < grace)),
         }
     }
 }

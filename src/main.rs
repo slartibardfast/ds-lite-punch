@@ -11,7 +11,7 @@ mod ct;
 mod dp;
 mod engine;
 mod forward;
-mod hold;
+mod keepalive;
 mod mapping;
 mod nft;
 mod obs;
@@ -81,10 +81,10 @@ struct Config {
     observation: bool,
     max_refresh_attempts: u32,
     cdc: CdcKind,
-    /// The allowlist (call/0025): the devices the hold acts for. Empty means
+    /// The allowlist (call/0025): the devices the keepalive acts for. Empty means
     /// nobody, and the observation arm keeps the admission it already had.
     allow: Vec<Ipv4Addr>,
-    /// Whether the hold actually holds: with an allowlist and no `--hold`,
+    /// Whether the keepalive actually holds: with an allowlist and no `--keepalive`,
     /// the arm only reports what it would act on (plan/0009 stage 1).
     hold: bool,
     /// The PCP and NAT-PMP listener on the shared port (call/0025's fourth
@@ -228,7 +228,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 let allow_path = v()?;
                 let text = std::fs::read_to_string(&allow_path)
                     .map_err(|e| format!("--allowlist {}: {}", allow_path, e))?;
-                let (list, bad) = hold::parse(&text);
+                let (list, bad) = keepalive::parse(&text);
                 if !bad.is_empty() {
                     return Err(format!(
                         "--allowlist {}: not an address: {}",
@@ -239,7 +239,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 allow = list;
                 i += 2
             }
-            "--hold" => {
+            "--keepalive" => {
                 hold = true;
                 i += 1
             }
@@ -433,7 +433,7 @@ fn add_stun_routes(servers: &[SocketAddrV4], gateway: &str) {
 }
 
 /// Dedicated table for the relay's tuple-sourced egress (RCA 2026-09-13:
-/// the accepted TCP connections' replies and the fold-holder's outbound
+/// the accepted TCP connections' replies and the TCP connection's outbound
 /// follow the kernel's output lookup, whose main-table default is the
 /// vdsl4 PPPoE, never the eth1 line the AFTR mapping lives on; the AFTR
 /// can translate a return path only on that line).
@@ -788,8 +788,8 @@ async fn main() {
         }
         if s.proto == slot::Proto::Tcp {
             // TCP slot datapath (call/0017): listener on the pin tuple
-            // with a STUN-over-TCP holder at the C3-sized cadence. The
-            // holder publishes the slot's external TCP tuple per-R.
+            // with a STUN-over-TCP connection at the C3-sized cadence. The
+            // connection publishes the slot's external TCP tuple per-R.
             let listener = match tcpslot::bind_pin(s.bind_port).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -806,7 +806,7 @@ async fn main() {
             let vote = Arc::new(Mutex::new(VoteState::new()));
             let bind_port = s.bind_port;
             tokio::spawn(tcpslot::run_tcp_slot(listener, target));
-            tokio::spawn(tcpslot::run_holder(
+            tokio::spawn(tcpslot::run_connection(
                 bind_ip, bind_port, servers, vote, publisher,
             ));
             continue;
@@ -886,7 +886,7 @@ async fn main() {
         None
     };
 
-    // The hold's local half (call/0025, plan/0009 #allowlist): the conntrack
+    // The keepalive's local half (call/0025, plan/0009 #allowlist): the conntrack
     // timeout policy for the named devices. It is installed only when the
     // hold is on — the log-only stage touches nothing — and its presence is
     // read back, because the evidence that matters is the live table's, not
@@ -918,12 +918,12 @@ async fn main() {
         // I1: inner tuples static/lease slots own — the engine never
         // captures one. (Today the table holds statics only; facade-added
         // leases extend this list in D/E.)
-        let held: Vec<(Ipv4Addr, u16)> = slots_snapshot
+        let owned: Vec<(Ipv4Addr, u16)> = slots_snapshot
             .iter()
             .map(|s| (bind_ip, s.bind_port))
             .collect();
         let cdc: Box<dyn cdc::Cdc> = match cfg.cdc {
-            cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(held.clone(), cfg.max_refresh_attempts, cfg.allow.clone())),
+            cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(owned.clone(), cfg.max_refresh_attempts, cfg.allow.clone())),
             cdc::CdcKind::Nft => {
                 // The mirror is part of the daemon's ruleset but only when
                 // the observation engine is enabled — the production daemon
@@ -932,7 +932,7 @@ async fn main() {
                     emiteln!("fatal: nft flow_obs mirror install failed: {}", e);
                     std::process::exit(1);
                 }
-                Box::new(cdc::NftCdc::new(held.clone(), cfg.max_refresh_attempts, cfg.allow.clone()))
+                Box::new(cdc::NftCdc::new(owned.clone(), cfg.max_refresh_attempts, cfg.allow.clone()))
             }
             cdc::CdcKind::Aya => {
                 emiteln!("fatal: --cdc aya is not built yet");
@@ -942,7 +942,7 @@ async fn main() {
         let servers = state.lock().await.servers.clone();
         let mut engine = engine::ObservationEngine::new(
             cdc,
-            held,
+            owned,
             cfg.max_refresh_attempts,
             engine::DEFAULT_GRACE_TICKS,
             servers,
@@ -950,7 +950,7 @@ async fn main() {
             Arc::new(engine::NftPins),
         );
         // The admission (call/0025): a named device's flows are held, and
-        // without --hold they are only reported.
+        // without --keepalive they are only reported.
         engine.allow = cfg.allow.clone();
         engine.hold = cfg.hold;
         // The allocation side of the collision rule (call/0027 R1): the arm
@@ -1274,7 +1274,7 @@ mod tests {
         }
     }
 
-    /// The hold's flags (call/0025, plan/0009 #allowlist): the allowlist is
+    /// The keepalive's flags (call/0025, plan/0009 #allowlist): the allowlist is
     /// read and validated at parse time, and the two switches default off.
     #[test]
     fn the_allowlist_is_parsed_and_named() {
@@ -1286,7 +1286,7 @@ mod tests {
         let c = parse_args_from(argv(&[
             "--static-map", "40000=192.168.0.21:40001",
             "--allowlist", good.to_str().unwrap(),
-            "--hold",
+            "--keepalive",
             "--pcp",
             "--pcp-peer",
         ]))

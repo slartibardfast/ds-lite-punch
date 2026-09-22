@@ -1250,7 +1250,7 @@ mod verify {
     #[kani::unwind(8)] // max_slots assumed <= 7 below
     fn upsert_unique_key_never_duplicates() {
         // I1 core: same (proto, int_port, client) key never yields a second
-        // holder. Symbolic in the key dimensions; time/life concrete (the
+        // connection. Symbolic in the key dimensions; time/life concrete (the
         // property does not depend on them and symbolic u64 inflated the
         // Vec-push state space).
         let mut t = LeaseTable::new(alloc_ok(), 7, 4);

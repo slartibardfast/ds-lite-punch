@@ -57,7 +57,7 @@ fn cli(version: &str) -> Command {
              ds-lite-punch --bind ip:port --target ip:port [OPTIONS]",
         )
         .about(
-            "CGNAT-aware UDP relay for a ds-lite line: hold the carrier's mapping \
+            "CGNAT-aware UDP relay for a ds-lite line: keep the carrier's mapping alive \
              and forward inbound traffic to a br-lan target.",
         )
         .long_about(
@@ -125,9 +125,9 @@ fn cli(version: &str) -> Command {
             Arg::new("gateway")
                 .long("gateway")
                 .value_name("IP")
-                .help("Next hop used to route STUN out the line that holds the mapping.")
+                .help("Next hop used to route STUN out the line the mapping is on.")
                 .long_help(
-                    "Next hop used to route STUN out the line that holds the mapping. Without \
+                    "Next hop used to route STUN out the line the mapping is on. Without \
                      it the default route wins and STUN reports the wrong nat. Default \
                      192.168.0.1.",
                 ),
@@ -165,8 +165,8 @@ fn cli(version: &str) -> Command {
             Arg::new("max-maps-per-client")
                 .long("max-maps-per-client")
                 .value_name("N")
-                .help("Maximum mappings one client may hold.")
-                .long_help("Maximum mappings one client may hold at a time. Default 16."),
+                .help("Maximum mappings per client.")
+                .long_help("Maximum mappings per client. Default 16."),
         )
         .arg(
             Arg::new("gc-grace-factor")
@@ -182,10 +182,10 @@ fn cli(version: &str) -> Command {
             Arg::new("max-refresh-attempts")
                 .long("max-refresh-attempts")
                 .value_name("N")
-                .help("The hold's budget: refresh attempts for one flow, and flows held at once.")
+                .help("The keepalive's budget: refresh attempts for one flow, and flows kept alive at once.")
                 .long_help(
-                    "The hold's budget. It bounds the refresh attempts for one flow whose \
-                     conntrack entry has gone, and the number of flows the hold keeps at once. \
+                    "The keepalive's budget. It bounds the refresh attempts for one flow whose \
+                     conntrack entry has gone, and the number of flows kept alive at once. \
                      Default 8.",
                 ),
         )
@@ -193,32 +193,32 @@ fn cli(version: &str) -> Command {
             Arg::new("observation")
                 .long("observation")
                 .action(ArgAction::SetTrue)
-                .help("Report what the hold would act on, and change nothing.")
+                .help("Report what the keepalive would act on, and change nothing.")
                 .long_help(
                     "Report the named devices' live flows and touch nothing. This is the \
-                     stage a new device is admitted from, before --hold arms the arm.",
+                     stage a new device is admitted from, before --keepalive arms the arm.",
                 ),
         )
         .arg(
             Arg::new("allowlist")
                 .long("allowlist")
                 .value_name("PATH")
-                .help("File of IPv4 addresses, one per line, naming the devices the hold acts for.")
+                .help("File of IPv4 addresses, one per line, naming the devices the keepalive acts for.")
                 .long_help(
                     "File of IPv4 addresses, one per line, with # for comments. These are the \
-                     devices the hold acts for. The list is a budget as well as an admission: \
-                     a held flow costs about half a packet a second at the default cadence. \
+                     devices the keepalive acts for. The list is a budget as well as an admission: \
+                     a flow kept alive costs about half a packet a second at the default cadence. \
                      The path is read at startup, so a typo fails the start.",
                 ),
         )
         .arg(
-            Arg::new("hold")
-                .long("hold")
+            Arg::new("keepalive")
+                .long("keepalive")
                 .action(ArgAction::SetTrue)
-                .help("Hold the named devices' flows instead of only reporting them.")
+                .help("Keep the named devices' mappings alive instead of only reporting them.")
                 .long_help(
-                    "Hold the named devices' flows: the RFC conntrack lifetimes, plus the \
-                     daemon's own writes to keep them alive. Without this flag the allowlist \
+                    "Keep the named devices' mappings alive: the RFC conntrack lifetimes, plus the \
+                     daemon's own writes on the device's behalf. Without this flag the allowlist \
                      is reported on and nothing is touched.",
                 ),
         )

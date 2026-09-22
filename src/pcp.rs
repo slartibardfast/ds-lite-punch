@@ -429,7 +429,7 @@ pub fn error_lifetime(code: u8) -> u32 {
     }
 }
 
-/// The lifetime a grant answers with, bounded by what the hold can maintain.
+/// The lifetime a grant answers with, bounded by what the keepalive can maintain.
 /// A zero request is the delete form and stays zero.
 pub fn lifetime_cap(requested: u32, cap: u32) -> u32 {
     if requested == 0 {
@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn a_granted_lifetime_is_bounded_by_its_dialect() {
-        // PCP: the hold's ceiling. NAT-PMP: the figure its own spec
+        // PCP: the keepalive's ceiling. NAT-PMP: the figure its own spec
         // recommends, which is what a legacy client expects to read back.
         assert_eq!(lifetime_cap(0, MAX_LIFETIME), 0, "a zero request is a delete");
         assert_eq!(lifetime_cap(120, MAX_LIFETIME), 120);

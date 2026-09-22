@@ -87,13 +87,13 @@ pub fn run_script(script: &str) -> io::Result<()> {
 /// re-added, so the address list in force is exactly the allowlist's: a
 /// startup that changes the list changes the rules, and a failure leaves no
 /// policy at all, which is the safe direction (every flow keeps the router's
-/// own timeouts and the WAN half of the hold is the daemon's own writes).
+/// own timeouts and the WAN half of the keepalive is the daemon's own writes).
 pub fn apply_hold(list: &[Ipv4Addr]) -> io::Result<()> {
     remove_hold();
     if list.is_empty() {
         return Ok(());
     }
-    run_script(&crate::hold::ruleset(list))
+    run_script(&crate::keepalive::ruleset(list))
 }
 
 /// Remove the policy: the selection chain first, then the two objects.
@@ -101,7 +101,7 @@ pub fn apply_hold(list: &[Ipv4Addr]) -> io::Result<()> {
 /// stop path deletes `table ip dslp` wholesale), so a failure here leaves
 /// nothing that outlives the daemon.
 pub fn remove_hold() {
-    let _ = run_script(&crate::hold::teardown());
+    let _ = run_script(&crate::keepalive::teardown());
 }
 
 /// Whether the policy is in the live table, for the startup log: the parse
@@ -114,7 +114,7 @@ pub fn hold_in_force() -> bool {
     else {
         return false;
     };
-    crate::hold::present(&String::from_utf8_lossy(&out.stdout))
+    crate::keepalive::present(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// The daemon's accept sets, inside fw4's table: a slot's inbound accept is an
@@ -354,7 +354,7 @@ pub fn revoke_statements(bind_port: u16, tcp: bool) -> Vec<String> {
 ///
 /// It removes no pin. The facade installs none, so a pin delete could only
 /// fail and print nft's own error into the log; the paths that do pin — the
-/// arm's self-pin and the TCP holder — remove their own with `del_pin`. This
+/// arm's self-pin and the TCP connection — remove their own with `del_pin`. This
 /// was the last of the log's error lines, measured on the router on
 /// 2026-09-20: three of them at 21:58, one per expired lease.
 pub fn revoke_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
@@ -741,7 +741,7 @@ pub fn add_pin(client: Ipv4Addr, client_port: u16, r: u16) -> io::Result<()> {
             // EEXIST: the kernel keeps nft state across a daemon crash, and
             // this map is the daemon's own, so a stale element for this key
             // is our own mess from a previous run rather than a competing
-            // holder. A key maps to one value, and a stale value is worse
+            // connection. A key maps to one value, and a stale value is worse
             // than any split this used to refuse: it mis-translates the
             // device's traffic to a port the device is not using, which is a
             // console losing its mapping while nothing looks wrong. The

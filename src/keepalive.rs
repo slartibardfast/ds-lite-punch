@@ -1,7 +1,7 @@
 //! The allowlist admission (call/0025, plan/0009 #allowlist): which devices
-//! get the hold, and the local ruleset that grants it.
+//! get the keepalive, and the local ruleset that grants it.
 //!
-//! Two halves make the hold, and neither is sufficient. Locally, the router's
+//! Two halves make the keepalive, and neither is sufficient. Locally, the router's
 //! own conntrack entry for a quiet device's flow is what the router's NAT
 //! needs in order to translate inbound for that device, and it is reaped at
 //! `nf_conntrack_udp_timeout` (60 s one-way) today. Remotely, only a datagram
@@ -15,7 +15,7 @@
 //!
 //! The policy lives in the daemon's own datapath table (`ip dslp`), beside the
 //! named map and the CDC mirror, for one reason: the allowlist drives both
-//! halves of the hold, so the process that owns the arm owns the policy, and
+//! halves of the keepalive, so the process that owns the arm owns the policy, and
 //! there is no file, table or list that can drift from the daemon's own view
 //! of who is admitted. fw4's generator carries no `flush ruleset`, so a
 //! firewall reload regenerates fw4's own tables and leaves this one alone --
@@ -79,7 +79,7 @@ pub fn parse(text: &str) -> (Vec<Ipv4Addr>, Vec<String>) {
     (list, bad)
 }
 
-/// Whether `ip` is admitted for the hold. Pure membership: the entry carries
+/// Whether `ip` is admitted for the keepalive. Pure membership: the entry carries
 /// no role, so this answer is only ever "maintain this flow", never "trust".
 pub fn allowed(list: &[Ipv4Addr], ip: Ipv4Addr) -> bool {
     list.contains(&ip)

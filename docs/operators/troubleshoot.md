@@ -134,14 +134,14 @@ logread | grep ds-lite-punch | grep upnp
 
 PCP and NAT-PMP are off by default, and they answer only when `PCP=1` is set.
 
-## The hold does not hold
+## The keepalive does not hold
 
 ```sh
 logread | grep ds-lite-punch | grep -E "hold|observe"
 ```
 
 - A device is held only when it is named in the file `ALLOWLIST` points at.
-- `HOLD=1` is what makes the arm hold. With `HOLD=0` the arm reports the named
+- `KEEPALIVE=1` is what makes the arm hold. With `KEEPALIVE=0` the arm reports the named
   devices' flows and touches nothing.
 - `OBSERVATION=1` is what turns the reporting arm on.
 

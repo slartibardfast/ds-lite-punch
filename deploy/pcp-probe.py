@@ -141,7 +141,7 @@ def main():
                     help="the lifetime to ask for, in seconds. The server "
                          "caps it; 120 is the RFC's own default and the "
                          "value every earlier run asked for")
-    ap.add_argument("--hold", action="store_true",
+    ap.add_argument("--keepalive", action="store_true",
                     help="after a successful MAP, keep the mapping and stay: "
                          "the client goes silent and this socket is where the "
                          "outside's probes land, so every arrival is printed "
@@ -187,7 +187,7 @@ def main():
         # association when the socket is connected to the wildcard.
         sock.connect(("0.0.0.0", 0))
         sock.settimeout(None)
-        print("HOLDING: the client is silent; the mapping is the daemon's", flush=True)
+        print("KEEPALIVEING: the client is silent; the mapping is the daemon's", flush=True)
         while True:
             data, peer = sock.recvfrom(2048)
             print(f"RX {len(data)} bytes from {peer[0]}:{peer[1]} at {time.time():.3f}",

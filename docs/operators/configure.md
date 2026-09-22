@@ -20,18 +20,18 @@ line needs.
 | `TARGET` | none, required | The local host and port that receives inbound traffic, as `ip:port`. The peer's source address is preserved. |
 | `STUN` | `stun.l.google.com:19302,stun.cloudflare.com:3478` | The servers that read and refresh the mapping, comma-separated. One that falls silent is rotated out. |
 | `INTERVAL` | `2` | Seconds between the STUN writes that keep the mapping alive. The carrier drops an idle UDP mapping in a few seconds, so treat this value as the lifetime of the mapping. Minimum 1. |
-| `GATEWAY` | `192.168.0.1` | The next hop used to route the STUN writes out the line that holds the mapping. Without it the default route wins and STUN reports the wrong address. |
+| `GATEWAY` | `192.168.0.1` | The next hop used to route the STUN writes out the line the mapping is on. Without it the default route wins and STUN reports the wrong address. |
 
 ## The slot engine
 
-A slot is one mapping the daemon holds on behalf of a client or a static entry.
+A slot is one mapping the daemon keeps for a client or a static entry.
 These keys cap the engine.
 
 | Key | Default | What it does |
 |---|---|---|
 | `SLOT_RANGE` | `30000-39999` | The ports the engine allocates from. Keep the range clear of the `BIND` port. |
 | `MAX_SLOTS` | `32` | The maximum number of slots at once. |
-| `MAX_MAPS_PER_CLIENT` | `16` | The maximum mappings one client may hold. |
+| `MAX_MAPS_PER_CLIENT` | `16` | The maximum mappings per client. |
 
 `SLOT_RANGE`, `MAX_SLOTS` and `MAX_MAPS_PER_CLIENT` are read by the service
 script and appear in no shipped environment file. Add them to
@@ -65,25 +65,25 @@ only, and use the same slot engine as the facade.
 Both are off by default, because nothing on a local network asks for PCP unless
 it is told to.
 
-## The hold
+## The keepalive
 
-The hold keeps a named device's flows past the point where the carrier would drop
-them. The daemon writes to each held flow on the local side and the kernel keeps
+The keepalive keeps a named device's mappings past the point where the carrier
+would drop them. The daemon writes to each flow it keeps alive, on the local side and the kernel keeps
 the carrier's own lifetime.
 
 | Key | Default | What it does |
 |---|---|---|
 | `ALLOWLIST` | none | The path of the file that names the devices, one IPv4 address per line, with `#` for comments. |
-| `HOLD` | `0` | `1` holds the named devices' flows. Without it the arm reports them and touches nothing. |
+| `KEEPALIVE` | `0` | `1` keeps the named devices' mappings alive. Without it the arm reports them and touches nothing. |
 | `OBSERVATION` | `0` | `1` turns the observation arm on, which is what reports the named devices' live flows. |
 
-To hold a device, name it in the allowlist and set `HOLD=1` with
-`OBSERVATION=1`. The allowlist is a budget as well as an admission: a held flow
+To keep a device's mapping alive, name it in the allowlist and set `KEEPALIVE=1` with
+`OBSERVATION=1`. The allowlist is a budget as well as an admission: a flow kept alive
 costs about half a packet a second at the default cadence. Start with the devices
 you need, and watch the count.
 
-To add a device safely, name it while `HOLD=0` stays set, read the report, and
-then set `HOLD=1`.
+To add a device safely, name it while `KEEPALIVE=0` stays set, read the report, and
+then set `KEEPALIVE=1`.
 
 ## The carrier watch
 
@@ -114,7 +114,7 @@ line in `/etc/init.d/ds-lite-punch` when you need them:
 | `--upnp-name` | `ds-lite-punch IGD` | The friendly name the facade reports. |
 | `--cdc` | `nft` | How conntrack entries are removed: `proc`, `nft` or `aya`. |
 | `--gc-grace-factor` | `3` | A multiplier on a slot's lifetime before collection. |
-| `--max-refresh-attempts` | `8` | The hold's budget: refresh attempts for one flow whose conntrack entry has gone, and the number of flows the hold keeps at once. |
+| `--max-refresh-attempts` | `8` | The keepalive's budget: refresh attempts for one flow whose conntrack entry has gone, and the number of flows the hold keeps at once. |
 
 ## Several mappings at once
 

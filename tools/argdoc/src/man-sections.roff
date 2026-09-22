@@ -18,7 +18,7 @@ Comma-separated STUN servers. Becomes \fB--stun\fR.
 Seconds between the STUN writes. Becomes \fB--interval\fR.
 .TP
 .B GATEWAY
-Next hop used to route STUN out the line that holds the mapping. Becomes
+Next hop used to route STUN out the line the mapping is on. Becomes
 \fB--gateway\fR.
 .TP
 .B UPNP_PORT
@@ -37,12 +37,12 @@ how the first identity is created. The format is one tab-separated row per
 entry, the same as the store the daemon keeps.
 .TP
 .B ALLOWLIST
-Path of the file naming the devices whose flows get the hold. Becomes
+Path of the file naming the devices whose flows are kept alive. Becomes
 \fB--allowlist\fR.
 .TP
 .B HOLD
-\fB1\fR holds the named devices' flows, and \fB0\fR leaves the arm reporting
-them. Becomes \fB--hold\fR.
+\fB1\fR keeps the named devices' mappings alive, and \fB0\fR leaves the
+arm reporting them. Becomes \fB--keepalive\fR.
 .TP
 .B OBSERVATION
 \fB1\fR turns the observation arm on. Becomes \fB--observation\fR.
@@ -77,7 +77,7 @@ Port range the slot engine allocates from. Default \fB30000-39999\fR. Becomes
 Maximum concurrent slots. Default \fB32\fR. Becomes \fB--max-slots\fR.
 .TP
 .B MAX_MAPS_PER_CLIENT
-Maximum mappings one client may hold. Default \fB16\fR. Becomes
+Maximum mappings per client. Default \fB16\fR. Becomes
 \fB--max-maps-per-client\fR.
 .PP
 The facade's friendly name has no environment key. Set \fB--upnp-name\fR on the
@@ -95,8 +95,8 @@ store, and installs the legacy input rule.
 The daemon.
 .TP
 .B /etc/ds-lite-punch.allow
-The devices whose flows get the hold, one IPv4 address per line, with # for
-comments. It is installed empty, and no device is held until you name one.
+The devices whose flows are kept alive, one IPv4 address per line, with # for
+comments. It is installed empty, and no device's mapping is kept alive until you name one.
 .TP
 .B /etc/ds-lite-punch.acl
 The DeviceProtection seed. It is copied to \fBdp.tsv\fR in the state directory
@@ -104,10 +104,10 @@ at start when no store exists.
 .TP
 .B /run/ds-lite-punch/tuple
 The mapping's learned external address and port, as the carrier reports it.
-Read this file to see what the line currently holds.
+Read this file to see the mapping the line currently has.
 .TP
 .B /run/ds-lite-punch/tuple-R
-The same external tuple for the held slot whose port is R, one file per slot.
+The same external tuple for the slot whose port is R, one file per slot.
 .TP
 .B /run/ds-lite-punch/upnp-ident
 The facade's own identity, the uuid it reports to control points. It is stable
@@ -133,8 +133,8 @@ The configuration the daemon started with: \fBbind\fR, \fBtarget\fR,
 \fBstun_servers\fR and \fBslots\fR.
 .TP
 .B tuple
-The mapping the carrier is holding, learned by STUN: \fBip\fR and \fBport\fR,
-and \fBslot\fR when the mapping belongs to a held slot.
+The mapping the carrier has, learned by STUN: \fBip\fR and \fBport\fR,
+and \fBslot\fR when the mapping belongs to a slot.
 .TP
 .B upnp
 The facade is serving: \fBlan\fR and the device's \fBudn\fR.
@@ -143,13 +143,13 @@ The facade is serving: \fBlan\fR and the device's \fBudn\fR.
 The PCP and NAT-PMP listener is serving: \fBbind\fR and whether PEER is
 answered.
 .TP
-.B hold
-The hold's admission and its state: \fBdevices\fR and whether its ruleset is in
+.B keepalive
+The keepalive's admission and its state: \fBdevices\fR and whether its ruleset is in
 force.
 .TP
 .B observe
-The observation arm's reading: \fBcdc\fR, \fBmax_rescues\fR, \fBallowed\fR and
-\fBhold\fR.
+The observation arm's reading: \fBcdc\fR, \fBmax_refresh_attempts\fR, \fBallowed\fR
+and \fBkeepalive\fR.
 .TP
 .B carrier-watch
 The watch is armed: \fBcounter\fR, \fBinterval\fR, \fBmisses\fR and \fBpoll\fR.
@@ -174,8 +174,8 @@ writes on a two second cadence.
 .PP
 One client holds one mapping on one port.
 .PP
-The hold costs about half a packet a second per held flow at the default
-cadence, written and reimbursed on the local side. Treat the allowlist as a
+The keepalive costs about half a packet a second per flow kept alive, at the
+default cadence, written and reimbursed on the local side. Treat the allowlist as a
 budget as well as an admission.
 .PP
 The daemon's own firewall rules are installed at startup. A reload of the
