@@ -51,6 +51,7 @@ logread | grep ds-lite-punch
 | `keepalive` | `devices`, `ruleset_in_force` | the keepalive's admission and its state |
 | `observe` | `cdc`, `max_refresh_attempts`, `allowed`, `keepalive` | the observation arm's reading |
 | `carrier-watch` | `counter`, `interval`, `misses`, `poll` | the watch is armed |
+| `carrier-watch-reinstalled` | `counter`, `epoch` | the watch's counting rules were missing and are back |
 | `carrier-probe` | `count`, `epoch` | a probe from the helper was counted |
 | `carrier-silent` | `last_probe`, `waited`, `epoch` | the count stopped rising |
 

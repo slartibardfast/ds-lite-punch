@@ -154,6 +154,12 @@ and \fBkeepalive\fR.
 .B carrier-watch
 The watch is armed: \fBcounter\fR, \fBinterval\fR, \fBmisses\fR and \fBpoll\fR.
 .TP
+.B carrier-watch-reinstalled
+The watch's counting rules were missing and have been installed again:
+\fBcounter\fR and \fBepoch\fR. A firewall reload takes the rules with it and
+leaves the counter object in place, so the reading looks unchanged while nothing
+counts. The daemon installs them again on its next poll and says so here.
+.TP
 .B carrier-probe
 A probe from the helper was counted: \fBcount\fR and \fBepoch\fR.
 .TP
@@ -178,10 +184,12 @@ The keepalive costs about half a packet a second per flow kept alive, at the
 default interval, written and reimbursed on the local side. Treat the allowlist as a
 budget as well as an admission.
 .PP
-The daemon's own firewall rules are installed at startup. A reload of the
-router's firewall rebuilds that firewall's tables, and the daemon's rules
-inside them go with the rebuild. Restart the service after a firewall reload,
-and read the log for the rules the daemon reports installing.
+The daemon's rules live in two places. Its own table is not one the firewall
+rebuilds. The rules it inserts into the firewall's tables are, and a reload of
+the router's firewall takes them with it. The watch installs its counting rules
+again on the next poll, and \fBcarrier-watch-reinstalled\fR names the moment. A
+reload is otherwise a restart's business: restart the service to put the rest of
+the rules back.
 .SH SEE ALSO
 .BR /etc/ds-lite-punch.env ,
 .BR /etc/init.d/ds-lite-punch

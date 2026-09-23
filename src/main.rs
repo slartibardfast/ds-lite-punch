@@ -1008,6 +1008,24 @@ async fn main() {
             loop {
                 tick.tick().await;
                 let now = epoch();
+                // The counting rules live in the firewall's tables, and a
+                // firewall rebuild takes them with it while leaving the counter
+                // object in place, so the reading stays plausible with nothing
+                // counting. Measured on the router on 2026-09-22: the counter
+                // stood at 10 for two and a half hours while the helper kept
+                // sending, and the watch raised carrier-silent at 22:59 UTC over
+                // its own missing rule. Converge here, and say so when the rules
+                // had to be put back, because a repaired instrument is a fact the
+                // operator needs and the counter cannot report.
+                match nft::ensure_carrier_probe() {
+                    Ok(true) => emitln!(
+                        "{{\"event\":\"carrier-watch-reinstalled\",\"counter\":\"{}\",\"epoch\":{}}}",
+                        nft::CARRIER_COUNTER,
+                        now
+                    ),
+                    Ok(false) => {}
+                    Err(e) => emiteln!("warn: carrier watch reinstall failed: {}", e),
+                }
                 let count = match nft::list_carrier_probe() {
                     Ok(c) => c,
                     Err(e) => {

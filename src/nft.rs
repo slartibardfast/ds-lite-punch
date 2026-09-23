@@ -653,11 +653,46 @@ fn carrier_probe_rule_argv(chain: &str) -> Vec<String> {
     ]
 }
 
+/// What one chain's listing says about the counting rule.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChainRuleState {
+    /// The handles of rules that name the counter and are not this build's rule.
+    pub stale: Vec<u64>,
+    /// Whether this build's rule is absent from the chain.
+    pub missing: bool,
+}
+
+/// Read one chain's listing into the two facts an install acts on.
+///
+/// A listing that cannot be read says nothing about the rule, and is left
+/// alone: the install would fail on the same read, and the caller reports it.
+pub fn carrier_probe_chain_state(listing: Option<&str>, text: &str) -> ChainRuleState {
+    match listing {
+        Some(l) => ChainRuleState {
+            stale: carrier_probe_stale_handles(l, text),
+            missing: !l.contains(text),
+        },
+        None => ChainRuleState {
+            stale: Vec::new(),
+            missing: false,
+        },
+    }
+}
+
 /// Install the counter and its rules. Idempotent, and content-aware: a rule is
 /// installed only when its chain does not already carry it, so a second call
 /// adds nothing and a chain that already counts keeps counting.
-pub fn ensure_carrier_probe() -> io::Result<()> {
-    let _ = run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]);
+///
+/// The return says whether this call changed anything, which is what makes a
+/// lost rule visible: the rules live in the firewall's tables, and a firewall
+/// rebuild takes them with it while leaving the counter object in place, so the
+/// reading stays plausible and only the install can tell that the instrument
+/// had gone.
+pub fn ensure_carrier_probe() -> io::Result<bool> {
+    let mut changed = false;
+    if run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]).is_ok() {
+        changed = true;
+    }
     for chain in CARRIER_CHAINS {
         let listing = Command::new("nft")
             .args(["list", "chain", "inet", "fw4", chain])
@@ -665,30 +700,30 @@ pub fn ensure_carrier_probe() -> io::Result<()> {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         let text = carrier_probe_rule_text(chain);
-        if let Some(l) = listing.as_deref() {
-            for h in carrier_probe_stale_handles(l, &text) {
-                let _ = run(&[
-                    "delete",
-                    "rule",
-                    "inet",
-                    "fw4",
-                    chain,
-                    "handle",
-                    &h.to_string(),
-                ]);
+        let state = carrier_probe_chain_state(listing.as_deref(), &text);
+        for h in state.stale {
+            if run(&[
+                "delete",
+                "rule",
+                "inet",
+                "fw4",
+                chain,
+                "handle",
+                &h.to_string(),
+            ])
+            .is_ok()
+            {
+                changed = true;
             }
         }
-        let present = listing
-            .as_deref()
-            .map(|l| l.contains(&text))
-            .unwrap_or(true);
-        if !present {
+        if state.missing {
             let argv = carrier_probe_rule_argv(chain);
             let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
             run(&refs)?;
+            changed = true;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Read the counter's packet count. An error here is the shape a watch that
@@ -1033,6 +1068,53 @@ mod tests {
         }
         assert!(CARRIER_CHAINS.contains(&"input"));
         assert!(CARRIER_CHAINS.contains(&"forward"));
+    }
+
+    #[test]
+    fn a_chain_whose_counting_rule_went_is_read_as_missing() {
+        // Measured on the router on 2026-09-22: a firewall rebuild left the
+        // counter object in place with nothing naming it, so the reading stayed
+        // plausible while the count stood still. This is the reading the poll
+        // converges on, and the wipe is the case with the object and no rule.
+        let text = carrier_probe_rule_text("forward");
+        let wiped = "\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n";
+        assert_eq!(
+            carrier_probe_chain_state(Some(wiped), &text),
+            ChainRuleState {
+                stale: Vec::new(),
+                missing: true
+            },
+            "an object with no rule naming it is the wipe"
+        );
+
+        let installed = format!("\t\t{} # handle 17660\n", text);
+        assert_eq!(
+            carrier_probe_chain_state(Some(&installed), &text),
+            ChainRuleState {
+                stale: Vec::new(),
+                missing: false
+            },
+            "the rule this build installs counts as present"
+        );
+
+        let older = "\t\tiifname \"eth1\" meta l4proto udp @th,64,64 0x64736c702d707262 counter name \"carrier_probe\" # handle 17661\n";
+        assert_eq!(
+            carrier_probe_chain_state(Some(older), &text),
+            ChainRuleState {
+                stale: vec![17661],
+                missing: true
+            },
+            "an older variant is replaced, and the chain still needs this build's rule"
+        );
+
+        assert_eq!(
+            carrier_probe_chain_state(None, &text),
+            ChainRuleState {
+                stale: Vec::new(),
+                missing: false
+            },
+            "a chain that cannot be read is left alone, and the caller reports the read"
+        );
     }
 
     #[test]

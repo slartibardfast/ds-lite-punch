@@ -64,8 +64,14 @@ reloaded while the daemon held a mapping. Check what is there:
 nft list ruleset | grep -E "dslp|dslitepunch"
 ```
 
-A missing slot-port accept, or a missing carrier counter, is this case. Restart
-the service, which installs them again:
+A missing slot-port accept is this case, and a restart installs it again. A
+missing carrier counter repairs itself: the watch installs its counting rules
+again on its next poll, and logs
+`{"event":"carrier-watch-reinstalled", ...}` when it does. A carrier-silent
+raised before that repair was the instrument's, so read the log for the repair
+before you believe the alarm.
+
+Restart the service to put the rest of the rules back:
 
 ```sh
 /etc/init.d/ds-lite-punch restart
