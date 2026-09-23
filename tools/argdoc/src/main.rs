@@ -375,6 +375,31 @@ fn drop_extra(roff: &str) -> String {
     out
 }
 
+/// The name a reader sees in the header, which is neutral on purpose: a manual
+/// describes the program, and it names no audience.
+const MANUAL_NAME: &str = "Manual";
+
+/// A man page's header centre is the *fifth* `.TH` field, which clap_mangen
+/// leaves out. Its manual name therefore sits in the fourth field, where a
+/// renderer's own table for the section wins, and the header reads "System
+/// Manager's Manual" whatever this file says. Move the name to the fifth field,
+/// which is the one the reader sees.
+fn manual_name_in_the_fifth_field(roff: &str, name: &str) -> String {
+    let mut out = String::with_capacity(roff.len() + name.len() + 8);
+    for line in roff.lines() {
+        if line.starts_with(".TH ") && line.ends_with(name) {
+            out.push_str(line.trim_end_matches(name).trim_end());
+            out.push_str(" \"\" \"");
+            out.push_str(name);
+            out.push_str("\"\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn main() -> std::io::Result<()> {
     let root = repo_root();
     let version = crate_version(&root);
@@ -390,11 +415,12 @@ fn main() -> std::io::Result<()> {
     let mut rendered = Vec::new();
     clap_mangen::Man::new(cmd)
         .section("8")
-        .manual("System Manager's Manual")
+        .manual(MANUAL_NAME)
         .source(format!("ds-lite-punch {}", version))
         .render(&mut rendered)?;
     let rendered = String::from_utf8(rendered).expect("clap_mangen writes utf-8");
-    let mut man = drop_extra(&rendered).into_bytes();
+    let man = manual_name_in_the_fifth_field(&drop_extra(&rendered), MANUAL_NAME);
+    let mut man = man.into_bytes();
     man.extend_from_slice(include_bytes!("man-sections.roff"));
     let man_path = root.join("deploy/man/ds-lite-punch.8");
     if let Some(dir) = man_path.parent() {

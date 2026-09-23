@@ -1227,6 +1227,14 @@ mod tests {
             !man.contains(".SH EXTRA"),
             "clap_mangen's EXTRA block is back, and the appended sections already cover it"
         );
+        // The header's centre is the fifth .TH field, which is where a reader
+        // sees this. A renderer's own table for the section shows through when
+        // the name is left in the fourth field, so the fifth is asserted here.
+        assert!(
+            man.contains("\"\" \"Manual\""),
+            "the manual's name is not in the header's fifth .TH field, so a reader \
+             sees the renderer's name for the section instead of a neutral one"
+        );
     }
 
     /// The multi-instance CLI contract (plan/0004 B3): `--static-map` is
