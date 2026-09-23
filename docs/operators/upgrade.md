@@ -70,8 +70,16 @@ next version.
    ssh root@ROUTER 'logread | grep ds-lite-punch | tail'
    ```
 
-Your configuration is untouched by an upgrade. The service reads
-`/etc/ds-lite-punch.env` at every start.
+Your configuration file is untouched by an upgrade, and the service reads it at
+every start. A release that renames a key is the one thing an upgrade cannot
+carry for you, so check the release notes for this list before you restart:
+
+| Version | Renamed | From |
+|---|---|---|
+| 0.3.1 | `KEEPALIVE` | `HOLD` |
+
+A deployment that set `HOLD=1` keeps a key no release reads after that upgrade,
+so its keepalive stops. Set the new key in the same edit.
 
 ## Roll back
 
