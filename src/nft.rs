@@ -586,6 +586,16 @@ pub const CARRIER_COUNTER: &str = "carrier_probe";
 /// expecting length or checksum or sport or dport" — so the rule was never
 /// installed and the watch counted nothing through two releases.
 ///
+/// The counter's name is written in quotes, and that is the second load-bearing
+/// spelling here. nft lists the rule it stored as
+/// `counter name "carrier_probe"`, quotes included, so a rule the daemon spells
+/// without them is never found in the listing: the install reads the chain,
+/// concludes its rule is missing, and inserts another copy. Measured on the
+/// router on 2026-09-23, while the convergence below ran: one duplicate every
+/// five seconds, thirty-nine copies after a few minutes. The text this build
+/// installs is therefore the text the listing carries, which is the whole point
+/// of comparing them.
+///
 /// Neither rule terminates, and that is deliberate: the probe is a datagram like
 /// any other, so the accept and forward rules still decide its fate, and a
 /// marked packet gains nothing from being recognised. The payload match is the
@@ -595,31 +605,55 @@ pub fn carrier_probe_rule_text(chain: &str) -> String {
     let mark = format!("@th,64,64 0x{:016x}", crate::carrier::MARK_WORD);
     match chain {
         "forward" => format!(
-            "iifname \"eth1\" meta l4proto udp {} counter name {}",
+            "iifname \"eth1\" meta l4proto udp {} counter name \"{}\"",
             mark, CARRIER_COUNTER
         ),
         _ => format!(
-            "iifname \"eth1\" udp dport @{} {} counter name {}",
+            "iifname \"eth1\" udp dport @{} {} counter name \"{}\"",
             ACCEPT_SET_UDP, mark, CARRIER_COUNTER
         ),
     }
 }
 
 /// The handles of this chain's rules that name the counter and are not the rule
-/// this build installs.
+/// this build means to have exactly once.
 ///
-/// An install that only adds leaves an older build's rule in place, and a rule
-/// that is merely different counts nothing. Measured on the router on
-/// 2026-09-21: a stale forward rule and two stale input variants survived two
-/// releases, and the counter stayed at zero while the probes arrived. Replacing
-/// them is how the watch converges on the one rule it means.
+/// Two kinds are returned, and both are how a watch stops being honest. An older
+/// build's rule survives an install that only adds, and a rule that is merely
+/// different counts nothing: measured on the router on 2026-09-21, a stale
+/// forward rule and two stale input variants survived two releases and the
+/// counter stayed at zero while the probes arrived. And a duplicate of the rule
+/// itself is what a repair that never verified its own write leaves behind: the
+/// convergence of 2026-09-23 inserted one copy per poll because the text it
+/// looked for was not the text nft stores, thirty-nine of them in a few minutes.
+/// The first rule that is this build's is kept, and every later copy goes.
 pub fn carrier_probe_stale_handles(listing: &str, text: &str) -> Vec<u64> {
-    listing
-        .lines()
-        .filter(|l| l.contains(CARRIER_COUNTER) && !l.contains(text))
-        .filter_map(|l| l.rsplit("handle ").next())
-        .filter_map(|h| h.trim().parse::<u64>().ok())
-        .collect()
+    let mut kept_this_build = false;
+    let mut out = Vec::new();
+    for line in listing.lines() {
+        if !line.contains(CARRIER_COUNTER) {
+            continue;
+        }
+        let is_this_build = line.contains(text);
+        let drop = if is_this_build {
+            let duplicate = kept_this_build;
+            kept_this_build = true;
+            duplicate
+        } else {
+            true
+        };
+        if !drop {
+            continue;
+        }
+        if let Some(h) = line
+            .rsplit("handle ")
+            .next()
+            .and_then(|h| h.trim().parse::<u64>().ok())
+        {
+            out.push(h);
+        }
+    }
+    out
 }
 
 /// The chains a counting rule is installed in. Both are real, and which one
@@ -679,6 +713,16 @@ pub fn carrier_probe_chain_state(listing: Option<&str>, text: &str) -> ChainRule
     }
 }
 
+/// Read one chain of the firewall's table. An error says nothing about the rule
+/// in it, which is why the answer is an Option rather than a String.
+fn read_carrier_chain(chain: &str) -> Option<String> {
+    Command::new("nft")
+        .args(["list", "chain", "inet", "fw4", chain])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
 /// Install the counter and its rules. Idempotent, and content-aware: a rule is
 /// installed only when its chain does not already carry it, so a second call
 /// adds nothing and a chain that already counts keeps counting.
@@ -694,13 +738,8 @@ pub fn ensure_carrier_probe() -> io::Result<bool> {
         changed = true;
     }
     for chain in CARRIER_CHAINS {
-        let listing = Command::new("nft")
-            .args(["list", "chain", "inet", "fw4", chain])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         let text = carrier_probe_rule_text(chain);
-        let state = carrier_probe_chain_state(listing.as_deref(), &text);
+        let state = carrier_probe_chain_state(read_carrier_chain(chain).as_deref(), &text);
         for h in state.stale {
             if run(&[
                 "delete",
@@ -720,6 +759,19 @@ pub fn ensure_carrier_probe() -> io::Result<bool> {
             let argv = carrier_probe_rule_argv(chain);
             let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
             run(&refs)?;
+            // The chain is read back, because the chain is the only thing that
+            // says whether the rule landed and which text it landed as. The
+            // quoting above was found this way: an install that looked for the
+            // wrong spelling added a copy a poll while reporting a repair.
+            if !read_carrier_chain(chain)
+                .map(|l| l.contains(&text))
+                .unwrap_or(false)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("the counting rule did not land in the {} chain", chain),
+                ));
+            }
             changed = true;
         }
     }
@@ -974,7 +1026,11 @@ mod tests {
                 "{}",
                 text
             );
-            assert!(text.contains(&format!("counter name {}", CARRIER_COUNTER)));
+            assert!(
+                text.contains(&format!("counter name \"{}\"", CARRIER_COUNTER)),
+                "the text must be the text nft lists, quotes included: {}",
+                text
+            );
             assert!(
                 !text.contains("accept"),
                 "recognising a probe grants nothing: {}",
@@ -1094,10 +1150,10 @@ mod tests {
                 stale: Vec::new(),
                 missing: false
             },
-            "the rule this build installs counts as present"
+            "the rule this build installs counts as present, read back as nft lists it"
         );
 
-        let older = "\t\tiifname \"eth1\" meta l4proto udp @th,64,64 0x64736c702d707262 counter name \"carrier_probe\" # handle 17661\n";
+        let older = "\t\tiifname \"eth1\" udp dport 40000 counter name \"carrier_probe\" # handle 17661\n";
         assert_eq!(
             carrier_probe_chain_state(Some(older), &text),
             ChainRuleState {
@@ -1105,6 +1161,23 @@ mod tests {
                 missing: true
             },
             "an older variant is replaced, and the chain still needs this build's rule"
+        );
+
+        // Measured on the router on 2026-09-23: the install looked for a text
+        // nft never stores, so every poll added another copy of the rule it
+        // already had. Thirty-nine of them sat in the chain. The first copy is
+        // kept and every later one goes, so the count comes back to one.
+        let duplicated = format!(
+            "\t\t{} # handle 21328\n\t\t{} # handle 21330\n\t\t{} # handle 21332\n",
+            text, text, text
+        );
+        assert_eq!(
+            carrier_probe_chain_state(Some(&duplicated), &text),
+            ChainRuleState {
+                stale: vec![21330, 21332],
+                missing: false
+            },
+            "copies of the rule the chain already has are duplicates, not repairs"
         );
 
         assert_eq!(
