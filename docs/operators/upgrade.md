@@ -45,7 +45,14 @@ next version.
    cat artifact-record.txt
    ```
 
-4. Park the binary you have, and install the new one:
+4. Stop the service first. The running daemon holds the binary it was started
+   from, so writing that file while it runs is refused with `Text file busy`:
+
+   ```sh
+   ssh root@ROUTER '/etc/init.d/ds-lite-punch stop'
+   ```
+
+5. Park the binary you have, and install the new one:
 
    ```sh
    cp /usr/bin/ds-lite-punch /usr/bin/ds-lite-punch.prev
@@ -53,7 +60,7 @@ next version.
    ssh root@ROUTER 'chmod 755 /usr/bin/ds-lite-punch'
    ```
 
-5. Install the manual page, and restart the service:
+6. Install the manual page, and start the service:
 
    ```sh
    ssh root@ROUTER 'cat > /tmp/ds-lite-punch.8' < ds-lite-punch.8
@@ -63,7 +70,7 @@ next version.
    ssh root@ROUTER '/etc/init.d/ds-lite-punch restart'
    ```
 
-6. Check the new start:
+7. Check the new start:
 
    ```sh
    ssh root@ROUTER 'ds-lite-punch --version; cat /run/ds-lite-punch/tuple'
