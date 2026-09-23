@@ -697,30 +697,37 @@ pub struct ChainRuleState {
 }
 
 /// Read one chain's listing into the two facts an install acts on.
-///
-/// A listing that cannot be read says nothing about the rule, and is left
-/// alone: the install would fail on the same read, and the caller reports it.
-pub fn carrier_probe_chain_state(listing: Option<&str>, text: &str) -> ChainRuleState {
-    match listing {
-        Some(l) => ChainRuleState {
-            stale: carrier_probe_stale_handles(l, text),
-            missing: !l.contains(text),
-        },
-        None => ChainRuleState {
-            stale: Vec::new(),
-            missing: false,
-        },
+pub fn carrier_probe_chain_state(listing: &str, text: &str) -> ChainRuleState {
+    ChainRuleState {
+        stale: carrier_probe_stale_handles(listing, text),
+        missing: !listing.contains(text),
     }
 }
 
-/// Read one chain of the firewall's table. An error says nothing about the rule
-/// in it, which is why the answer is an Option rather than a String.
-fn read_carrier_chain(chain: &str) -> Option<String> {
+/// Whether the named counter is there to read.
+fn carrier_counter_reads() -> bool {
     Command::new("nft")
-        .args(["list", "chain", "inet", "fw4", chain])
+        .args(["list", "counter", "inet", "fw4", CARRIER_COUNTER])
         .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Read one chain of the firewall's table. A chain that cannot be read is an
+/// error rather than a shrug: an unreadable chain is how the install of
+/// 2026-09-23 went silent, announcing a repair every poll while `nft` was
+/// segfaulting on the listing and nothing moved.
+fn read_carrier_chain(chain: &str) -> io::Result<String> {
+    let out = Command::new("nft")
+        .args(["list", "chain", "inet", "fw4", chain])
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("nft list chain inet fw4 {} -> {}", chain, out.status),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Install the counter and its rules. Idempotent, and content-aware: a rule is
@@ -731,17 +738,29 @@ fn read_carrier_chain(chain: &str) -> Option<String> {
 /// lost rule visible: the rules live in the firewall's tables, and a firewall
 /// rebuild takes them with it while leaving the counter object in place, so the
 /// reading stays plausible and only the install can tell that the instrument
-/// had gone.
+/// had gone. A call that changes nothing returns false, and only a call that
+/// reports true is announced, which is why every step here is read back.
 pub fn ensure_carrier_probe() -> io::Result<bool> {
     let mut changed = false;
-    if run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER]).is_ok() {
+    // The counter is created only when it is absent. Adding one that exists
+    // reports success and changes nothing, and counting that as a change
+    // announced a repair on every poll: measured on the router on 2026-09-23,
+    // a reinstalled event every five seconds while no rule moved.
+    if !carrier_counter_reads() {
+        run(&["add", "counter", "inet", "fw4", CARRIER_COUNTER])?;
+        if !carrier_counter_reads() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("the counter {} did not land", CARRIER_COUNTER),
+            ));
+        }
         changed = true;
     }
     for chain in CARRIER_CHAINS {
         let text = carrier_probe_rule_text(chain);
-        let state = carrier_probe_chain_state(read_carrier_chain(chain).as_deref(), &text);
+        let state = carrier_probe_chain_state(&read_carrier_chain(chain)?, &text);
         for h in state.stale {
-            if run(&[
+            run(&[
                 "delete",
                 "rule",
                 "inet",
@@ -749,11 +768,8 @@ pub fn ensure_carrier_probe() -> io::Result<bool> {
                 chain,
                 "handle",
                 &h.to_string(),
-            ])
-            .is_ok()
-            {
-                changed = true;
-            }
+            ])?;
+            changed = true;
         }
         if state.missing {
             let argv = carrier_probe_rule_argv(chain);
@@ -763,10 +779,7 @@ pub fn ensure_carrier_probe() -> io::Result<bool> {
             // says whether the rule landed and which text it landed as. The
             // quoting above was found this way: an install that looked for the
             // wrong spelling added a copy a poll while reporting a repair.
-            if !read_carrier_chain(chain)
-                .map(|l| l.contains(&text))
-                .unwrap_or(false)
-            {
+            if !read_carrier_chain(chain)?.contains(&text) {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!("the counting rule did not land in the {} chain", chain),
@@ -1135,7 +1148,7 @@ mod tests {
         let text = carrier_probe_rule_text("forward");
         let wiped = "\tchain forward {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n";
         assert_eq!(
-            carrier_probe_chain_state(Some(wiped), &text),
+            carrier_probe_chain_state(wiped, &text),
             ChainRuleState {
                 stale: Vec::new(),
                 missing: true
@@ -1145,7 +1158,7 @@ mod tests {
 
         let installed = format!("\t\t{} # handle 17660\n", text);
         assert_eq!(
-            carrier_probe_chain_state(Some(&installed), &text),
+            carrier_probe_chain_state(&installed, &text),
             ChainRuleState {
                 stale: Vec::new(),
                 missing: false
@@ -1155,7 +1168,7 @@ mod tests {
 
         let older = "\t\tiifname \"eth1\" udp dport 40000 counter name \"carrier_probe\" # handle 17661\n";
         assert_eq!(
-            carrier_probe_chain_state(Some(older), &text),
+            carrier_probe_chain_state(older, &text),
             ChainRuleState {
                 stale: vec![17661],
                 missing: true
@@ -1172,7 +1185,7 @@ mod tests {
             text, text, text
         );
         assert_eq!(
-            carrier_probe_chain_state(Some(&duplicated), &text),
+            carrier_probe_chain_state(&duplicated, &text),
             ChainRuleState {
                 stale: vec![21330, 21332],
                 missing: false
@@ -1180,14 +1193,9 @@ mod tests {
             "copies of the rule the chain already has are duplicates, not repairs"
         );
 
-        assert_eq!(
-            carrier_probe_chain_state(None, &text),
-            ChainRuleState {
-                stale: Vec::new(),
-                missing: false
-            },
-            "a chain that cannot be read is left alone, and the caller reports the read"
-        );
+        // An unreadable chain is no longer a shrug here: `read_carrier_chain`
+        // returns the error, and the caller logs it, because silence is what hid
+        // the segfaulting listing of 2026-09-23.
     }
 
     #[test]
