@@ -1,10 +1,10 @@
 //! TCP slot datapath (call/0017). A listener on the slot's pin tuple
 //! accepts AFTR-forwarded inbound connections and splices them to the
 //! slot target. A persistent STUN-over-TCP connection from the same tuple
-//! keeps the mapping alive at a cadence sized under the C3 bound: an
+//! keeps the mapping alive at an interval under the C3 bound: an
 //! idle AFTR TCP mapping survives 120 s of silence and dies by 300 s
 //! (results/RESULTS-2026-09-13-c3.md), so the connection refreshes at a
-//! cadence strictly under the lower bound. The connection's XOR-MAPPED is
+//! interval strictly under the lower bound. The connection's XOR-MAPPED is
 //! the slot's external TCP tuple, published per slot on churn. The
 //! connection lifecycle is the Kani-proven state machine. The fw4 TCP input
 //! accept is mandatory for the splice: the box drops forwarded TCP NEW
@@ -23,7 +23,7 @@ use crate::publish::Publisher;
 use crate::stun;
 use crate::vote::{VoteDecision, VoteState};
 
-/// Keepalive cadence for a TCP slot, strictly under the C3 silent-death
+/// Keepalive interval for a TCP slot, strictly under the C3 silent-death
 /// lower bound (120 s). See the Kani proof `cadence_under_bound`.
 pub const TCP_KEEPALIVE_SECS: u64 = 60;
 
@@ -32,7 +32,7 @@ pub const TCP_KEEPALIVE_SECS: u64 = 60;
 /// The mapping's connection state machine. Live means a live STUN-over-TCP
 /// connection from the pin tuple, hence a live AFTR TCP mapping; Dead
 /// means the connection errored (RST or silent expiry) and the mapping
-/// is re-establishing on the next cadence.
+/// is re-establishing on the next interval.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnectionState {
     Live,
@@ -139,10 +139,10 @@ async fn connection_round(
     Ok((tuple, conn, local_port))
 }
 
-/// The connection task: at each cadence, refresh the persistent connection
+/// The connection task: at each interval, refresh the persistent connection
 /// (the STUN traffic re-arms the AFTR idle timer) and publish the
 /// observed tuple on churn; on connection error, drop it and re-establish
-/// on the next cadence, rotating servers.
+/// on the next interval, rotating servers.
 pub async fn run_connection(
     bind_ip: Ipv4Addr,
     r: u16,
@@ -185,7 +185,7 @@ pub async fn run_connection(
                 }
             }
         } else {
-            // Dead: re-establish on the next cadence, rotating servers.
+            // Dead: re-establish on the next interval, rotating servers.
             state.on_error();
             conn = None;
             if let Some(lp) = last_local.take() {
@@ -233,7 +233,7 @@ mod proofs {
     fn cadence_under_bound() {
         // C3: an idle AFTR TCP mapping survives 120 s of silence and
         // dies by 300 s on the measured node/session. The connection refresh
-        // cadence must sit strictly under the silent-death lower bound so
+        // interval must sit strictly under the silent-death lower bound so
         // a reachable mapping is refreshed before the AFTR can expire it.
         assert!(TCP_KEEPALIVE_SECS < 120);
         assert!(TCP_KEEPALIVE_SECS > 0);

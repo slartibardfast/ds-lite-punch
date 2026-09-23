@@ -20,7 +20,7 @@ watch, naming this listener in CALLBACK:
     NT: upnp:event
     TIMEOUT: Second-300
 
-Every NOTIFY lands in /tmp/notify.log with its head and its propertyset. The
+Every NOTIFY is written to /tmp/notify.log with its head and its propertyset. The
 run that proved plan/0009's `#signal` used exactly this, with the subscription
 sent from the workstation and the callback here, so the caller the daemon
 captured was the workstation (which is what the containment keys on) while the

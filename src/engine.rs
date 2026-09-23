@@ -49,7 +49,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use crate::publish::{emiteln};
 
-/// Engine cadence. 2 s « 5–10 s AFTR TTL (I3).
+/// Engine interval. 2 s « 5–10 s AFTR TTL (I3).
 pub const TICK: Duration = Duration::from_secs(2);
 /// G5 grace in ticks: entry gone from the CDC ∧ no inbound for this long →
 /// flow presumed dead. Default 3 ticks (~6 s after the conntrack entry died,

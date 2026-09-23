@@ -169,7 +169,7 @@ def main():
     show_pcp("MAP with PREFER_FAILURE", send(sock, prefer), time.time())
 
     # The real thing: a MAP, retried once because a mapping whose discovery
-    # is in flight is dropped rather than answered with a guess.
+    # has not been answered yet is dropped, and no guess is sent.
     req = pcp_header(OP_MAP, args.lifetime, client) + pcp_map_body(args.proto, args.int_port, args.suggest)
     sent_at = time.time()
     resp = send(sock, req, wait=4.0)

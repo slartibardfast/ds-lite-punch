@@ -335,7 +335,7 @@ pub fn verify_authenticator(
 
 // ---- the stateful service core ----
 
-/// The DeviceProtection error surface (spec 2.6.15 summary and the per-
+/// The DeviceProtection error set (spec 2.6.15 summary and the per-
 /// action error tables): the faults this service can return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpErr {

@@ -117,7 +117,7 @@ fn cli(version: &str) -> Command {
                 .help("Seconds between the STUN writes that keep the mapping alive.")
                 .long_help(
                     "Seconds between the STUN writes that keep the mapping alive. The writes \
-                     are what the carrier sees, so this is the cadence the mapping's lifetime \
+                     are what the carrier sees, so this is the interval the mapping's lifetime \
                      depends on. Default 2, minimum 1.",
                 ),
         )
@@ -207,7 +207,7 @@ fn cli(version: &str) -> Command {
                 .long_help(
                     "File of IPv4 addresses, one per line, with # for comments. These are the \
                      devices the keepalive acts for. The list is a budget as well as an admission: \
-                     a flow kept alive costs about half a packet a second at the default cadence. \
+                     a flow kept alive costs about half a packet a second at the default interval. \
                      The path is read at startup, so a typo fails the start.",
                 ),
         )

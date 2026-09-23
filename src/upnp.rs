@@ -27,7 +27,7 @@ pub const UPNP_DEFAULT_PORT: u16 = 49152;
 /// The br-lan address the HTTP service and SSDP membership bind
 /// (default; `--lan-ip` overrides).
 pub const DEFAULT_LAN_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 21, 1);
-/// SSDP CACHE-CONTROL max-age (s); the alive NOTIFY cadence is max-age/2.
+/// SSDP CACHE-CONTROL max-age (s); the alive NOTIFY interval is max-age/2.
 pub const SSDP_MAX_AGE: u32 = 1800;
 pub const SSDP_ALIVE_PERIOD_S: u64 = 900;
 /// The SOAP envelope namespace every M-POST MAN header must name.
@@ -556,7 +556,7 @@ pub fn service_of_path(path: &[u8]) -> Option<SoapService> {
 
 /// The IGDv1 actions the facade honours (E3): the WANIPConnection:1 set,
 /// plus GetCommonLinkProperties on the WANCommonInterfaceConfig:1 service.
-/// DeviceProtection:1's thirteen actions (the authoritative surface,
+/// DeviceProtection:1's thirteen actions (the authoritative set,
 /// docs/upnp-dp1/TRANSCRIPTION.md) and the WANIPConnection:2-only actions
 /// use the same table (plan/0008 #v2-service-set).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -564,7 +564,7 @@ pub enum SoapAction {
     GetExternalIpAddress,
     GetStatusInfo,
     GetConnectionTypeInfo,
-    // the rest of the WANIPConnection:2 required surface (table 2-10's
+    // the rest of the WANIPConnection:2 required actions (table 2-10's
     // R column): the connection control actions and the RSIP/NAT report
     SetConnectionType,
     RequestConnection,
@@ -575,7 +575,7 @@ pub enum SoapAction {
     GetSpecificPortMappingEntry,
     GetGenericPortMappingEntry,
     GetCommonLinkProperties,
-    // WANIPConnection:2-only surface
+    // WANIPConnection:2-only actions
     AddAnyPortMapping,
     DeletePortMappingRange,
     GetListOfPortMappings,

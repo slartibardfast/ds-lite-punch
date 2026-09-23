@@ -17,7 +17,7 @@ Options:
           STUN servers, comma-separated as host:port, tried in order and rotated when one falls silent. Default: stun.l.google.com:19302,stun.cloudflare.com:3478.
 
       --interval <SECS>
-          Seconds between the STUN writes that keep the mapping alive. The writes are what the carrier sees, so this is the cadence the mapping's lifetime depends on. Default 2, minimum 1.
+          Seconds between the STUN writes that keep the mapping alive. The writes are what the carrier sees, so this is the interval the mapping's lifetime depends on. Default 2, minimum 1.
 
       --gateway <IP>
           Next hop used to route STUN out the line the mapping is on. Without it the default route wins and STUN reports the wrong nat. Default 192.168.0.1.
@@ -44,7 +44,7 @@ Options:
           Report the named devices' live flows and touch nothing. This is the stage a new device is admitted from, before --keepalive arms the arm.
 
       --allowlist <PATH>
-          File of IPv4 addresses, one per line, with # for comments. These are the devices the keepalive acts for. The list is a budget as well as an admission: a flow kept alive costs about half a packet a second at the default cadence. The path is read at startup, so a typo fails the start.
+          File of IPv4 addresses, one per line, with # for comments. These are the devices the keepalive acts for. The list is a budget as well as an admission: a flow kept alive costs about half a packet a second at the default interval. The path is read at startup, so a typo fails the start.
 
       --keepalive
           Keep the named devices' mappings alive: the RFC conntrack lifetimes, plus the daemon's own writes on the device's behalf. Without this flag the allowlist is reported on and nothing is touched.

@@ -170,12 +170,12 @@ carrier may answer with a different one.
 .PP
 The carrier drops an idle mapping. On this line the measured windows are five
 to ten seconds for UDP and 120 to 300 seconds for TCP, which is why the daemon
-writes on a two second cadence.
+writes every two seconds.
 .PP
 One client holds one mapping on one port.
 .PP
 The keepalive costs about half a packet a second per flow kept alive, at the
-default cadence, written and reimbursed on the local side. Treat the allowlist as a
+default interval, written and reimbursed on the local side. Treat the allowlist as a
 budget as well as an admission.
 .PP
 The daemon's own firewall rules are installed at startup. A reload of the

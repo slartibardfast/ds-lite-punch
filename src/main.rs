@@ -647,7 +647,7 @@ async fn main() {
     // B8 respawn restore: re-bind the exact same Rs before the first STUN
     // round. Config statics are authoritative; granted leases come back
     // from leases.tsv (tmpfs survives a crash, not a reboot — which is the
-    // mapping-death alignment). A granted record's target is its own
+    // mapping's own end). A granted record's target is its own
     // (client, int_port) tuple. A persisted grant whose R collides with a
     // config static is stale (config wins) — dropped, not fatal.
     let static_tuples: Vec<(u16, Ipv4Addr, u16)> = cfg
@@ -788,7 +788,7 @@ async fn main() {
         }
         if s.proto == slot::Proto::Tcp {
             // TCP slot datapath (call/0017): listener on the pin tuple
-            // with a STUN-over-TCP connection at the C3-sized cadence. The
+            // with a STUN-over-TCP connection at the C3-sized interval. The
             // connection publishes the slot's external TCP tuple per-R.
             let listener = match tcpslot::bind_pin(s.bind_port).await {
                 Ok(l) => l,
@@ -976,7 +976,7 @@ async fn main() {
     // and the datapath counts the mark. The daemon cannot send from a foreign
     // address, so this is the only way it is told that the carrier still
     // forwards a stranger's traffic. The counter is read on its own short
-    // cadence while the interval it measures is minutes long.
+    // interval, while the period it measures is minutes long.
     if cfg.carrier_probe {
         if let Err(e) = nft::ensure_carrier_probe() {
             emiteln!(
@@ -1163,7 +1163,7 @@ mod tests {
             .collect()
     }
 
-    /// The CLI surface check. `tools/argdoc` holds a clap definition of this
+    /// The CLI check. `tools/argdoc` holds a clap definition of this
     /// command line and generates the help text from it, so that definition is
     /// a second copy of the parser. This test is the seam between the copies:
     /// the flags the parser takes and the flags the help names are one set.

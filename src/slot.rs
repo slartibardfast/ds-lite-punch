@@ -5,7 +5,7 @@
 //! All table logic is pure over small `Vec`s (max `--max-slots`, default 32)
 //! so Kani can prove it; the runtime layer (sockets, nft, STUN) lives in
 //! `main.rs` and the facade modules. Linear scans are deliberate: at ≤32
-//! slots they are nanoseconds, and they keep the proof surface simple.
+//! slots they are nanoseconds, and they keep the proofs simple.
 //!
 //! Invariants (Kani-checked):
 //!   - one slot per distinct (client, int_port); two indices never diverge;

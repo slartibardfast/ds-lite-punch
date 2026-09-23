@@ -79,7 +79,7 @@ the carrier's own lifetime.
 
 To keep a device's mapping alive, name it in the allowlist and set `KEEPALIVE=1` with
 `OBSERVATION=1`. The allowlist is a budget as well as an admission: a flow kept alive
-costs about half a packet a second at the default cadence. Start with the devices
+costs about half a packet a second at the default interval. Start with the devices
 you need, and watch the count.
 
 To add a device safely, name it while `KEEPALIVE=0` stays set, read the report, and

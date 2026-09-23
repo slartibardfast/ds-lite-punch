@@ -1,7 +1,7 @@
 //! G1 change-data-capture (brief v2 §10.1, DECIDED 2026-09-01).
 //!
 //! One `Cdc` trait, three backends, one contract: *live bidirectional UDP
-//! candidates with shadow-bind tuples at ≤2 s cadence*.
+//! candidates with shadow-bind tuples at an interval of at most 2 s*.
 //!
 //!   (a) nft `flow_obs` dynamic-set mirror  — primary. Gating test PASSED
 //!       2026-09-02: a filter-postrouting observer at priority 110 (> fw4
@@ -44,7 +44,7 @@ pub enum CdcKind {
 /// the trait carries both bounds the runtime needs.
 pub trait Cdc: Send + Sync {
     /// Live candidates this tick. Cheap by contract: capped at the refresh
-    /// budget, no blocking beyond a kernel table read, 2 s cadence.
+    /// budget, no blocking beyond a kernel table read, a 2 s interval.
     fn tick(&mut self) -> Vec<Candidate>;
     fn name(&self) -> &'static str;
 }

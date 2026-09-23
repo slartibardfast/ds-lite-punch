@@ -71,9 +71,9 @@ const DESC_MAX: usize = 64;
 /// control-silent; the AFTR reaps idle TCP at the C3 bound).
 const LEASE_GRACE_S: u64 = 86_400;
 const LEASE_BACKSTOP_S: u64 = 604_800;
-/// The GENA prune cadence (subscriptions live at 2x the requested timeout).
+/// The GENA prune interval (subscriptions live at 2x the requested timeout).
 const GENA_PRUNE_S: u64 = 60;
-/// The local GC cadence for granted leases (facade teardown ownership).
+/// The local GC interval for granted leases (facade teardown ownership).
 const GC_TICK_S: u64 = 60;
 /// NOTIFY delivery per-callback timeout.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -141,7 +141,7 @@ struct GenaState {
     subs: Vec<Sub>,
     sids: SidSet,
     /// SystemUpdateID: bumped when a mapping appears or goes, so a subscriber
-    /// that only reads the evented surface still sees the table move.
+    /// that only reads the evented state variables still sees the table move.
     update_id: u32,
 }
 
@@ -445,7 +445,7 @@ impl UpnpFacade {
             };
             let key = match src {
                 SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
-                _ => continue, // SSDP is IPv4-only on this surface
+                _ => continue, // SSDP is IPv4-only here
             };
             match discovery_action(st, IGD_V2_ENABLED) {
                 DiscoveryAction::Ignore => continue,
@@ -1069,7 +1069,7 @@ impl UpnpFacade {
                     )
                     .await;
                 match answer {
-                    // NAT-PMP has no answer for a mapping still in flight:
+                    // NAT-PMP has no answer for a mapping still being set up:
                     // the client asks again, and this request is dropped
                     pcp::MapAnswer::Drop => None,
                     pcp::MapAnswer::Answer {
@@ -2051,7 +2051,7 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 p if eq_ia(p, b"/igd/v1/WANIPC.xml") => Some(SCPD_WANIP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/igd/v1/WANPPP.xml") => Some(SCPD_WANPPP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/igd/v1/WANCfg.xml") => Some(SCPD_WANCMN.as_bytes().to_vec()),
-                // The v2 surface mounts only with its complete service set
+                // The v2 service mounts only with its complete service set
                 // (plan/0008 R5, R6 gate); until then the URLs are not
                 // offered and answer 404.
                 p if IGD_V2_ENABLED && eq_ia(p, b"/igd/v2/rootDesc.xml") => {
@@ -2154,7 +2154,7 @@ async fn handle_soap(
     // A v2 WIP2 security-sensitive invocation flows through the session
     // principal before the canonical mapping engine; there is no engine
     // bypass for the v2 face. The v1 facade stays a legacy unauthenticated
-    // compatibility surface (section 26.12).
+    // compatibility rules (section 26.12).
     let gated: Result<(), UpnpErr> = if service == SoapService::WanIpConnection
         && v2
         && matches!(
@@ -2298,7 +2298,7 @@ async fn handle_soap(
                 Ok(i) => facade.get_generic(i, view).await,
                 Err(e) => Err(e),
             },
-            // WIP2-only surface (plan/0008 #v2-service-set). The engine is
+            // WIP2-only actions (plan/0008 #v2-service-set). The engine is
             // report-requested: the granted bind port IS the external
             // port, so AddAnyPortMapping answers NewReservedPort with the
             // granted port and the entries key follows it.
@@ -2964,7 +2964,7 @@ fn parse_desc(body: &[u8]) -> String {
     clean.chars().take(DESC_MAX).collect()
 }
 
-/// The connection status the evented surface reports. This line is not
+/// The connection status the evented state variables report. This line is not
 /// dialled by anything of ours, so the only two states the daemon can
 /// honestly claim are "the external tuple is known" and "it is not".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3581,7 +3581,7 @@ fn dp_random_16() -> [u8; 16] {
     out
 }
 
-/// Map a DeviceProtection error onto the facade error surface (the SOAP
+/// Map a DeviceProtection error onto the facade's error set (the SOAP
 /// fault codes of spec 2.6.15).
 fn map_dp_err(e: dp::DpErr) -> UpnpErr {
     match e {
@@ -3806,7 +3806,7 @@ fn root_desc(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
 /// plan/0008's LOCATION design: the IGD:2 root description (gated route data).
 /// DeviceProtection:1 sits directly under InternetGatewayDevice:2 per
 /// section 26.4; WANIPConnection:2 under WANConnectionDevice:2. This is
-/// the v2 surface definition; it is not served until the
+/// the v2 service description; it is not served until the
 /// #v2-service-set task flips IGD_V2_ENABLED (R6 mount gate).
 fn root_desc_v2(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
     format!(
@@ -3994,7 +3994,7 @@ const SCPD_WANCMN: &str = r#"<?xml version="1.0"?>
 "#;
 
 /// plan/0008: the WANIPConnection:2 SCPD (gated route data). The action
-/// surface, every argument table, and the state table are transcribed from
+/// actions, every argument table, and the state table are transcribed from
 /// the normative spec (docs/upnp-wip2/UPnP-gw-WANIPConnection-v2-Service.md,
 /// sections 2.3, 2.4, 2.5 and the section 4 XML Service Description
 /// reassembled in docs/upnp-wip2/TRANSCRIPTION.md): twenty-one actions,
@@ -4118,7 +4118,7 @@ const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
 "#;
 
 /// DeviceProtection:1 service description (urn:schemas-upnp-org:service:DeviceProtection:1).
-/// The action surface is transcribed from the normative spec
+/// The action set is transcribed from the normative spec
 /// (docs/upnp-dp1/UPnP-gw-DeviceProtection-V1-Service.md, sections 2.6.1-2.6.13):
 /// thirteen actions, every argument table per the spec. Earlier
 /// miniupnpd-derived names (RequestUserLogin, ValidateIdentity, AddACLEntry,
@@ -4501,7 +4501,7 @@ mod tests {
             .spawn_udp_slot(bind_port, Ipv4Addr::LOCALHOST, 51001)
             .await
             .expect("slot spawn on loopback");
-        assert_eq!(handles.len(), 2, "keepalive + recv handles must both surface");
+        assert_eq!(handles.len(), 2, "keepalive and recv handles must both be visible");
 
         // While the slot tasks live, the socket is bound.
         let probe = TokioUdp::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -5545,7 +5545,7 @@ mod tests {
 
     #[test]
     fn v2_builders_carry_the_surface() {
-        // the v2 surface is real data (section 26.4 places DP under the
+        // the v2 service is real data (section 26.4 places DP under the
         // root device; WIP2 under WANConnectionDevice:2), served only
         // when the gate flips at #v2-service-set
         let doc = root_desc_v2(Ipv4Addr::new(192, 168, 21, 1), 49152, "t", "udn-x");
@@ -5559,7 +5559,7 @@ mod tests {
         assert!(wip2.contains("AddAnyPortMapping"));
         assert!(wip2.contains("DeletePortMappingRange"));
         assert!(wip2.contains("GetListOfPortMappings"));
-        // the surface assertions compare against the line-wrapped document
+        // the service assertions compare against the line-wrapped document
         // with its layout removed, so they test the XML structure rather
         // than the literal's formatting
         let wip2_flat: String = wip2.chars().filter(|c| !c.is_whitespace()).collect();
@@ -5895,7 +5895,7 @@ mod tests {
         );
         // the mounted v2 root description: IGD:2, and (sections 26.4 and
         // 26.11) DeviceProtection:1 beside WANIPConnection:2, since an
-        // IGD:2 facade without an enforced DP surface is the shortcut the
+        // IGD:2 facade without an enforced DeviceProtection service is the shortcut the
         // plan forbids
         let (ok, body) = get("/igd/v2/rootDesc.xml").await;
         assert!(
@@ -5912,8 +5912,8 @@ mod tests {
         ] {
             assert!(body.contains(want), "the v2 root description carries {}", want);
         }
-        // the v2 service descriptions: the transcribed WIP2 surface (21
-        // actions) and the DP surface (13)
+        // the v2 service descriptions: the transcribed WIP2 actions (21
+        // actions) and the DeviceProtection actions (13)
         let (ok, body) = get("/igd/v2/WANIPCn.xml").await;
         assert!(
             ok && body.contains("AddAnyPortMapping") && body.contains("DeletePortMappingRange"),
@@ -5932,7 +5932,7 @@ mod tests {
         assert_eq!(
             body.matches("<action>").count(),
             13,
-            "the DP surface is the authoritative 13 actions"
+            "the DeviceProtection service is the authoritative 13 actions"
         );
     }
 
@@ -6920,7 +6920,7 @@ mod ifindex_probe {
         let _ = std::fs::remove_dir_all(dir);
     }
     /// The connection-control actions of the required WANIPConnection:2
-    /// surface at the wire: the auto-configured line answers
+    /// service at the wire: the auto-configured line answers
     /// SetConnectionType with 731 ReadOnly, reports NAT on and RSIP off,
     /// refuses ForceTermination instead of handing every LAN client a
     /// lever on the household line, and treats RequestConnection as the
@@ -7037,7 +7037,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // the same surface with no external tuple: RequestConnection now
+        // the same service with no external tuple: RequestConnection now
         // reports the provider-side failure the spec names for it
         let mut f3 = UpnpFacade {
             cfg: UpnpConfig {
@@ -7094,7 +7094,7 @@ mod ifindex_probe {
         );
     }
 
-    // ---- the evented surface (call/0025, plan/0009 #signal) ----
+    // ---- the evented state variables (call/0025, plan/0009 #signal) ----
 
     fn ev(ip: &str, entries: u16, update_id: u32) -> EventView {
         EventView::new(ip.parse().unwrap(), entries, update_id)

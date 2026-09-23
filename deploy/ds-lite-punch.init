@@ -63,14 +63,14 @@ start_service() {
 
     # The facade is default-on; an operator with a real IGD on the LAN (or
     # a dead UDP 1900) can disable it via UPNP=0 in the env file — the rc
-    # surface must expose the flag, or every fix would be overwritten by
-    # an opkg upgrade.
+    # the environment must carry the flag, or an opkg upgrade would overwrite
+    # every fix.
     NO_UPNP=
     [ "${UPNP:-1}" = "1" ] || NO_UPNP=--no-upnp
 
     # The keepalive's admission (call/0025): the allowlist names the devices whose
     # flows get the RFC lifetimes, and KEEPALIVE=1 turns the arm from reporting
-    # them to keeping them alive. The conntrack policy lands in the daemon's own
+    # them to keeping them alive. The conntrack policy is installed in the daemon's own
     # table (ip dslp), so cleanup_nft's table delete reverts it with the rest
     # of the datapath and no firewall include has to be kept in step.
     ALLOW=
