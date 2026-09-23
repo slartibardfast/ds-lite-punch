@@ -72,7 +72,7 @@ jobs:
             artifact-record.txt
           if-no-files-found: error
 
-  # The operator surfaces are generated from one definition, and a generated
+  # The help text and the manual page are generated from one definition, and a
   # file can leave that definition behind with no one noticing. This job holds
   # the two generated artifacts to it, holds the manual page to the renderer,
   # holds the authored docs' links, and holds their register.

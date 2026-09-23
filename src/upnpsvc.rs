@@ -6336,7 +6336,7 @@ mod ifindex_probe {
         assert!(
             text.contains("730 (PortMappingNotFound)"),
             "the empty TCP range is the spec's fault, which the reference client \
-             surfaces as a failed pass: {}",
+             reports as a failed pass: {}",
             text
         );
         assert!(

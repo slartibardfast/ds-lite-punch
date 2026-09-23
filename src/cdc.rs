@@ -246,7 +246,7 @@ mod tests {
             max_refresh_attempts: 8,
             allowed: Vec::new(),
         };
-        assert!(cdc.tick().is_empty(), "I1: owned tuple never surfaces");
+        assert!(cdc.tick().is_empty(), "I1: an owned tuple never appears");
     }
 
     #[test]
