@@ -1,25 +1,4 @@
-//! Netlink conntrack deletion — bisected, then superseded.
-//!
-//! Background: the engine claims a flow whose conntrack entry occupies the
-//! exact 5-tuple `(NAT, R_nat) ⇄ <server>` that the shadow keepalive must
-//! use. The kernel then NAPT's the shadow's keepalives to a fresh ephemeral
-//! port (measured on this box 2026-09-02: 41077 → 1024) — the refresh
-//! refreshes the WRONG mapping while the observed one dies at the AFTR TTL.
-//!
-//! The brief's G8.4 mechanism for that is deleting the observed entry
-//! ("conntrack -D if present, else netlink"). The netlink encoding was
-//! implemented and bisected (`--ct-probe`): every variant (family 0/2 ×
-//! NLA_F_NESTED × ORIG/REPLY × zone) returns EINVAL on this 6.12.35
-//! ImmortalWrt build while a canonical libmnl-shaped message does the same,
-//! and no conntrack tool is installable (no such apk package). ACKED as a
-//! kernel-build quirk and ABANDONED in favor of the SELF-PIN (engine.rs
-//! G3(c)): an explicit (NAT, R_nat) → (NAT, R_nat) map element makes the
-//! shadow's keepalives egress under the observed tuple without any
-//! deletion, by the same explicit-tuple snat path the host pins use.
-//!
-//! The delete code stays as a documented dead end (and a possible restart
-//! point if the kernel ever accepts the encoding); `--ct-probe` remains for
-//! re-bisecting.
+//! Netlink conntrack deletion, which this kernel refuses with EINVAL; the self-pin replaced it, and --ct-probe re-bisects it.
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
 use crate::publish::{emitln};
@@ -45,9 +24,7 @@ const CTA_TUPLE_ORIG: u16 = 1;
 /// Top-level zone attribute (ctattr_type: CTA_ZONE = 23).
 const CTA_ZONE: u16 = 23;
 
-/// Append an NLA attribute (u16 len = 4+data, u16 type, payload, 4-byte
-/// aligned). Nested attributes carry NLA_F_NESTED — strict nfnetlink
-/// validation rejects nested attrs without it (EINVAL, measured 2026-09-02).
+/// Append an NLA attribute: length (4 + data), type, payload, padded to four bytes.
 fn put_attr(buf: &mut Vec<u8>, ty: u16, data: &[u8], nested: bool) {
     let nty = if nested { ty | 0x8000 } else { ty };
     buf.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
@@ -58,8 +35,7 @@ fn put_attr(buf: &mut Vec<u8>, ty: u16, data: &[u8], nested: bool) {
     }
 }
 
-/// Parameterized delete message builder — used by the empirical bisect
-/// (`--ct-probe`) and, with the established winners, by `del_orig`.
+/// Build a delete message from the encodings the bisect varies.
 #[allow(clippy::too_many_arguments)]
 fn build_msg(
     family: u8,
@@ -99,9 +75,7 @@ fn build_msg(
     req
 }
 
-/// Build the CT_DELETE request matching the observed flow's ORIG tuple
-/// (host:host_port → peer:peer_port, UDP). Pure; unit-tested against the
-/// wire shape. Dead code today — see the module docs (self-pin wins).
+/// Build the CT_DELETE request for the observed flow's original tuple. Dead code: the self-pin replaced it.
 #[allow(dead_code)]
 pub fn build_del_msg(
     host: Ipv4Addr,
@@ -119,9 +93,7 @@ pub fn build_del_msg(
     )
 }
 
-/// Send one delete request and return the ack error code. Ok(0) = deleted;
-/// Ok(-ENOENT) = already gone; Ok(other negative) = errno; Err = transport
-/// failure (socket/bind/send, or an ack that never arrived).
+/// Send one delete request: Ok(0) deleted, Ok(-2) already gone, other negatives are errno, Err is the request failing.
 fn ct_delete(cmd: &[u8]) -> std::io::Result<i32> {
     let fd: RawFd = unsafe {
         libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_NETFILTER)
@@ -170,9 +142,7 @@ fn ct_delete(cmd: &[u8]) -> std::io::Result<i32> {
     Ok(code)
 }
 
-/// Delete the observed flow's conntrack entry. Ok(()) if deleted or already
-/// gone (ENOENT). Best-effort by contract — callers warn, never fail.
-/// Dead code today — see the module docs (self-pin wins).
+/// Delete the observed flow's conntrack entry, best effort: a caller warns and never fails. Dead code.
 #[allow(dead_code)]
 pub fn del_orig(
     host: Ipv4Addr,
@@ -187,11 +157,7 @@ pub fn del_orig(
     }
 }
 
-/// Empirical bisect (`--ct-probe`): create our own conntrack entry (a UDP
-/// datagram from a fresh local socket), then try every delete-message
-/// variant against it and print each ack code (0 = deleted, -2 = gone,
-/// -22 = EINVAL...). This pinned down the encoding this kernel accepts
-/// (2026-09-02) after a canonical-looking message still returned EINVAL.
+/// The --ct-probe bisect: create an entry from a fresh socket, try every encoding, print each acknowledgement code.
 pub fn self_test() {
     use std::io::Write as _;
     let sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -275,9 +241,7 @@ mod tests {
         // nfgenmsg: family AF_INET, version 0
         assert_eq!(m[16], AF_INET);
         assert_eq!(m[17], NFNETLINK_V0);
-        // the orig tuple bytes appear big-endian in the payload:
-        // m[20..24] TUPLE_ORIG ldr, m[24..28] TUPLE_IP ldr,
-        // m[28..32] V4_SRC ldr, m[32..36] src octets
+        // The tuple bytes are big-endian: original-tuple header, IP header, then the source octets.
         assert_eq!(&m[32..36], &[192, 168, 21, 1], "src ip octets");
         assert_eq!(&m[40..44], &[74, 125, 250, 129], "dst ip octets");
         // ports big-endian
