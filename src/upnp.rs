@@ -704,11 +704,11 @@ pub fn find_ns_soapaction<'a>(head: &'a [u8], ns: &[u8]) -> Option<&'a [u8]> {
 pub enum ReqClass {
     /// A description-document GET.
     Get,
-    /// A SOAP invocation; `v2` is the version attribution read from the SOAPACTION URN.
+    /// A SOAP invocation; `is_v2` is the version attribution read from the SOAPACTION URN.
     Soap {
         service: SoapService,
         action: SoapAction,
-        v2: bool,
+        is_v2: bool,
     },
     /// GENA control messages.
     GenaSubscribe,
@@ -800,9 +800,9 @@ pub fn classify(head: &[u8]) -> ReqClass {
         return ReqClass::SoapInvalidAction;
     };
     // the version attribution comes from the same SOAPACTION value in both transports, keeping parity
-    let v2 = soapaction_is_v2(soapaction);
+    let is_v2 = soapaction_is_v2(soapaction);
     match service_of_path(path) {
-        Some(service) => ReqClass::Soap { service, action, v2 },
+        Some(service) => ReqClass::Soap { service, action, is_v2 },
         None => ReqClass::SoapInvalidAction,
     }
 }
@@ -1255,7 +1255,7 @@ mod tests {
             ReqClass::Soap {
                 service: SoapService::WanIpConnection,
                 action: SoapAction::AddPortMapping,
-                v2: false
+                is_v2: false
             }
         );
         let ppp = b"POST /ctl/PPPConn HTTP/1.1\r\nSOAPACTION: urn:schemas-upnp-org:service:WANPPPConnection:1#GetStatusInfo\r\n\r\n";
@@ -1264,7 +1264,7 @@ mod tests {
             ReqClass::Soap {
                 service: SoapService::WanPppConnection,
                 action: SoapAction::GetStatusInfo,
-                v2: false
+                is_v2: false
             }
         );
         let bad = b"POST /ctl/IPConn HTTP/1.1\r\nSOAPACTION: \"urn:...#Nope\"\r\n\r\n";
@@ -1276,7 +1276,7 @@ mod tests {
             ReqClass::Soap {
                 service: SoapService::WanCommonIfaceCfg,
                 action: SoapAction::GetCommonLinkProperties,
-                v2: false
+                is_v2: false
             }
         );
     }
@@ -1291,7 +1291,7 @@ mod tests {
             ReqClass::Soap {
                 service: SoapService::WanIpConnection,
                 action: SoapAction::GetExternalIpAddress,
-                v2: false
+                is_v2: false
             }
         );
         // foreign MAN -> invalid

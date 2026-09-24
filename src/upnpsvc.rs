@@ -91,7 +91,7 @@ struct Sub {
     /// The control point that subscribed: containment keys on the caller, not on the callback address.
     caller: Ipv4Addr,
     /// The face it subscribed on: the port floor binds the v2 face only, so its count is scoped as its reads are.
-    v2: bool,
+    is_v2: bool,
     /// The declared evented variables as this subscriber last saw them, so a NOTIFY carries exactly what moved.
     sent: Option<EventView>,
 }
@@ -1298,7 +1298,7 @@ impl UpnpFacade {
         callback: &[u8],
         timeout_secs: u32,
         caller: Ipv4Addr,
-        v2: bool,
+        is_v2: bool,
     ) -> Result<String, UpnpErr> {
         let Some((ip, port, path)) = parse_callback(callback) else {
             return Err(UpnpErr::InvalidArgs);
@@ -1325,13 +1325,13 @@ impl UpnpFacade {
             expires_at_unix: now.saturating_add(u64::from(timeout) * 2),
             seq: 0,
             caller,
-            v2,
+            is_v2,
             sent: None,
         });
         drop(g);
         // The initial NOTIFY carries eventKey 0 and every declared variable, then advances the key to 1.
         let ext = self.external_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let view = self.view_for(caller, v2, ext).await;
+        let view = self.view_for(caller, is_v2, ext).await;
         self.notify_view(sid, view, true).await;
         Ok(format!(
             "SID: {}\r\nTIMEOUT: Second-{}\r\n",
@@ -1402,10 +1402,10 @@ impl UpnpFacade {
     async fn notify_all(&self, ip: Ipv4Addr) {
         let subs: Vec<(Sid, Ipv4Addr, bool)> = {
             let g = self.gena.lock().await;
-            g.subs.iter().map(|s| (s.sid, s.caller, s.v2)).collect()
+            g.subs.iter().map(|s| (s.sid, s.caller, s.is_v2)).collect()
         };
-        for (sid, caller, v2) in subs {
-            let view = self.view_for(caller, v2, ip).await;
+        for (sid, caller, is_v2) in subs {
+            let view = self.view_for(caller, is_v2, ip).await;
             self.notify_view(sid, view, false).await;
         }
     }
@@ -1821,8 +1821,8 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 }
             }
         }
-        ReqClass::Soap { service, action, v2 } => {
-            handle_soap(&facade, service, action, v2, client_ip, &body, &mut stream).await;
+        ReqClass::Soap { service, action, is_v2 } => {
+            handle_soap(&facade, service, action, is_v2, client_ip, &body, &mut stream).await;
             // Client-presence stamp: any SOAP action from this IP proves the client is alive.
             facade.stamp_client(client_ip).await;
         }
@@ -1830,10 +1830,10 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
             let callback = upnp::find_header(head, b"CALLBACK").unwrap_or(b"");
             let timeout =
                 parse_timeout(upnp::find_header(head, b"TIMEOUT")).unwrap_or(GENA_TIMEOUT_CAP);
-            let v2 = request_path(head)
+            let is_v2 = request_path(head)
                 .map(|p| p.starts_with(b"/igd/v2/"))
                 .unwrap_or(false);
-            match facade.gena_subscribe(callback, timeout, client_ip, v2).await {
+            match facade.gena_subscribe(callback, timeout, client_ip, is_v2).await {
                 Ok(extra) => {
                     let _ = write_response(&mut stream, "200 OK", b"", &extra).await;
                 }
@@ -1885,14 +1885,14 @@ async fn handle_soap(
     facade: &Arc<UpnpFacade>,
     service: SoapService,
     action: SoapAction,
-    v2: bool,
+    is_v2: bool,
     client_ip: Ipv4Addr,
     body: &[u8],
     stream: &mut TcpStream,
 ) {
     // The DeviceProtection authorization boundary: a v2 WIP2 security-sensitive invocation flows through it first.
     let gated: Result<(), UpnpErr> = if service == SoapService::WanIpConnection
-        && v2
+        && is_v2
         && matches!(
             action,
             SoapAction::AddPortMapping
@@ -1918,7 +1918,7 @@ async fn handle_soap(
     } else {
         Some(Contain {
             caller: client_ip,
-            high_port: v2,
+            high_port: is_v2,
         })
     };
     let result: Result<String, UpnpErr> = match gated {
@@ -1971,7 +1971,7 @@ async fn handle_soap(
             ) => match parse_add_args(body) {
                 Ok((ext, proto, int_port, client, lifetime)) => {
                     // the URN's version decides the lease reading: 0 means the v2 maximum, or a v1 static mapping
-                    let lifetime = if v2 { wip2_lease(lifetime) } else { lifetime };
+                    let lifetime = if is_v2 { wip2_lease(lifetime) } else { lifetime };
                     facade
                         .allocate_exact(
                             MappingReq {
@@ -2099,12 +2099,12 @@ async fn handle_soap(
     match result {
         Ok(inner) => {
             let action_name = String::from_utf8_lossy(upnp::soap_action_name(action));
-            let xml = upnp::soap_success_v(service, v2, &action_name, &inner);
+            let xml = upnp::soap_success_v(service, is_v2, &action_name, &inner);
             let _ = write_response(stream, "200 OK", &xml, "").await;
             emitln!(
                 "{{\"event\":\"upnp\",\"action\":\"{}\",\"service\":\"{}\"}}",
                 action_name,
-                String::from_utf8_lossy(upnp::service_urn_v(service, v2))
+                String::from_utf8_lossy(upnp::service_urn_v(service, is_v2))
             );
         }
         Err(e) => {
@@ -3879,7 +3879,7 @@ mod tests {
             }
         };
 
-        // round 1: 12 concurrent GETs (under the 16-permit cap), all served whole
+        // 12 concurrent GETs, under the 16-permit cap, all served whole
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..12 {
             set.spawn(client(b"GET /rootDesc.xml HTTP/1.0\r\n\r\n"));
@@ -3891,9 +3891,9 @@ mod tests {
                 served += 1;
             }
         }
-        assert_eq!(served, 12, "all round-1 GETs must be served whole");
+        assert_eq!(served, 12, "every GET of the first wave must be served whole");
 
-        // round 2: 12 peers stall mid-head then close; a fresh GET after each close must still be served
+        // 12 peers stall mid-head then close; a fresh GET after each close must still be served
         for i in 0..12 {
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
             s.write_all(b"GET /rootDes").await.unwrap();
@@ -3907,7 +3907,7 @@ mod tests {
             );
         }
 
-        // round 3: a body-stall must not wedge the pool; the 30 s timeout bounds it
+        // a body-stall must not wedge the pool; the 30 s timeout bounds it
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         s.write_all(
             b"POST /ctl/IPConn HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n",
