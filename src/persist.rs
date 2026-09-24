@@ -1,26 +1,4 @@
-//! Persistence for the slot engine (brief v2, B6/B7/B8): epoch + lease
-//! records under `/tmp/dslp/`.
-//!
-//!   `epoch`      — one line: unix seconds the lease table was first
-//!                  created (written on first start; tmpfs survives
-//!                  respawn, not reboot — which is exactly right, B7/I5).
-//!   `leases.tsv` — one row per slot: R, kind(static|granted), client,
-//!                  int_port, bookkeeping_ext_port, granted_lifetime,
-//!                  expires_at_unix, created_at_unix. Rewritten on every
-//!                  change (small table; atomic via tmpfile+rename).
-//!
-//! Respawn restore (B8): read `epoch` to continue the PCP ANNOUNCE epoch;
-//! read `leases.tsv` to re-bind the exact same Rs before the first STUN
-//! round. Grant records that are still valid under the *static* config are
-//! reconciled by the caller (`LeaseTable::restore`).
-//!
-//! Path is fixed at `/tmp/dslp/` per the brief; the runtime dir
-//! (`--state-dir`, `/run/ds-lite-punch`) stays for the published tuple.
-//!
-//! Interim `dead_code` allowance (p2-slot-engine): `read_leases` is the
-//! B8 respawn-restore reader, wired in the next phase. Remove the
-//! `#![allow(dead_code)]` when B8 is done and the merge-gate build runs
-//! `cargo build -D warnings`.
+//! The epoch and the lease records, at the fixed path /tmp/dslp, which a restart re-binds its slots from.
 use std::fs;
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -28,8 +6,7 @@ use std::path::Path;
 
 pub const DEFAULT_DIR: &str = "/tmp/dslp";
 
-/// Parse `epoch` from disk, creating it with `now` when absent.
-/// `now` is provided by the caller (Epoch::now) so tests can pin it.
+/// Parse `epoch`, creating it with `now` when absent; the caller supplies the clock so tests can pin it.
 pub fn load_epoch(dir: &Path, now: u64) -> u64 {
     let path = dir.join("epoch");
     match fs::read_to_string(&path) {
@@ -46,8 +23,7 @@ pub fn load_epoch(dir: &Path, now: u64) -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedSlot {
     pub bind_port: u16,
-    /// IANA proto code: 17 = UDP, 6 = TCP (the last column; rows without
-    /// it are legacy UDP).
+    /// IANA protocol code: 17 is UDP, 6 is TCP; a row without the column is legacy UDP.
     pub proto: u8,
     pub kind: u8, // 0=static, 1=granted
     pub client: Ipv4Addr,
@@ -58,9 +34,7 @@ pub struct PersistedSlot {
     pub created_at_unix: u64,
 }
 
-/// Snapshot the live slot table for persisting (B8 respawn restore; the
-/// UPnP facade grants reuse the same projection so respawn re-binds the
-/// granted Rs).
+/// Project the live slot table for persisting, so a restart re-binds the same slots.
 pub fn snapshot(table: &[crate::slot::Slot], now_unix: u64) -> Vec<PersistedSlot> {
     table
         .iter()
@@ -96,8 +70,7 @@ pub fn snapshot(table: &[crate::slot::Slot], now_unix: u64) -> Vec<PersistedSlot
         .collect()
 }
 
-/// Serialize slots to TSV. Deterministic order (by bind_port) so diffs
-/// between respawns are stable.
+/// Serialize the slots to TSV, ordered by bind port so the bytes are stable across restarts.
 pub fn tsv(slots: &[PersistedSlot]) -> String {
     let mut rows: Vec<&PersistedSlot> = slots.iter().collect();
     rows.sort_by_key(|s| s.bind_port);
@@ -119,8 +92,7 @@ pub fn tsv(slots: &[PersistedSlot]) -> String {
     out
 }
 
-/// Atomically replace `leases.tsv` (tmpfile + rename). Never leaves a
-/// half-written file behind a crash.
+/// Replace `leases.tsv` atomically, so a crash leaves no half-written file.
 pub fn write_leases(dir: &Path, slots: &[PersistedSlot]) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let tmp = dir.join("leases.tsv.tmp");
@@ -132,16 +104,9 @@ pub fn write_leases(dir: &Path, slots: &[PersistedSlot]) -> std::io::Result<()> 
     fs::rename(&tmp, final_path)
 }
 
-/// Parse `leases.tsv`. Rows skip malformed lines (return partial list plus
-/// the count skipped — the caller decides whether that is fatal; restore
-/// semantics in the brief treat a malformed row as a bind failure, so the
-/// strictness lives in slot::LeaseTable::restore, not here).
+/// Parse `leases.tsv`: a malformed row is skipped and counted here, and the caller decides what that costs.
 #[allow(dead_code)] // B8 respawn-restore reader
-/// Atomically replace `upnp.tsv` (tmpfile + rename). The rename is what
-/// makes a record visible, so it happens only when the write did: renaming
-/// unconditionally published an empty tmpfile over a good table when the
-/// state directory was full, which is what a 0-byte `upnp.tsv` and a
-/// long-running daemon were, on the router, 2026-09-18.
+/// Replace `upnp.tsv` atomically, and only when the write succeeded: an unconditional rename published an empty file over a good table.
 pub fn write_entries(dir: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write;
     fs::create_dir_all(dir)?;
@@ -167,8 +132,7 @@ pub fn read_leases(dir: &Path) -> (Vec<PersistedSlot>, usize) {
             skipped += 1;
             continue;
         }
-        // Proto code is the appended column; rows without it are legacy
-        // UDP. A malformed proto column counts as a malformed row.
+        // The protocol code is the appended column, and a malformed one counts as a malformed row.
         let proto: u8 = match parts.get(8) {
             Some(p) => match p.parse::<u8>() {
                 Ok(v) if v == 17 || v == 6 => v,
@@ -222,9 +186,7 @@ mod tests {
 
     #[test]
     fn a_failed_entry_write_cannot_publish_an_empty_record() {
-        // The forced failure is a directory where the tmpfile belongs, so the
-        // create fails and the rename is never reached. The point is the
-        // property, not the errno: the table that was there stays there.
+        // A directory where the tmpfile belongs: the create fails, and the table that was there stays there.
         let d = tmpdir("entries");
         fs::create_dir_all(&d).unwrap();
         let good = d.join("upnp.tsv");
@@ -300,10 +262,7 @@ mod tests {
 
     #[test]
     fn snapshot_projects_static_and_granted_exactly() {
-        // Regression (review S6): snapshot is the respawn-restore
-        // projection; a field dropped or mis-keyed in the Granted arm
-        // (kind flipped, client/int swapped, lifetime zeroed) would ship
-        // green and silently kill facade grants on the next respawn.
+        // A field dropped or mis-keyed in the granted arm would ship green and kill facade grants on the next restart.
         let now = 1_800_000_000u64;
         let slots = [
             crate::slot::Slot {
@@ -344,8 +303,7 @@ mod tests {
         assert_eq!(p[1].granted_lifetime, 3600);
         assert_eq!(p[1].expires_at_unix, now + 3600);
         assert_eq!(p[1].proto, 6);
-        // the TSV round-trip recovers the granted row for main's kind==1
-        // restore filter
+        // The round trip recovers the granted row for the restore filter.
         let d = tmpdir("snapshot");
         write_leases(&d, &[p[1].clone()]).unwrap();
         let (got, skipped) = read_leases(&d);
@@ -376,11 +334,7 @@ mod tests {
 
     #[test]
     fn tsv_output_is_permutation_invariant() {
-        // Deterministic serialization: caller order must not change the
-        // bytes on disk (rows sort by bind_port). This is the property a
-        // future Kani harness would prove, but `format!`/String equality
-        // stall the solver — same class as forward.rs's FFI; kept as a
-        // unit test instead (recorded in the brief's Kani non-goals).
+        // Caller order must not change the bytes on disk; a Kani harness would prove it, and `format!` stalls the solver.
         let mk = |bind_port: u16, kind: u8| PersistedSlot {
             bind_port,
             proto: 17,
