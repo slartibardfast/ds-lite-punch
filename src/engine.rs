@@ -1,39 +1,4 @@
-//! Observation refresh engine (brief v2, Phase G — G3–G5 runtime).
-//!
-//! One tokio task per refreshed flow, mirroring `run_slot` (same one-poll-loop
-//! shape, tokio DECIDED): the engine's 2 s tick drives *lifecycle* (claim /
-//! budget / exit) from the selected `Cdc` backend; each claimed flow gets a
-//! spawned task owning its shadow socket — keepalive tick + recv loop in the
-//! task, decisions in the engine.
-//!
-//! Refresh sequence (G3, exact order):
-//!   (b) bind shadow socket (NAT addr, R_nat) — C5 PASS, shadow-bind proven;
-//!   (c) install the SELF-PIN `(NAT, R_nat) -> (NAT, R_nat)` — the shadow
-//!       keepalive flows must egress as `(NAT, R_nat)` to refresh the
-//!       observed AFTR mapping. Without it the kernel NAPT's them to a
-//!       fresh ephemeral port the moment the observed conntrack entry lives
-//!       (measured 41077 → 1024 on-box 2026-09-02) and the refresh targets
-//!       the WRONG mapping. An explicit (addr, port) snat via the map
-//!       bypasses that remap; the entry-delete alternative was bisected
-//!       (CT_DELETE, all encodings) and rejected EINVAL by this 6.12
-//!       ImmortalWrt kernel — see ct.rs;
-//!   (d) add pin element (host, host_port) → R_nat — host wake-up flows
-//!       reach the same AFTR inner tuple;
-//!   (e) input accept for R_nat (B4-parallel — a promotion datagram is a
-//!       NEW inbound flow fw4's `ct state established` won't cover);
-//!   (f) STUN keepalive from the shadow socket every tick — EIM refreshes
-//!       the flow's mapping, the peer receives nothing;
-//!   (g) record the flow's XOR-MAPPED-ADDRESS on any STUN reply (free
-//!       per-flow observability);
-//!   (h) inbound datagram → forward P1-style to (host, host_port) with the
-//!       peer source preserved — G4 promotion; conntrack never touched.
-//!
-//! Exit (G5): the inner tuple got claimed by a static/lease slot (I1 —
-//! instant teardown) | the entry is absent from the CDC for `grace_ticks`
-//! AND no inbound for `grace_ticks` (flow presumed dead). On exit: stop the
-//! task (socket closes), delete the pin element, drop the record. (Pin
-//! deletion can change the console's external tuple — acceptable only at
-//! exit, flow presumed dead.)
+//! The observation refresh engine: it claims flows, spawns a shadow keepalive per flow, and releases them.
 use crate::cdc::Cdc;
 use crate::forward;
 use crate::nft;
@@ -49,26 +14,23 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use crate::publish::{emiteln};
 
-/// Engine interval. 2 s « 5–10 s AFTR TTL (I3).
+/// Engine interval: 2 s, well under the AFTR's 5 to 10 s idle timeout.
 pub const TICK: Duration = Duration::from_secs(2);
-/// G5 grace in ticks: entry gone from the CDC ∧ no inbound for this long →
-/// flow presumed dead. Default 3 ticks (~6 s after the conntrack entry died,
-/// which itself lags host silence by the kernel UDP timeouts).
+/// Ticks an entry must be missing from the CDC with no inbound before the flow is presumed dead.
 pub const DEFAULT_GRACE_TICKS: u32 = 3;
 
-/// G5 exit reasons — Copy enum (Kani-friendly).
+/// Why a flow's keepalive ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitReason {
-    /// A static/lease slot claims the inner tuple (I1).
+    /// A static or lease slot has claimed the inner tuple.
     OwnedBySlot,
-    /// Entry gone from the CDC and no inbound within grace — flow dead.
+    /// The entry is gone from the CDC with no inbound within the grace: the flow is dead.
     Stale,
-    /// The device itself stopped answering on the LAN (call/0029): a keepalive
-    /// for a device that is off or asleep releases nothing anyone uses.
+    /// The device stopped answering on the LAN, so a keepalive releases nothing anyone uses.
     DeviceGone,
 }
 
-/// I1 + G2 budget gate before claiming a candidate. Pure; Kani-proven.
+/// The claim gate: never an owned tuple, and never past the refresh budget.
 pub fn claim_allowed(
     bind: (Ipv4Addr, u16),
     owned: &[(Ipv4Addr, u16)],
@@ -78,7 +40,7 @@ pub fn claim_allowed(
     !owned.contains(&bind) && (active as u64) < (max_refresh_attempts as u64)
 }
 
-/// G5 exit decision. Pure; Kani-proven (the exit state machine).
+/// The exit decision from the missing-tick and silence counters.
 pub fn exit_due(
     missing_ticks: u32,
     grace_ticks: u32,
@@ -94,15 +56,11 @@ pub fn exit_due(
     None
 }
 
-/// Pin/unpin + forward-path accept operations — real impl drives nft; tests
-/// inject no-ops. The accept is B4-parallel: inbound to a refreshed tuple that
-/// is NOT part of an established flow (the promotion datagram) would be
-/// rejected by fw4's `ct state established` input policy without a per-port
-/// accept (slot accepts exist the same way; observation shadows install
-/// theirs per claim).
+/// The pin, unpin and accept operations a claim performs; tests inject no-ops.
 pub trait PinOps: Send + Sync {
     fn add(&self, host: Ipv4Addr, host_port: u16, r: u16) -> std::io::Result<()>;
     fn del(&self, host: Ipv4Addr, host_port: u16);
+    /// Per-port input accept: fw4 would drop an inbound datagram that no established flow covers.
     fn accept(&self, r: u16) -> std::io::Result<()>;
     fn unaccept(&self, r: u16);
 }
@@ -110,19 +68,11 @@ pub trait PinOps: Send + Sync {
 pub struct NftPins;
 
 impl PinOps for NftPins {
-    /// Pin the shadow's own egress, never the device's key. The shadow binds
-    /// the device's tuple, so what it needs is for its own keepalives to
-    /// leave as that tuple: a pin on the *device's* (client, port) key would
-    /// instead drag the device's own traffic onto our port, and a console
-    /// whose game flows then egress on two different external tuples is
-    /// scored Strict or Moderate. call/0014 settled this, and the port a
-    /// device keeps by preservation is the tuple the shadow mirrors.
+    /// Installs only the shadow's self-pin; the device's own pin is a separate call.
     fn add(&self, _host: Ipv4Addr, _host_port: u16, r: u16) -> std::io::Result<()> {
         nft::add_pin(nft::NAT_ADDR, r, r)
     }
-    /// Only ever a self-pin. A device-key element is not ours to remove with
-    /// the tuple gone; those are cleaned once by hand when the arm stops
-    /// installing them.
+    /// Removes a self-pin only, guarded by the NAT address; a device-key element is not ours to take away.
     fn del(&self, host: Ipv4Addr, host_port: u16) {
         if host == nft::NAT_ADDR {
             let _ = nft::del_pin(host, host_port);
@@ -142,20 +92,13 @@ struct ObsSlot {
     host_port: u16,
     bind_tuple: (Ipv4Addr, u16),
     external: Option<(Ipv4Addr, u16)>,
-    /// The per-flow vote, so the report carries the decision the daemon
-    /// actually made rather than only the tuple it learned. The shadow keeps
-    /// one server (concurrent flows from one source port are NAPT'd
-    /// elsewhere), so a lone report can only be Stable or the first Churn.
+    /// The per-flow vote, so the report carries the decision as well as the learned tuple.
     vote: Arc<Mutex<VoteState>>,
     /// Wall-clock second this flow was last seen live.
     last_seen_unix: u64,
-    /// The device's own packet count for this tuple, as the connection table
-    /// last reported it. Our own writes are not the device's, and they are
-    /// what used to keep this arm believing a flow was alive: the delta over
-    /// this counter is the liveness signal that cannot be self-fulfilled.
+    /// The device's own packet count for this tuple, as the connection table last reported it.
     dev_pkts: u64,
-    /// Consecutive ticks with neither the device nor a peer touching the
-    /// tuple.
+    /// Consecutive ticks with neither the device nor a peer touching the tuple.
     quiet_ticks: u32,
     /// Consecutive failed LAN probes for this slot's device.
     dev_misses: u8,
@@ -177,22 +120,13 @@ pub struct ObservationEngine {
     publisher: Arc<Publisher>,
     pins: Arc<dyn PinOps>,
     slots: Vec<ObsSlot>,
-    /// The devices this arm may act for (call/0025): the allowlist is
-    /// admission for maintenance, and everything outside it is untouched.
-    /// Set by the daemon from its configuration; empty leaves the arm the
-    /// admission it already had.
+    /// The devices this arm may act for; an empty list leaves it the admission it already had.
     pub allow: Vec<Ipv4Addr>,
-    /// Whether the arm holds (claims, keeps alive, promotes) or only reports.
-    /// The log-only stage is how the allowlist is read against the AFTR's
-    /// real behaviour before a device's mapping is kept alive.
+    /// Whether the arm holds and promotes, or only reports.
     pub hold: bool,
-    /// Tuples already reported in log-only mode, so the line appears once per
-    /// flow rather than once per tick.
+    /// Tuples already reported in log-only mode, so the line appears once per flow rather than per tick.
     reported: std::collections::HashSet<(Ipv4Addr, u16)>,
-    /// The lease table, when this arm runs beside the facade: the tuples an
-    /// allocation holds, read live. The frozen list a start-up snapshot gives
-    /// cannot see a grant that happened since, and a slot's tuple is not this
-    /// arm's to capture (call/0027 R1).
+    /// The live lease table, when this arm runs beside the facade: the tuples an allocation holds, read live.
     pub alloc: Option<Arc<Mutex<LeaseTable>>>,
     /// The address the slots bind, so their tuples can be named.
     pub bind_ip: Ipv4Addr,
@@ -202,10 +136,7 @@ pub struct ObservationEngine {
     probe_cursor: usize,
     /// The per-device hold cap.
     per_host: u32,
-    /// Candidates not yet kept alive, with the device's last packet count and how
-    /// many ticks it has been quiet. A flow is claimed when it has been quiet
-    /// long enough to need us, which is what keeps a device's capacity for
-    /// the mappings that matter.
+    /// Candidates not yet held, with the device's last packet count and its quiet ticks.
     young: std::collections::HashMap<(Ipv4Addr, u16), (u64, u32)>,
 }
 
@@ -254,8 +185,7 @@ impl ObservationEngine {
         }
     }
 
-    /// The tuples an allocation holds right now: the static snapshot plus
-    /// whatever the lease table has granted since (call/0027 R1).
+    /// The tuples an allocation holds now: the static snapshot plus any grant made since.
     async fn owned_now(&self) -> Vec<(Ipv4Addr, u16)> {
         let mut owned = self.owned.clone();
         if let Some(t) = &self.alloc {
@@ -270,10 +200,7 @@ impl ObservationEngine {
         let owned = self.owned_now().await;
         let live: Vec<crate::cdc::Candidate> = self.cdc.tick();
 
-        // The admission (call/0025): a configured allowlist narrows this arm
-        // to the named devices, and an empty one leaves it the admission it
-        // already had (the G2 predicate in cdc.rs), so a deployment that
-        // never names a device keeps the behaviour it was verified with.
+        // An empty allowlist keeps the predicate's admission; a set one narrows the arm to the named devices.
         let live: Vec<crate::cdc::Candidate> = if self.allow.is_empty() {
             live
         } else {
@@ -285,12 +212,10 @@ impl ObservationEngine {
             self.report_only(&live);
             return;
         }
-        // The report set follows the live set in either mode, so a tuple that
-        // is long gone cannot keep its place in it.
+        // The report set follows the live set in either mode, so a gone tuple keeps no place in it.
         self.reported.retain(|t| live.iter().any(|c| c.bind_tuple == *t));
 
-        // Per-slot bookkeeping: an entry reported by the CDC resets its miss
-        // counter; a task inbound (counter change) resets inbound silence.
+        // Per-slot bookkeeping: a CDC entry resets the miss counter, and an inbound change resets silence.
         for s in self.slots.iter_mut() {
             s.missing_ticks = if live.iter().any(|c| c.bind_tuple == s.bind_tuple) {
                 0
@@ -304,17 +229,14 @@ impl ObservationEngine {
             } else {
                 s.ticks_since_inbound = s.ticks_since_inbound.saturating_add(1);
             }
-            // G3e: once the shadow socket sees a STUN reply, record the
-            // flow's live external tuple.
+            // Once the shadow sees a STUN reply, record the flow's live external tuple.
             if live.iter().any(|c| c.bind_tuple == s.bind_tuple) {
                 s.last_seen_unix = unix_now();
             }
             let seen = *s.external_arc.lock().await;
             if let Some(t) = observe_report(s.external, seen) {
                 s.external = Some(t);
-                // The decision the flow's own vote made, reported beside the
-                // tuple it learned, so the log and the client's view cannot
-                // disagree about what happened.
+                // Report the vote's decision beside the tuple it learned, so the two cannot disagree.
                 let decision = s.vote.lock().await.observe(0, t);
                 self.publisher.log_transition(
                     "observed-tuple",
@@ -323,7 +245,7 @@ impl ObservationEngine {
             }
         }
 
-        // Claims (G3): fresh candidates only, through the I1 + budget gate.
+        // Claims: fresh candidates only, through the owned-tuple and budget gate.
         for c in &live {
             if self.slots.iter().any(|s| s.bind_tuple == c.bind_tuple) {
                 continue; // already refreshed
@@ -334,7 +256,7 @@ impl ObservationEngine {
                 .copied()
                 .unwrap_or((c.host_port as u64, 0));
             if quiet < KEEPALIVE_AFTER_TICKS {
-                // the device is still refreshing this flow: it needs nothing
+                // the device is still refreshing this flow, so it needs nothing
                 continue;
             }
             if !host_budget_ok(c.host, &self.slots, self.per_host) {
@@ -342,10 +264,7 @@ impl ObservationEngine {
                 continue;
             }
             if !claim_allowed(c.bind_tuple, &owned, self.slots.len(), self.max_refresh_attempts) {
-                // R5: a tuple a slot holds is refused rather than captured,
-                // and the refusal is reported. A device's flow on a slot's
-                // tuple is the late collision (call/0028), and the log is
-                // where it becomes visible; the device keeps the inbound.
+                // A tuple a slot holds is refused rather than captured, and the refusal is reported.
                 if owned.contains(&c.bind_tuple) && self.reported.insert(c.bind_tuple) {
                     self.publisher.log_transition(
                         "collision-reported",
@@ -365,9 +284,7 @@ impl ObservationEngine {
                     continue;
                 }
             };
-            // G3(c): self-pin — the shadow's keepalive traffic must egress
-            // as (NAT, R_nat) or the kernel NAPT's it elsewhere and the
-            // refresh targets the wrong mapping (measured 41077 → 1024).
+            // Self-pin: the keepalive must egress as (NAT, R_nat), or the kernel NAPT's it elsewhere.
             if let Err(e) = self.pins.add(c.bind_tuple.0, c.bind_tuple.1, c.bind_tuple.1) {
                 emiteln!("warn: shadow self-pin {} failed: {}", c.bind_tuple.1, e);
                 drop(sock);
@@ -433,15 +350,9 @@ impl ObservationEngine {
             });
         }
 
-        // Liveness pass: what keeps a keepalive alive is the device or a peer,
-        // never our own writes. The device's own packet count comes from the
-        // connection table (our egress appears there with the NAT address as
-        // its origin, so it cannot be mistaken for the device's), and a peer
-        // probe is what the shadow timestamps as inbound.
+        // Liveness pass: only the device's packets or a peer's inbound keep a hold alive, never our writes.
         self.ticks += 1;
-        // Age the young: a candidate's own device packets reset its quiet
-        // count, so only a flow the device has stopped refreshing becomes a
-        // hold candidate.
+        // Age the young: the device's packets reset quiet, so only a flow it stopped refreshing is held.
         if !live.is_empty() {
             let proc_text = std::fs::read_to_string("/proc/net/nf_conntrack").ok();
             for c in live.iter() {
@@ -478,8 +389,7 @@ impl ObservationEngine {
                     s.quiet_ticks = s.quiet_ticks.saturating_add(1);
                 }
             }
-            // One device probe per throttle window, round robin across the
-            // holds so a tick never blocks on more than one ping.
+            // One device probe per throttle window, round robin, so a tick never blocks on two.
             if self.ticks % PROBE_EVERY_TICKS == 0 {
                 if self.probe_cursor >= self.slots.len() {
                     self.probe_cursor = 0;
@@ -500,8 +410,7 @@ impl ObservationEngine {
             }
         }
 
-        // Exit pass (G5). Held-by-slot is instant (I1); stale needs the
-        // entry gone ∧ no inbound, both past grace.
+        // Exit pass: held-by-slot is instant, and stale needs the entry gone and no inbound, both past grace.
         let mut i = 0;
         while i < self.slots.len() {
             let (t, missing, since_inbound, stop) = {
@@ -547,10 +456,7 @@ impl ObservationEngine {
     }
 }
 
-/// Whether a flow's observation is worth reporting, and with which tuple:
-/// the first look, or a tuple that has moved since the last one. The daemon
-/// reports the tuple as often as it changes, so a re-key appears in the log
-/// beside its decision rather than being invisible (#snoop, call/0027 R5).
+/// Whether the observed tuple is worth reporting: the first look, or a tuple that has moved.
 fn observe_report(
     prev: Option<(Ipv4Addr, u16)>,
     now: Option<(Ipv4Addr, u16)>,
@@ -561,28 +467,16 @@ fn observe_report(
     }
 }
 
-/// A candidate is claimed only once its device has been quiet this long: a
-/// flow the device is refreshing needs nothing from us, and claiming it would
-/// spend the device's own capacity on churn (call/0029). Five to ten seconds
-/// is well inside the uplink's measured reaping window, so the keepalive starts
-/// before the mapping can lapse.
+/// Ticks a flow must be quiet before it is held, so one the device still refreshes is never claimed.
 const KEEPALIVE_AFTER_TICKS: u32 = 3;
-/// A hold is released when both sides have left it alone this long. Generous
-/// on purpose: a lobby is silence, and silence is what the keepalive is for, so
-/// this is a backstop behind the device-presence probe rather than a
-/// liveness rule.
+/// Ticks both sides must leave a hold alone before the backstop releases it.
 const LONG_QUIET_TICKS: u32 = 150;
 /// Consecutive failed LAN probes before a keepalive is released as abandoned.
 const DEV_MISSES_TO_RELEASE: u8 = 3;
-/// Probe one slot's device every this many ticks, so the tick never blocks
-/// on more than one probe.
+/// Probe one slot's device every this many ticks, so a tick blocks on one probe at most.
 const PROBE_EVERY_TICKS: u64 = 3;
 
-/// The one place a keepalive's end is decided. A keepalive yields to a slot, ends when
-/// its device stops answering on the LAN, and otherwise ends only when both
-/// sides have left the tuple alone for the long window: going quiet is what a
-/// hold is for, so quiet is never by itself a reason to release one
-/// (call/0029). Pure, so the policy is testable without a clock.
+/// The one place a keepalive's end is decided; pure, so the policy is testable without a clock.
 fn release_reason(
     owned_now: bool,
     misses: u8,
@@ -604,13 +498,7 @@ fn release_reason(
     }
 }
 
-/// The device's own packet count for a tuple: the connection table's entries
-/// whose NAT side is that tuple and whose origin is the device. A game
-/// talking to several peers is several entries on one tuple, so this is a
-/// sum, and our own writes to the same tuple carry the NAT address as their
-/// origin and are therefore counted out. That exclusion is the whole point:
-/// a liveness signal our own keepalives can satisfy proves nothing
-/// (call/0029).
+/// Sums the table entries on a tuple whose origin is the device, so our own writes cannot vouch for liveness.
 fn device_packets(proc_text: &str, bind: (Ipv4Addr, u16), host: Ipv4Addr) -> u64 {
     proc_text
         .lines()
@@ -620,16 +508,13 @@ fn device_packets(proc_text: &str, bind: (Ipv4Addr, u16), host: Ipv4Addr) -> u64
         .sum()
 }
 
-/// Per-device budget: one device's churn must not spend another's capacity.
-/// Pure; the caller passes the keepalives grouped by host.
+/// A device's own hold budget: one device's churn cannot spend another's capacity.
 fn host_budget_ok(host: Ipv4Addr, slots: &[ObsSlot], per_host: u32) -> bool {
     let mine = slots.iter().filter(|s| s.host == host).count() as u64;
     mine < per_host as u64
 }
 
-/// The log-only stage: report every named device's live flow once, and touch
-/// nothing. It exists so the allowlist can be read against the AFTR's real
-/// behaviour before any device is held (plan/0009's first rollout stage).
+/// The log-only stage: reports each named device's live flow once and touches nothing.
 impl ObservationEngine {
     fn report_only(&mut self, live: &[crate::cdc::Candidate]) {
         self.reported
@@ -648,10 +533,7 @@ impl ObservationEngine {
     }
 }
 
-/// The per-flow shadow task: keepalive every tick from the bound tuple
-/// (G3d — EIM refreshes the flow's mapping, peer sees nothing), inbound
-/// datagrams forwarded P1-style to the observed host:port (G4 promotion,
-/// source preserved, conntrack untouched).
+/// The per-flow shadow task: a keepalive each tick, and inbound datagrams forwarded to the host:port.
 fn spawn_shadow(
     sock: UdpSocket,
     host: Ipv4Addr,
@@ -674,10 +556,7 @@ fn spawn_shadow(
                         break;
                     }
                     if !servers.is_empty() {
-                        // Stick to one server (relay pattern): concurrent
-                        // flows from one source port get NAPT'd by the
-                        // kernel (measured 41077 → 1024), which would
-                        // refresh the wrong tuple. Rotate only on failure.
+                        // Stick to one server: a second flow from this port gets NAPT'd onto another tuple.
                         let server = servers[cursor % servers.len()];
                         let txn = stun::random_txn();
                         let req = stun::binding_request(&txn);
@@ -692,12 +571,12 @@ fn spawn_shadow(
                         let pkt = &buf[..n];
                         let SocketAddr::V4(v4) = src else { continue };
                         if servers.iter().any(|s| *s == v4) {
-                            // STUN reply → the flow's live external tuple.
+                            // a STUN reply carries the flow's live external tuple.
                             if let Some(t) = stun::parse_mapped(pkt) {
                                 *external.lock().await = Some(t);
                             }
                         } else {
-                            // Peer datagram → promotion (G4).
+                            // a peer datagram is promoted to the observed host:port.
                             match forward::forward(pkt, v4, target) {
                                 Ok(()) => {
                                     inbound_ts.store(unix_now(), Ordering::Relaxed);
@@ -751,10 +630,7 @@ mod tests {
         fn unaccept(&self, _r: u16) {}
     }
 
-    /// Tick until a candidate has been quiet long enough to keep alive: the arm
-    /// holds what a device has stopped refreshing, so a fresh flow needs a
-    /// few ticks before it is old enough, and a flow the device keeps
-    /// refreshing is never claimed at all.
+    /// Ticks until a candidate has been quiet long enough to be held.
     async fn age(e: &mut ObservationEngine, ticks: usize) {
         for _ in 0..ticks {
             e.tick().await;
@@ -782,15 +658,13 @@ mod tests {
         )
     }
 
-    // Loopback NAT for tests: the engine binds whatever the CDC reports
-    // (real CDC yields 192.168.0.21 — the hub-LAN NAT addr on-box).
+    // Loopback NAT for tests: the engine binds whatever the CDC reports.
     const LO: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
     const HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 21, 50);
 
     #[tokio::test]
     async fn claims_live_candidate_once() {
-        // distinct ports across tests: shadow tasks hold their sockets for
-        // the test's runtime, and cargo runs tests in parallel
+        // distinct ports per test: a shadow task holds its socket for the test's runtime.
         let c = cand((LO, 54322), HOST, 54322);
         let mut e = engine(Box::new(FakeCdc { cands: vec![c] }), Vec::new(), 8, 3);
         age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
@@ -819,10 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_quiet_hold_is_kept_not_released() {
-        // The rule this milestone changed: an entry gone from the change data
-        // capture with no inbound is what a lobby looks like, and it is the
-        // state a keepalive exists to survive. The old rule released on exactly
-        // those two counters.
+        // An entry gone from the CDC with no inbound is what a lobby looks like, so it is kept.
         let h = HOST;
         let mut e = engine(
             Box::new(FakeCdc { cands: vec![cand((LO, 54360), h, 54360)] }),
@@ -843,13 +714,9 @@ mod tests {
         assert_eq!(e.slots.len(), 1, "quiet is what the keepalive is for");
     }
 
-    // ---- the allowlist and the keepalive (call/0025, plan/0009 #snoop) ----
-
     #[tokio::test]
     async fn a_device_outside_the_allowlist_is_never_claimed() {
-        // The arm's whole point is that it acts for named devices only: a
-        // flow whose origin is not on the list is not held, however live it
-        // is, and no write is ever made for it.
+        // The arm acts for named devices only: a flow outside the list is not held, however live it is.
         let named = Ipv4Addr::new(192, 168, 21, 68);
         let other = Ipv4Addr::new(192, 168, 21, 59);
         let mut e = engine(Box::new(FakeCdc {
@@ -867,9 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_log_only_stage_holds_nothing() {
-        // plan/0009's first rollout stage: the arm reports what it would act
-        // on and touches nothing, so the log can be read against the AFTR's
-        // real behaviour before any device is held.
+        // Log-only: the arm reports what it would act on and touches nothing.
         let named = Ipv4Addr::new(192, 168, 21, 68);
         let mut e = engine(Box::new(FakeCdc {
             cands: vec![cand((LO, 54342), named, 54342)],
@@ -908,10 +773,7 @@ mod tests {
 
     #[test]
     fn a_quiet_hold_is_kept_and_a_gone_device_is_not() {
-        // Quiet is what a keepalive is for: neither the device nor a peer touching
-        // the tuple is the normal case for a lobby, and it must not end the
-        // hold. Only the device's disappearance, a slot's claim, or the long
-        // backstop does.
+        // Quiet is what a keepalive is for, so only a gone device, a slot's claim or the backstop ends it.
         let long = 150;
         assert_eq!(release_reason(false, 0, 5, 9, 9, long), None, "quiet is kept");
         assert_eq!(
@@ -947,8 +809,7 @@ mod tests {
         e.per_host = 1;
         age(&mut e, KEEPALIVE_AFTER_TICKS as usize + 1).await;
         assert_eq!(e.slots.len(), 1, "a lone flow from a named device is held");
-        // a second flow from the same device is refused by that device's own
-        // cap, which is the point: the churn cannot spend another's capacity
+        // a second flow from the same device is refused by that device's own cap
         let mut e2 = engine(
             Box::new(FakeCdc {
                 cands: vec![cand((LO, 54411), c, 54411), cand((LO, 54412), c, 54412)],
@@ -976,11 +837,7 @@ mod tests {
 
     #[test]
     fn a_report_is_per_observation_not_once_per_flow() {
-        // #snoop wants the learned tuple, the last-seen stamp and the
-        // decision per observation, so the log carries a flow's tuple
-        // history rather than only its first value. A re-key is the case
-        // that matters: the AFTR can move the tuple under a held flow, and a
-        // change that is not reported is what call/0027 R5 forbids.
+        // A re-key matters most: the AFTR can move the tuple under a held flow, so every change is reported.
         let a = ("203.0.113.1".parse().unwrap(), 40001);
         let b = ("203.0.113.1".parse().unwrap(), 40002);
         assert_eq!(observe_report(None, Some(a)), Some(a), "the first look is reported");
@@ -991,10 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_allocated_tuple_is_never_captured() {
-        // call/0027 R1 from this arm's side. The snapshot it starts with
-        // cannot see a grant that happened since, so the claim gate reads the
-        // live table: a slot's tuple belongs to the slot, and a shadow socket
-        // on it would be two local owners of one inner tuple.
+        // The claim gate reads the live table, so a slot's tuple never has two local owners.
         let c = Ipv4Addr::new(192, 168, 21, 68);
         let mut t = crate::slot::LeaseTable::new(
             crate::slot::PortAllocator::new(30000, 30009).unwrap(),

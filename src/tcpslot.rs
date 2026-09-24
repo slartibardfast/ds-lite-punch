@@ -1,4 +1,4 @@
-//! TCP slot datapath: the listener splices AFTR-forwarded connections, and a STUN-over-TCP link keeps the mapping alive.
+//! TCP slot datapath: the listener splices AFTR-forwarded connections, and a STUN link keeps the mapping.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};

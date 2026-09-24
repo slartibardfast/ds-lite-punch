@@ -225,7 +225,7 @@ pub fn brlan_ctx() -> ObsCtx<'static> {
 mod tests {
     use super::*;
 
-    // A br-lan container UDP flow egressing the VM line, as captured on the router.
+    // A br-lan container UDP flow egressing the VM line.
     const GOOD: &str = "ipv4     2 udp      17 56 src=192.168.21.10 dst=8.8.8.8 sport=54322 dport=53 packets=1 bytes=92 [UNREPLIED] src=8.8.8.8 dst=192.168.0.21 sport=53 dport=54322 packets=0 bytes=0 mark=0 zone=0 use=2";
 
     #[test]
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn scan_respects_global_budget() {
-        // two eligible lines but max_refresh_attempts=1 -> only the first is taken
+        // two eligible lines, but a budget of 1 takes only the first
         let good = replied_line();
         let mut ctx = brlan_ctx();
         ctx.max_refresh_attempts = 1;
@@ -385,8 +385,7 @@ mod verify {
     use super::*;
 
     fn any_entry() -> CtEntry {
-        // build an entry with symbolic UDP fields; a few fields pinned so
-        // the tree stays small
+        // Symbolic UDP fields, with the ports pinned to zero so the proof's tree stays small.
         CtEntry {
             proto: 17,
             timeout_left: kani::any(),
@@ -418,6 +417,7 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             owned: &OWNED,
+            allowed: &[],
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -435,6 +435,7 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             owned: &OWNED,
+            allowed: &[],
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -450,6 +451,7 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             owned: &OWNED,
+            allowed: &[],
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -466,6 +468,7 @@ mod verify {
             brlan: BR,
             vm_nat: NAT,
             owned: &OWNED,
+            allowed: &[],
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
@@ -474,13 +477,14 @@ mod verify {
     }
 
     #[kani::proof]
-    fn held_never_refreshed() {
+    fn owned_never_refreshed() {
         let e = any_entry();
         const OWNED1: [(Ipv4Addr, u16); 1] = [(NAT, 54322)];
         let ctx = ObsCtx {
             brlan: BR,
             vm_nat: NAT,
-            held: &OWNED1,
+            owned: &OWNED1,
+            allowed: &[],
             max_refresh_attempts: 8,
             refresh_attempts_so_far: 0,
         };
