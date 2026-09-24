@@ -150,6 +150,13 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len:
 
 // ---- the DP:1 datastructures (per the internalized spec) ----
 
+/// Strip the characters that would break a one-line record or a document: a
+/// name arrives from the wire, the store is one tab-separated line per entry,
+/// and the ACL document carries the same text.
+pub fn clean_name(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// One Identity in the ACL: a Control Point identity with its assigned
 /// roles (spec section 2.4.4 / 2.4.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,9 +270,9 @@ pub fn acl_xml(acl: &DpAcl) -> String {
     out.push_str("  <Identities>\n");
     for id in &acl.identities {
         out.push_str("    <User>\n");
-        out.push_str(&format!("      <Name>{}</Name>\n", id.name));
+        out.push_str(&format!("      <Name>{}</Name>\n", crate::upnpsvc::xml_escape(&id.name)));
         if let Some(alias) = &id.alias {
-            out.push_str(&format!("      <Alias>{}</Alias>\n", alias));
+            out.push_str(&format!("      <Alias>{}</Alias>\n", crate::upnpsvc::xml_escape(alias)));
         }
         out.push_str("      <RoleList>\n");
         for r in &id.roles {
@@ -284,7 +291,7 @@ pub fn identity_list_xml(acl: &DpAcl) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<IdentityList xmlns=\"urn:schemas-upnp-org:gw:DeviceProtection\">\n",
     );
     for id in &acl.identities {
-        out.push_str(&format!("  <Identity><Name>{}</Name></Identity>\n", id.name));
+        out.push_str(&format!("  <Identity><Name>{}</Name></Identity>\n", crate::upnpsvc::xml_escape(&id.name)));
     }
     out.push_str("</IdentityList>\n");
     out
@@ -624,6 +631,10 @@ impl DpState {
     pub fn add_identities(&mut self, incoming: &DpAcl) -> DpAcl {
         let mut added = DpAcl::default();
         for id in &incoming.identities {
+            let mut id = id.clone();
+            id.name = clean_name(&id.name);
+            id.alias = id.alias.as_deref().map(clean_name);
+            let id = &id;
             let present = self.acl.identities.iter().any(|x| {
                 (id.id != [0u8; 16] && x.id == id.id) || (id.name == x.name)
             });
@@ -650,6 +661,7 @@ impl DpState {
     /// associated with the user name ... is updated"). Returns false when
     /// the identity is entirely unknown (600 is the caller's choice).
     pub fn set_user_password(&mut self, name: &str, stored: [u8; 16], salt: [u8; 16]) -> bool {
+        let name = clean_name(name);
         match self.users.iter_mut().find(|u| u.name == name) {
             Some(u) => {
                 u.stored = stored;
@@ -917,6 +929,63 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name arrives from the wire, and the store is one tab-separated line per entry, so a tab or a newline in a name must not forge a row.
+    #[test]
+    fn a_name_cannot_forge_a_row_in_the_store() {
+        let forged = "ok\t-\t00000000000000000000000000000000\tAdmin\nA\tghost\t-\t11111111111111111111111111111111\tAdmin";
+        let mut state = DpState::default();
+        state.add_identities(&DpAcl {
+            identities: vec![DpIdentity {
+                name: forged.to_string(),
+                alias: None,
+                id: [0u8; 16],
+                roles: vec!["Basic".to_string()],
+            }],
+        });
+        let tsv = config_tsv(&state.users, &state.acl);
+        assert_eq!(
+            tsv.lines().count(),
+            1,
+            "one identity makes one row, whatever its name"
+        );
+        let (_, acl) = config_from_tsv(&tsv);
+        assert_eq!(
+            acl.identities.len(),
+            1,
+            "and the row reads back as that one identity"
+        );
+    }
+
+    /// The ACL document and the identity list carry a control point's own text, so the name and the alias are escaped there.
+    #[test]
+    fn a_name_with_markup_is_escaped_in_the_documents() {
+        let acl = DpAcl {
+            identities: vec![DpIdentity {
+                name: "<a&b>".to_string(),
+                alias: Some("\"q\"".to_string()),
+                id: [0u8; 16],
+                roles: vec!["Basic".to_string()],
+            }],
+        };
+        let doc = acl_xml(&acl);
+        assert!(
+            doc.contains("&lt;a&amp;b&gt;"),
+            "the name is escaped: {}",
+            doc
+        );
+        assert!(
+            doc.contains("&quot;q&quot;"),
+            "and the alias is too: {}",
+            doc
+        );
+        let list = identity_list_xml(&acl);
+        assert!(
+            list.contains("&lt;a&amp;b&gt;"),
+            "the identity list escapes it as well: {}",
+            list
+        );
+    }
 
     #[test]
     fn sha256_vectors() {

@@ -2674,7 +2674,8 @@ fn dp_identity_names(body: &[u8]) -> Vec<String> {
         let block = &body[block_start..block_start + end_rel];
         if let Some(name) = xml_tag(block, b"Name") {
             if let Ok(s) = std::str::from_utf8(name) {
-                out.push(s.trim().to_string());
+                // Cleaned here as well as in the store, so a name keys the same identity on every call.
+                out.push(crate::dp::clean_name(s.trim()));
             }
         }
         search_from = block_start + end_rel + b"</Identity>".len();
@@ -3111,10 +3112,10 @@ fn discovery_verdict(waited_s: u64, tuple_known: bool) -> Option<u8> {
     }
 }
 
-/// Escape the five XML metacharacters. Only the description needs it: the
-/// other emitted fields are numbers or a parsed address, while the
-/// description is arbitrary text a control point chose.
-fn xml_escape(s: &str) -> String {
+/// Escape the five XML metacharacters. Any field a control point chose needs
+/// it: a mapping description, and the DeviceProtection identity name, alias
+/// and role text.
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
