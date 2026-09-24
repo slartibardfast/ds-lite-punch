@@ -1,9 +1,4 @@
-//! Tuple publication: write the current external tuple to a state file and
-//! emit a JSON line (journald) on every change. Downstream (DDNS, dashboards)
-//! consumes the file; the daemon never blocks on consumers. When a watch
-//! sender is attached (UPnP facade mode), every published tuple also feeds
-//! the facade's external-IP state (E3 GetExternalIPAddress + E5 GENA
-//! events) — fire-and-forget: the facade runs with the latest value.
+//! Publish the learned external tuple to a state file, to a JSON line, and to the facade's watch when one is attached.
 use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,19 +7,12 @@ use std::net::Ipv4Addr;
 
 use tokio::sync::watch;
 
-/// Take a lock without letting a poisoned one take the process down. The
-/// daemon sets `panic = "abort"`, so a panic anywhere is fatal, and a
-/// `StdMutex` that a panicking thread held stays poisoned: `.unwrap()` would
-/// then abort the daemon on the next request. A failed write must never do
-/// that (call/0029), and neither must the lock around the state it writes.
+/// Take a lock that may be poisoned, which `panic = "abort"` would otherwise turn into an abort on the next request.
 pub fn lock_or_recover<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Print a line without letting a failed write take the process down.
-/// `println!` panics when stdout is a broken pipe, and this daemon's stdout is
-/// a procd pipe; with `panic = "abort"` set that panic is fatal. Every line
-/// this daemon emits goes through here (call/0029).
+/// Print a line with a write that may fail: `println!` panics on a broken pipe, and `panic = "abort"` makes that fatal.
 macro_rules! emitln {
     ($($t:tt)*) => {{
         use std::io::Write as _;
@@ -45,14 +33,9 @@ pub(crate) use {emiteln, emitln};
 pub struct Publisher {
     dir: String,
     ip_watch: Option<watch::Sender<Ipv4Addr>>,
-    /// The learned tuples, held in memory. The file is the record, but a
-    /// state directory that cannot be written (a full tmpfs, a read-only
-    /// mount) must not cost the daemon its knowledge of its own mappings:
-    /// PCP answers a slot from here, and the file is only how a *restored*
-    /// slot's tuple is read back after a restart.
+    /// The learned tuples in memory, so a state directory that refuses a write costs no knowledge.
     slots: StdMutex<HashMap<u16, (Ipv4Addr, u16)>>,
-    /// Whether the state directory last refused a write, so the report is a
-    /// transition rather than a line per packet.
+    /// Whether the state directory last refused a write, so the report is a transition.
     dir_failed: AtomicBool,
 }
 
@@ -74,14 +57,10 @@ impl Publisher {
         emitln!("{{\"event\":\"tuple\",\"ip\":\"{}\",\"port\":{}}}", ip, port);
     }
 
-    /// Per-slot tuple file (B6/B8): `tuple-<R>` alongside the aggregate
-    /// `tuple` file (last writer). Respawn restore reads `tuple-<R>` per
-    /// slot; existing consumers keep reading `tuple` unchanged. The facade
-    /// watch mirrors the same value for the SOAP/GENA layers.
+    /// Write `tuple-<R>` beside the aggregate `tuple` file, and mirror the value to the facade's watch.
     pub fn publish_slot(&self, bind_port: u16, ip: Ipv4Addr, port: u16) {
         let path = format!("{}/tuple-{}", self.dir, bind_port);
-        // memory first: the answer a client gets must not depend on the
-        // state directory accepting a write
+        // The answer a client gets must not depend on the state directory accepting a write.
         lock_or_recover(&self.slots).insert(bind_port, (ip, port));
         let w = fs::write(&path, format!("{}:{}\n", ip, port));
         self.note_write(&format!("tuple-{}", bind_port), w);
@@ -95,9 +74,7 @@ impl Publisher {
         }
     }
 
-    /// The tuple a slot's discovery learned: memory first, because that is
-    /// the live answer, then the file, which is how a restored slot's tuple
-    /// comes back after a restart.
+    /// The tuple a slot's discovery learned: memory first, then the file a restart restores it from.
     pub fn slot_tuple(&self, bind_port: u16) -> Option<(Ipv4Addr, u16)> {
         if let Some(t) = lock_or_recover(&self.slots).get(&bind_port) {
             return Some(*t);
@@ -107,10 +84,7 @@ impl Publisher {
         Some((ip.parse().ok()?, port.parse().ok()?))
     }
 
-    /// Report a write into the state directory as a transition: the first
-    /// failure says so, and the first success after it says so too. The
-    /// tables and the tuples live in memory either way, so what this reports
-    /// is that the record on disk has stopped keeping up.
+    /// Report a write into the state directory as a transition, since the tables are in memory either way.
     pub fn note_write(&self, what: &str, r: std::io::Result<()>) {
         match r {
             Ok(()) => {
@@ -129,11 +103,7 @@ impl Publisher {
         }
     }
 
-    /// A mapping's tuple file goes when the mapping does. The file is the
-    /// *learned* tuple, so one that outlives its mapping is a lie a client can
-    /// act on: a later mapping that takes the same bind port would be
-    /// answered with the dead port. The box found this on 2026-09-17, with
-    /// three revoked slots still carrying their old tuples.
+    /// Remove a mapping's tuple file with it: a file that outlives its mapping answers a later mapping with a dead port.
     pub fn remove_slot(&self, bind_port: u16) {
         lock_or_recover(&self.slots).remove(&bind_port);
         let _ = fs::remove_file(format!("{}/tuple-{}", self.dir, bind_port));
@@ -149,13 +119,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// The fallback the daemon needs when its state directory will not take a
-    /// write: the tuple a client is answered with comes from memory.
+    /// The tuple a client is answered with comes from memory when the directory refuses a write.
     #[test]
     fn a_learned_tuple_is_served_when_the_file_cannot_be_written() {
-        // A regular file where the directory would be: create_dir_all cannot
-        // make it and every write fails with ENOTDIR, which is the shape a
-        // full tmpfs presents to the daemon.
+        // A regular file where the directory would be: every write fails with ENOTDIR, as a full tmpfs does.
         let blocker = std::env::temp_dir().join(format!("dslp-blocker-{}", std::process::id()));
         let _ = fs::remove_file(&blocker);
         fs::write(&blocker, "not a directory\n").unwrap();
@@ -174,11 +141,7 @@ mod tests {
         assert_eq!(p.slot_tuple(30001), None);
     }
 
-    /// A poisoned lock must not take the daemon down. `panic = "abort"` makes
-    /// any panic fatal, and a `StdMutex` a panicking thread held stays
-    /// poisoned, so `.unwrap()` on it would abort the daemon on the next
-    /// request — a failed write bringing the service down by construction is
-    /// what this rules out (call/0029).
+    /// A poisoned lock must not take the daemon down: `panic = "abort"` would make `.unwrap()` fatal.
     #[test]
     fn a_poisoned_lock_is_recovered_not_fatal() {
         let m = Arc::new(StdMutex::new(7u32));
@@ -192,8 +155,7 @@ mod tests {
         assert_eq!(*lock_or_recover(&m), 7, "the value survives and the lock is taken");
     }
 
-    /// A restored slot's tuple is the one case the file is the source, since
-    /// memory starts empty after a restart.
+    /// A restored slot's tuple is the one case the file is the source, since memory starts empty.
     #[test]
     fn a_restored_slots_tuple_is_read_from_the_file() {
         let dir = std::env::temp_dir().join(format!("dslp-pubfile-{}", std::process::id()));
