@@ -1716,8 +1716,7 @@ mod verify {
 
     #[kani::proof]
     fn action_name_roundtrip() {
-        // Dispatch completeness: every action's wire name parses back to
-        // the same action (the dispatch table is total over the enum).
+        // Round trip for the seven actions named here; the table holds 28, so this covers a quarter of it.
         for a in [
             SoapAction::GetExternalIpAddress,
             SoapAction::GetStatusInfo,
