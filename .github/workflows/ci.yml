@@ -100,6 +100,10 @@ jobs:
             echo "::error::groff reports the manual page"
             exit 1
           fi
+      - name: Every comment run is one line
+        # Non-blocking while the corpus converges; call/0037 carries the rule, and this becomes blocking at zero.
+        continue-on-error: true
+        run: python3 tools/comment-lint.py
       - name: Every relative link in the authored docs resolves
         run: sh tools/link-check.sh
       - name: The authored docs carry no prose tropes
