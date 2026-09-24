@@ -1,12 +1,4 @@
-# The component's own lane.
-#
-# The host's Reproducible build workflow rebuilds from the pin inside a
-# digest-pinned container and compares the result with the hash recorded in
-# `.host-software`. This lane runs the same recipe the same way, with the same
-# image and the same /src mount, so that a hash printed here is a hash the host
-# will reproduce rather than a second opinion about a different build. It is
-# also where that hash comes from when the record has to be re-derived, which
-# is the difference between a recorded anchor and an asserted one.
+# Runs the host's recorded build recipe verbatim, with the same image and /src mount, so a hash printed here is the hash the host re-derives from the pin.
 name: CI
 
 on:
@@ -16,16 +8,12 @@ on:
   schedule:
     - cron: "23 6 * * 1" # weekly, so drift finds us before a release does
 
-# A stranger's pull request runs these jobs. The default token is read-only for
-# a public repository, and saying so here keeps that true if the setting ever
-# changes: nothing in this lane needs to write.
+# A stranger's pull request runs these jobs, and nothing in this lane needs to write.
 permissions:
   contents: read
 
 env:
-  # One definition of the toolchain, by digest. The same value is what the host
-  # records in `.host-software`; a tag would be movable and a moved toolchain
-  # silently invalidates every hash ever recorded under it.
+  # Pinned by digest, and the host records this same value: a moved tag would invalidate every hash ever recorded under it.
   TOOLCHAIN: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
   ARTIFACT: target/x86_64-unknown-linux-musl/release/ds-lite-punch
 
@@ -34,12 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # The crate's .cargo/config.toml targets musl for every cargo command, so
-      # the tests are built, and their static binaries run, inside the same
-      # pinned toolchain the artifact is built in. A runner-side rustup would
-      # be a second compiler: the profile carries lto, codegen-units=1 and
-      # strip, so a debug-profile or foreign-toolchain pass would test a
-      # different program than the one that ships.
+      # The crate's .cargo/config.toml targets musl for every cargo command, so this builds and runs in the same pinned toolchain the artifact ships from.
       - name: Build and test in the pinned toolchain
         run: |
           docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
@@ -53,16 +36,11 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
             sh -c 'cargo build --release --locked --target x86_64-unknown-linux-musl'
-      # The hash is the point of this job. It is printed in the form the host's
-      # record uses, so re-deriving the anchor is a copy rather than a
-      # transcription.
+      # Printed in the form `.host-software` records, so re-deriving the anchor is a copy rather than a transcription.
       - name: Print the artifact hash as `.host-software` records it
         run: |
           printf 'artifact = %s %s\n' "$ARTIFACT" "$(sha256sum "$ARTIFACT" | cut -d' ' -f1)" | tee artifact-record.txt
-      # The artifact leaves the job with its hash, so what ships can be the
-      # bytes GitHub built rather than a local build of the same source. With
-      # an upload that can silently produce nothing, absence would read as
-      # success, so a missing file fails the job.
+      # The artifact leaves the job with its hash, and a missing file fails the job, so absence cannot read as success.
       - name: Upload the artifact and the line that records it
         uses: actions/upload-artifact@v4
         with:
@@ -72,28 +50,19 @@ jobs:
             artifact-record.txt
           if-no-files-found: error
 
-  # The help text and the manual page are generated from one definition, and a
-  # file can leave that definition behind with no one noticing. This job holds
-  # the two generated artifacts to it, holds the manual page to the renderer,
-  # holds the authored docs' links, and holds their register.
+  # One definition generates the help text and the manual page, and this job regenerates both and holds them to it.
   docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: The generated help text and manual page match their definition
         run: |
-          # The generator is a dev tool and it builds for the host, not for the
-          # router. The crate tree's .cargo/config.toml sends every cargo
-          # command to musl, so the target is named here. Regenerate, then fail
-          # if either committed artifact moved: a hand-edited help text, or a
-          # flag added to the definition and not regenerated, is caught here.
+          # The generator builds for the host while the tree pins musl, so the target is named; regenerate and fail on any diff.
           cargo run --quiet --manifest-path tools/argdoc/Cargo.toml --target x86_64-unknown-linux-gnu
           git diff --exit-code -- src/help.txt deploy/man/ds-lite-punch.8
       - name: The manual page renders without a warning
         run: |
-          # groff writes a warning to stderr and still exits 0, so the check is
-          # that it has nothing to say. A macro it cannot read is caught the
-          # same way.
+          # groff writes a warning to stderr and still exits 0, so the check is a non-empty stderr file.
           groff -man -ww -Tascii deploy/man/ds-lite-punch.8 > /dev/null 2> groff.txt
           if [ -s groff.txt ]; then
             cat groff.txt
@@ -108,15 +77,7 @@ jobs:
         run: sh tools/link-check.sh
       - name: The authored docs carry no prose tropes
         run: |
-          # Pinned to the host-lint tag the host repository references, since
-          # this repository keeps no submodule for the tool. The audit reads
-          # what this repository tracks, and `.host-lintignore` names the two
-          # archived specification transcriptions, which are records of another
-          # document.
-          #
-          # Build it from /tmp: cargo finds its config from the working
-          # directory, and the component's .cargo/config.toml would otherwise
-          # aim this build at musl, which the runner has no linker for.
+          # Built from /tmp at the pinned tag, because cargo reads its config from the working directory and this tree pins musl.
           git clone --quiet --depth 1 --branch v0.22.0 \
             https://github.com/connollydavid/host-lint /tmp/host-lint
           (cd /tmp && cargo build --quiet --release --manifest-path /tmp/host-lint/Cargo.toml)

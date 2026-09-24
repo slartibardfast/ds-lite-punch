@@ -1,28 +1,10 @@
-//! argdoc — the CLI authoring tool for ds-lite-punch.
-//!
-//! One clap definition of the command line lives here, and two files come out
-//! of it: the help text the daemon prints (`src/help.txt`) and the manual page
-//! (`deploy/man/ds-lite-punch.8`). The manual's ENVIRONMENT, FILES, LOG EVENTS,
-//! LIMITS and SEE ALSO sections come from `src/man-sections.roff`, appended so
-//! that a regeneration keeps them.
-//!
-//! The daemon links nothing from here. `src/main.rs` carries the help text with
-//! `include_str!`, and a test in that crate compares this definition's flags
-//! with the ones the real parser accepts, which is what keeps the two in step.
-//!
-//! Run it with an explicit target, because the crate tree's `.cargo/config.toml`
-//! sends every cargo command to musl:
-//!
-//! ```text
-//! cargo run --manifest-path tools/argdoc/Cargo.toml --target x86_64-unknown-linux-gnu
-//! ```
+//! One clap definition writes the daemon's help text (`src/help.txt`) and the manual page, the daemon links none of it, and the tree pins musl so it takes an explicit host target: cargo run --manifest-path tools/argdoc/Cargo.toml --target x86_64-unknown-linux-gnu
 
 use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgAction, Command};
 
-/// The repository root, resolved from this crate's manifest directory so the
-/// tool can be run from anywhere.
+/// The repository root, resolved from this crate's manifest directory so the tool runs from anywhere.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -30,8 +12,7 @@ fn repo_root() -> PathBuf {
         .expect("resolve the repository root")
 }
 
-/// The shipping crate's version, read from its manifest so the help text, the
-/// manual page and `--version` cannot disagree with the artifact.
+/// The shipping crate's version, read from its manifest so the help text, the manual page and `--version` cannot disagree.
 fn crate_version(root: &Path) -> String {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
         .expect("read the shipping crate's manifest");
@@ -43,14 +24,11 @@ fn crate_version(root: &Path) -> String {
     panic!("no version line in the shipping crate's manifest");
 }
 
-/// The command line, mirrored flag for flag from `parse_args_from` in
-/// `src/main.rs`.
+/// The command line, mirrored flag for flag from `parse_args_from` in `src/main.rs`.
 fn cli(version: &str) -> Command {
     Command::new("ds-lite-punch")
         .version(version.to_string())
-        // The daemon prints this text itself, for `-h` and `--help` alike, so
-        // clap's own help flag would add a note about a short form that does
-        // not exist. The flag below takes its place.
+        // The daemon prints this text itself for `-h` and `--help`, so clap's help flag is disabled and the `help` arg below takes its place.
         .disable_help_flag(true)
         .override_usage(
             "ds-lite-punch --static-map R=ip:port [OPTIONS]\n       \
@@ -352,10 +330,7 @@ fn cli(version: &str) -> Command {
         )
 }
 
-/// clap_mangen renders `after_long_help` as an EXTRA section. The help text
-/// needs that block, because an operator reading `--help` wants the exit status
-/// and the pointer to the manual; the manual does not, because the authored
-/// sections below state the same things properly. Drop it.
+/// Drops the EXTRA section clap_mangen renders from `after_long_help`: the help text wants it, and the manual states the same content in its own sections.
 fn drop_extra(roff: &str) -> String {
     let mut out = String::with_capacity(roff.len());
     let mut skipping = false;
@@ -375,15 +350,10 @@ fn drop_extra(roff: &str) -> String {
     out
 }
 
-/// The name a reader sees in the header, which is neutral on purpose: a manual
-/// describes the program, and it names no audience.
+/// The manual name a reader sees in the header; it names no audience.
 const MANUAL_NAME: &str = "Manual";
 
-/// A man page's header centre is the *fifth* `.TH` field, which clap_mangen
-/// leaves out. Its manual name therefore sits in the fourth field, where a
-/// renderer's own table for the section wins, and the header reads "System
-/// Manager's Manual" whatever this file says. Move the name to the fifth field,
-/// which is the one the reader sees.
+/// A man page's header centre is the fifth `.TH` field, which clap_mangen leaves empty, so the name moves there from the fourth field, where a renderer's own table would win.
 fn manual_name_in_the_fifth_field(roff: &str, name: &str) -> String {
     let mut out = String::with_capacity(roff.len() + name.len() + 8);
     for line in roff.lines() {

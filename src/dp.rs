@@ -1,25 +1,4 @@
-//! DeviceProtection:1 service core (plan/0008 #v2-service-set).
-//!
-//! Pure, dependency-free implementation of the normative contract
-//! transcribed from the internalized specification
-//! (docs/upnp-dp1/UPnP-gw-DeviceProtection-V1-Service.md): the
-//! SupportedProtocols document (the mandated WPS introduction and
-//! PKCS5 login protocol names), the ACL / IdentityList / Identity
-//! datastructures, the challenge-response UserLogin ceremony, role
-//! management, and the authorization decision for protected actions.
-//!
-//! The PKCS5 ceremony per the spec (2.6.5.6 / 2.6.6.4): a device keeps,
-//! per user Name, a random 16-octet Salt and STORED = the first 128 bits
-//! of T1, where T1 is computed as PBKDF2 with PRF = HMAC-SHA-256,
-//! password = Password, salt = Name || Salt (both UTF-8), c = 5000
-//! iterations. GetUserLoginChallenge issues a fresh Challenge;
-//! UserLogin's Authenticator is the Base64 of the first 128 bits of
-//! HMAC-SHA-256(STORED, Challenge || DeviceID || ControlPointID). This
-//! module implements SHA-256, HMAC and PBKDF2 in pure Rust (the crate
-//! is dependency-free) with standard test vectors.
-//!
-//! Kani non-goal: the core is io-free and unit-tested; the vector
-//! pins below are the invariants the ceremony depends on.
+//! DeviceProtection:1 core: the PKCS5 ceremony, roles, and SHA-256/HMAC/PBKDF2 written in pure Rust.
 
 // ---- SHA-256 (FIPS 180-4) ----
 
@@ -148,17 +127,14 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len:
     out
 }
 
-// ---- the DP:1 datastructures (per the internalized spec) ----
+// ---- the DP:1 datastructures ----
 
-/// Strip the characters that would break a one-line record or a document: a
-/// name arrives from the wire, the store is one tab-separated line per entry,
-/// and the ACL document carries the same text.
+/// Strip control characters, so a name from the wire cannot forge a store row or break a document.
 pub fn clean_name(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// One Identity in the ACL: a Control Point identity with its assigned
-/// roles (spec section 2.4.4 / 2.4.5).
+/// One Identity in the ACL: a control point identity with its assigned roles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DpIdentity {
     /// the case-sensitive identity name (CP certificate CN)
@@ -171,35 +147,32 @@ pub struct DpIdentity {
     pub roles: Vec<String>,
 }
 
-/// A user login credential record: Salt + STORED (spec 2.6.5) plus the
-/// roles associated with the Name (spec 2.6.5.7: "the Roles associated
-/// with Name").
+/// A user credential record: Salt and STORED plus the roles associated with the Name.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DpUser {
     pub name: String,
     /// 16-octet random salt, per user
     pub salt: [u8; 16],
-    /// first 128 bits of T1 (PBKDF2-HMAC-SHA-256, spec 2.6.5.6)
+    /// first 128 bits of T1 (PBKDF2-HMAC-SHA-256)
     pub stored: [u8; 16],
     /// the roles assigned to this user Name
     pub roles: Vec<String>,
 }
 
-/// The ACL document (spec 2.4.4): identities and roles.
+/// The ACL document: identities and roles.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DpAcl {
     pub identities: Vec<DpIdentity>,
 }
 
-/// A pending login challenge (spec 2.6.5 / 2.6.6).
+/// A pending login challenge.
 #[derive(Clone, Debug)]
 pub struct DpChallenge {
     /// the fresh nonce a CP must authenticate against
     pub nonce: [u8; 16],
 }
 
-/// The set of roles a control point holds for an action (spec 3.1,
-/// "Determining Roles Required for Actions").
+/// The roles a control point holds for an action; Public needs none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DpAuthz {
     /// the action is public: no role required
@@ -208,8 +181,7 @@ pub enum DpAuthz {
     Roles(Vec<String>),
 }
 
-/// Evaluate an ACL for a control point identity presented by its
-/// 16-octet ID: the roles assigned to that identity.
+/// The roles the ACL assigns to the identity with this 16-octet ID.
 pub fn roles_for_identity(acl: &DpAcl, id: &[u8; 16]) -> Vec<String> {
     acl.identities
         .iter()
@@ -218,9 +190,7 @@ pub fn roles_for_identity(acl: &DpAcl, id: &[u8; 16]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The role hierarchy: a principal holding a higher role satisfies a
-/// requirement for any lower role (the spec's recurring "Basic or Admin"
-/// pair means Admin covers Basic). An unknown role satisfies nothing.
+/// A higher role satisfies a requirement for any lower one; an unknown role satisfies nothing.
 fn role_level(role: &str) -> Option<u8> {
     match role {
         "Basic" => Some(0),
@@ -237,11 +207,7 @@ fn role_satisfies(r: &str, n: &str) -> bool {
     }
 }
 
-/// The authorization decision: a control point holding `roles` may
-/// invoke an action gated by `required`. Public actions need nothing.
-///
-/// Source-IP independence is structural: the decision is a pure
-/// function of (roles, required), never of the transport address.
+/// The authorization decision over (roles, required): a pure function, never of the transport address.
 pub fn authorize(roles: &[String], required: &DpAuthz) -> bool {
     match required {
         DpAuthz::Public => true,
@@ -249,8 +215,7 @@ pub fn authorize(roles: &[String], required: &DpAuthz) -> bool {
     }
 }
 
-/// The SupportedProtocols document (spec 2.4.3): the WPS introduction
-/// and PKCS5 login protocols are MANDATORY; vendor additions may follow.
+/// The SupportedProtocols document: the WPS introduction and PKCS5 login are mandated.
 pub fn supported_protocols_xml() -> String {
     concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
@@ -262,7 +227,7 @@ pub fn supported_protocols_xml() -> String {
     .to_string()
 }
 
-/// The ACL document XML (spec 2.4.4).
+/// The ACL document XML.
 pub fn acl_xml(acl: &DpAcl) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ACL xmlns=\"urn:schemas-upnp-org:gw:DeviceProtection\">\n",
@@ -285,7 +250,7 @@ pub fn acl_xml(acl: &DpAcl) -> String {
     out
 }
 
-/// The IdentityList document XML (spec 2.4.5).
+/// The IdentityList document XML.
 pub fn identity_list_xml(acl: &DpAcl) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<IdentityList xmlns=\"urn:schemas-upnp-org:gw:DeviceProtection\">\n",
@@ -302,14 +267,11 @@ pub fn new_challenge(nonce: [u8; 16]) -> DpChallenge {
     DpChallenge { nonce }
 }
 
-/// PBKDF2 iteration count c for the PKCS5 ceremony (spec 2.6.5.6).
+/// PBKDF2 iteration count for the PKCS5 ceremony.
 #[allow(dead_code)] // the CP-side half of the ceremony; pinned by the vector tests
 pub const DP_PBKDF2_ITERATIONS: u32 = 5000;
 
-/// Compute STORED = first 128 bits of T1, where T1 is the PBKDF2
-/// (PRF = HMAC-SHA-256, c = DP_PBKDF2_ITERATIONS) output over
-/// password = Password and salt = Name || Salt (spec 2.6.5.6).
-/// Password and Name are UTF-8.
+/// STORED = the first 128 bits of PBKDF2-HMAC-SHA-256 over Password and Name || Salt.
 #[allow(dead_code)] // the CP-side half of the ceremony; pinned by the vector tests
 pub fn stored_for(password: &[u8], name: &[u8], salt: &[u8; 16]) -> [u8; 16] {
     let mut pbkdf2_salt = Vec::with_capacity(name.len() + 16);
@@ -321,10 +283,7 @@ pub fn stored_for(password: &[u8], name: &[u8], salt: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// Verify a UserLogin authenticator:
-/// Authenticator == first 16 bytes of
-/// HMAC-SHA-256(STORED, Challenge || DeviceID || ControlPointID)
-/// per spec 2.6.6.
+/// The UserLogin authenticator: first 16 bytes of the MAC over Challenge, DeviceID, ControlPointID.
 pub fn verify_authenticator(
     stored: &[u8; 16],
     challenge: &[u8; 16],
@@ -342,42 +301,29 @@ pub fn verify_authenticator(
 
 // ---- the stateful service core ----
 
-/// The DeviceProtection error set (spec 2.6.15 summary and the per-
-/// action error tables): the faults this service can return.
+/// The DeviceProtection faults this service can return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpErr {
-    /// 600 Argument Value Invalid (unknown Name, unknown Challenge,
-    /// unsupported ProtocolType, malformed arguments)
+    /// 600 Argument Value Invalid (unknown Name or Challenge, unsupported ProtocolType)
     InvalidValue,
-    /// 606 Action not authorized (2.6.5.10 and the admin-action tables)
+    /// 606 Action not authorized
     NotAuthorized,
-    /// 701 Authentication Failure (2.6.6.9)
+    /// 701 Authentication Failure
     AuthFailure,
-    /// 704 Processing Error (2.6.1.9)
+    /// 704 Processing Error
     Processing,
 }
 
-/// One control point's session. The plain-HTTP analogue of the spec's
-/// authenticated TLS session: keyed by the control point's address (the
-/// transport the facade serves), holding the login state the spec ties to
-/// a session. The principal (user + CP identity + roles) is established
-/// by the PKCS5 challenge-response; the address keys the session the same
-/// way the TLS connection handle does and is never the authorization
-/// input itself (plan/0008's security context).
+/// One control point's session, keyed by its address, which is never the authorization input.
 #[derive(Clone, Debug)]
 struct DpSession {
-    /// the most recent challenge issued (2.6.5.9: only the most recent is
-    /// kept) and the user Name it was issued for
+    /// the most recent challenge issued, and the user Name it was issued for
     challenge: Option<DpChallenge>,
     challenge_user: Option<String>,
-    /// the logged-in principal: user Name and the matched ACL identity ID
-    /// (2.6.6.8). The role set is evaluated live from the ACL at read
-    /// time, so an ACL/role change takes effect on live sessions.
+    /// the logged-in user Name and matched ACL identity ID; roles are read live from the ACL
     user: Option<String>,
     cp_identity: Option<[u8; 16]>,
-    /// failed UserLogin attempts since the last challenge (2.6.6.8: after
-    /// about five, the session state is freed and a fresh challenge is
-    /// required)
+    /// failed UserLogin attempts since the last challenge; at the limit the state is freed
     failures: u8,
     last_seen: u64,
 }
@@ -395,25 +341,16 @@ impl DpSession {
     }
 }
 
-/// Session idle ceiling for a plain-HTTP login session (the "session
-/// validity / expiry" of plan/0008's security context; the spec's sessions die
-/// with the TLS connection, which this facade does not offer).
+/// Session idle ceiling for a plain-HTTP login session; the spec's sessions die with TLS.
 pub const DP_SESSION_TTL_SECS: u64 = 1800;
 
-/// Failed UserLogin attempts before the session challenge is freed and a
-/// fresh GetUserLoginChallenge is required (spec 2.6.6.8, recommended
-/// five).
+/// Failed UserLogin attempts before the challenge is freed and a fresh one is required.
 pub const DP_LOGIN_FAILURE_LIMIT: u8 = 5;
 
-/// The full DP:1 service state: the persistent security configuration
-/// (users + ACL, per plan/0008's persistence rules) and the transient sessions.
-/// Pure and io-free: the clock is injected so the conformance tests are
-/// deterministic, and the caller persists through `config_tsv` /
-/// `config_from_tsv`.
+/// The DP service state: persistent users and ACL, transient sessions, and an injected clock.
 #[derive(Clone, Debug, Default)]
 pub struct DpState {
-    /// the device's 16-octet identity (the DeviceID in the authenticator
-    /// computation; derived from the root UDN by the caller)
+    /// the device's 16-octet DeviceID, derived from the root UDN by the caller
     pub device_id: [u8; 16],
     /// the password file: one record per login Name
     pub users: Vec<DpUser>,
@@ -433,17 +370,12 @@ impl DpState {
         }
     }
 
-    /// SetupReady (spec 2.4.2): the device is never busy — it runs no
-    /// setup protocol registrar, so no setup operation is pending and the
-    /// only pressure a setup-capable CP can meet is the SendSetupMessage
-    /// fault path. The value stays 1 (evented variable; no transitions).
+    /// SetupReady is always 1: the device runs no setup registrar, so nothing is pending.
     pub fn setup_ready(&self) -> bool {
         true
     }
 
-    /// GetUserLoginChallenge (2.6.5). The Name must be a known user
-    /// (2.6.5.10: an unknown Name is 600); the issued challenge replaces
-    /// the session's previous one (2.6.5.9).
+    /// GetUserLoginChallenge: an unknown Name is 600, and the new challenge replaces the last one.
     pub fn begin_login(
         &mut self,
         key: std::net::Ipv4Addr,
@@ -467,15 +399,7 @@ impl DpState {
         Ok((user.salt, session.challenge.as_ref().unwrap().nonce))
     }
 
-    /// UserLogin (2.6.6). Verifies the Authenticator against STORED of
-    /// the challenge's user Name, trying each ACL identity ID as the
-    /// ControlPointID (2.6.6.4: the MAC input binds Challenge,
-    /// DeviceID and ControlPointID; the CP identity MUST be in the ACL,
-    /// 2.6.6.5). On success the session principal becomes the user with
-    /// the union of the user's and the matched identity's roles
-    /// (2.6.6.8). An unrecognized challenge is 600 (2.6.6.9); a bad
-    /// Authenticator is 701; after the failure limit the challenge is
-    /// freed so a fresh one is required (2.6.6.8 backstop).
+    /// UserLogin: verify the authenticator against the challenge user's STORED, over each ACL identity.
     pub fn login(
         &mut self,
         key: std::net::Ipv4Addr,
@@ -497,7 +421,7 @@ impl DpState {
             return Err(DpErr::InvalidValue);
         }
         if session.failures >= DP_LOGIN_FAILURE_LIMIT {
-            // 2.6.6.8: session state freed -> a fresh challenge is needed
+            // session state freed -> a fresh challenge is needed
             session.challenge = None;
             session.challenge_user = None;
             session.failures = 0;
@@ -511,9 +435,7 @@ impl DpState {
                 return Err(DpErr::InvalidValue);
             }
         };
-        // the CP identity must be an ACL identity (2.6.6.5); the
-        // authenticator binds it into the MAC, so guessing requires the
-        // password-derived STORED
+        // the CP identity must be an ACL identity, and the MAC binds it, so guessing needs the STORED
         let mut matched: Option<[u8; 16]> = None;
         for identity in &self.acl.identities {
             if identity.id == [0u8; 16] {
@@ -542,8 +464,7 @@ impl DpState {
         Ok(())
     }
 
-    /// UserLogout (2.6.7): the session principal is dropped — a no-op
-    /// when nothing is logged in, per 2.6.7.
+    /// UserLogout drops the session principal; it is a no-op when nothing is logged in.
     pub fn logout(&mut self, key: std::net::Ipv4Addr, now: u64) {
         let session = self.sessions.entry(key).or_insert_with(|| DpSession::fresh(now));
         session.user = None;
@@ -561,10 +482,7 @@ impl DpState {
         }
     }
 
-    /// The session's role set, empty when not logged in or expired.
-    /// Evaluated LIVE from the password file and ACL: an ACL or role
-    /// change takes effect on existing sessions immediately (plan/0008
-    /// section 26.19 "ACL change / role change" obligations).
+    /// The session's roles, empty when not logged in or expired, and read live from the ACL.
     pub fn session_roles(&self, key: std::net::Ipv4Addr, now: u64) -> Vec<String> {
         let Some(s) = self.sessions.get(&key) else {
             return Vec::new();
@@ -600,11 +518,7 @@ impl DpState {
         }
     }
 
-    /// The authorization decision (plan/0008's security context): a pure
-    /// function of the session principal's roles and the action's
-    /// requirement. The address keys the session store only; the decision
-    /// never consults it, so the outcome is source-IP independent for a
-    /// given principal.
+    /// The authorization decision is a pure function of the principal's roles and the requirement.
     pub fn enforce(&self, key: std::net::Ipv4Addr, required: &DpAuthz, now: u64) -> Result<(), DpErr> {
         match required {
             DpAuthz::Public => Ok(()),
@@ -619,15 +533,12 @@ impl DpState {
         }
     }
 
-    /// GetACLData (2.6.8): the ACL document.
+    /// GetACLData: the ACL document.
     pub fn acl(&self) -> &DpAcl {
         &self.acl
     }
 
-    /// AddIdentityList (2.6.9): union-add the incoming identities; the
-    /// result is the identities actually added (2.6.9.3). A User identity
-    /// is keyed by name, a CP identity by its 16-octet ID; an entry
-    /// already present is not re-added.
+    /// AddIdentityList union-adds by name or 16-octet ID and returns the identities actually added.
     pub fn add_identities(&mut self, incoming: &DpAcl) -> DpAcl {
         let mut added = DpAcl::default();
         for id in &incoming.identities {
@@ -646,20 +557,14 @@ impl DpState {
         added
     }
 
-    /// RemoveIdentity (2.6.10): remove by Name, case-sensitive. Unknown
-    /// names are a no-op success (the spec's error table cites 600 for an
-    /// invalid Identity; the absence of an identity is idempotent from
-    /// the caller's side — the caller decides whether to fault).
+    /// RemoveIdentity removes by Name, case-sensitively; an absent identity is a no-op success.
     pub fn remove_identity(&mut self, name: &str) -> bool {
         let before = self.acl.identities.len();
         self.acl.identities.retain(|x| x.name != name);
         self.acl.identities.len() != before
     }
 
-    /// SetUserLoginPassword (2.6.11): sets the Stored/Salt for a login
-    /// Name, creating the user record when absent (2.6.11.9 "the password
-    /// associated with the user name ... is updated"). Returns false when
-    /// the identity is entirely unknown (600 is the caller's choice).
+    /// SetUserLoginPassword sets Stored and Salt, creating the record for a known name; else false.
     pub fn set_user_password(&mut self, name: &str, stored: [u8; 16], salt: [u8; 16]) -> bool {
         let name = clean_name(name);
         match self.users.iter_mut().find(|u| u.name == name) {
@@ -686,9 +591,7 @@ impl DpState {
         }
     }
 
-    /// AddRolesForIdentity (2.6.12): strictly additive union on the ACL
-    /// entry or the user record named `identity`. Returns false if the
-    /// identity does not exist.
+    /// AddRolesForIdentity adds to the ACL entry or user record named `identity`; false if unknown.
     pub fn add_roles(&mut self, identity: &str, roles: &[String]) -> bool {
         if let Some(u) = self.users.iter_mut().find(|u| u.name == identity) {
             for r in roles {
@@ -709,7 +612,7 @@ impl DpState {
         false
     }
 
-    /// RemoveRolesForIdentity (2.6.13): the symmetric removal.
+    /// RemoveRolesForIdentity: the symmetric removal.
     pub fn remove_roles(&mut self, identity: &str, roles: &[String]) -> bool {
         if let Some(u) = self.users.iter_mut().find(|u| u.name == identity) {
             u.roles.retain(|r| !roles.contains(r));
@@ -723,20 +626,14 @@ impl DpState {
     }
 }
 
-/// The services whose actions the DP boundary gates (the WANIPConnection
-/// integration: the mapping service flows through the authorization layer).
+/// The services whose actions the authorization boundary gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpTarget {
     DeviceProtection,
     WanIpConnection,
 }
 
-/// The device's role policy (plan/0008's public-versus-protected operations through its default security posture): which role
-/// each action requires. Public actions need no session; the WIP2
-/// mapping mutators require an authenticated session holding at least
-/// "Basic"; the security-administration DP actions require
-/// "Admin". SetUserLoginPassword additionally permits the
-/// session's own user (checked in the caller).
+/// Which role each action requires: Basic for the mapping mutators, Admin for security.
 pub fn required_role(target: DpTarget, action: &str) -> DpAuthz {
     match target {
         DpTarget::WanIpConnection => match action {
@@ -755,18 +652,12 @@ pub fn required_role(target: DpTarget, action: &str) -> DpAuthz {
     }
 }
 
-/// The role names the device recognizes (unknown roles are rejected with
-/// 600 per 2.6.12.3).
+/// The role names the device recognizes; an unknown role is refused with 600.
 pub fn valid_role(role: &str) -> bool {
     matches!(role, "Admin" | "Basic")
 }
 
-// ---- persistence projection (plan/0008's persistence rules) ----
-//
-// users + ACL are the persistent security configuration; sessions are
-// transient. The TSV shapes:
-//   U <name> <salt-hex32> <stored-hex32> <role,role,...>
-//   A <name> <alias-or--> <id-hex32> <role,role,...>
+// ---- persistence projection: one U (user) or A (ACL) line per record, sessions transient ----
 
 pub fn config_tsv(users: &[DpUser], acl: &DpAcl) -> String {
     let mut out = String::new();
@@ -792,9 +683,7 @@ pub fn config_tsv(users: &[DpUser], acl: &DpAcl) -> String {
     out
 }
 
-/// Parse the TSV projection; malformed lines are skipped (the caller
-/// decides whether a partial parse is fatal). Salt/stored/id decode from
-/// lowercase hex; an alias of `-` is None.
+/// Parse the TSV projection; malformed lines are skipped and an alias of `-` is None.
 pub fn config_from_tsv(text: &str) -> (Vec<DpUser>, DpAcl) {
     let mut users = Vec::new();
     let mut acl = DpAcl::default();
@@ -878,8 +767,7 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Decode standard base64 (whitespace tolerated; strict about padding:
-/// `=` appears only in the final group's last two slots).
+/// Decode standard base64; whitespace is tolerated and `=` may appear only in the last two slots.
 pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let s: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     if s.is_empty() {
@@ -930,7 +818,7 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// A name arrives from the wire, and the store is one tab-separated line per entry, so a tab or a newline in a name must not forge a row.
+    /// A tab or a newline in a name must not forge a row in the one-line-per-entry store.
     #[test]
     fn a_name_cannot_forge_a_row_in_the_store() {
         let forged = "ok\t-\t00000000000000000000000000000000\tAdmin\nA\tghost\t-\t11111111111111111111111111111111\tAdmin";
@@ -957,7 +845,7 @@ mod tests {
         );
     }
 
-    /// The ACL document and the identity list carry a control point's own text, so the name and the alias are escaped there.
+    /// The ACL and identity-list documents escape the name and the alias, which come from the wire.
     #[test]
     fn a_name_with_markup_is_escaped_in_the_documents() {
         let acl = DpAcl {
@@ -1047,12 +935,10 @@ mod tests {
 
     #[test]
     fn login_ceremony_roundtrip_and_tamper() {
-        // a full PKCS5 UserLogin exchange: salt -> STORED -> challenge
-        // -> authenticator -> verify
+        // a full PKCS5 UserLogin exchange: salt -> STORED -> challenge -> authenticator -> verify
         let salt = [42u8; 16];
         let name = b"network-admin";
-        // the device keeps the user record (Name, Salt, STORED) in its
-        // password file, as SetUserLoginPassword would have written it
+        // the device keeps the user record (Name, Salt, STORED), as SetUserLoginPassword writes it
         let stored = stored_for(b"correct horse battery staple", name, &salt);
         let user = DpUser {
             name: String::from_utf8(name.to_vec()).unwrap(),
@@ -1067,8 +953,7 @@ mod tests {
         mac_in.extend_from_slice(&challenge.nonce);
         mac_in.extend_from_slice(&device_id);
         mac_in.extend_from_slice(&cp_id);
-        // the CP computes the authenticator from the returned Salt, its
-        // own Password and Name; the device verifies against STORED
+        // the CP computes the authenticator from Salt, Name and its password; the device verifies STORED
         let good = hmac_sha256(&user.stored, &mac_in);
         assert!(verify_authenticator(
             &user.stored,
@@ -1087,8 +972,7 @@ mod tests {
             &cp_id,
             &bad[..16]
         ));
-        // the PBKDF2 salt is Name || Salt: a different Name (or a
-        // different Salt) yields a different STORED for the same password
+        // the PBKDF2 salt is Name || Salt, so a different Name or Salt yields a different STORED
         let other_name = stored_for(b"correct horse battery staple", b"other-user", &user.salt);
         assert_ne!(user.stored, other_name);
         let other_salt = stored_for(b"correct horse battery staple", name, &[43u8; 16]);
@@ -1124,8 +1008,7 @@ mod tests {
         assert!(authorize(&admin_roles, &protected));
         assert!(!authorize(&guest_roles, &protected));
         assert!(authorize(&guest_roles, &DpAuthz::Public));
-        // the decision does not name any address: transport source cannot
-        // influence it (the structural source-independence of 26.19)
+        // the decision names no address, so transport source cannot influence it
         let doc = acl_xml(&acl);
         assert!(doc.contains("<Name>Trusted CP</Name>"));
         assert!(doc.contains("<Role>Admin</Role>"));
@@ -1133,8 +1016,7 @@ mod tests {
         assert!(list.contains("<Identity><Name>Guest</Name></Identity>"));
     }
 
-    /// The PKCS5 client half of the ceremony for the conformance suite:
-    /// GetUserLoginChallenge then compute and present the Authenticator.
+    /// The PKCS5 client half: GetUserLoginChallenge, then compute and present the authenticator.
     #[allow(clippy::too_many_arguments)]
     fn dp_login(
         dp: &mut DpState,
@@ -1170,9 +1052,7 @@ mod tests {
 
     #[test]
     fn dp19_conformance_suite() {
-        // plan/0008's conformance suite: the anti-stub gate. A stub that answers
-        // names but never enforces fails every one of these by
-        // construction.
+        // the anti-stub gate: a stub that answers names but never enforces fails every case here
         let device_id: [u8; 16] = [0xdd; 16];
         let cp_admin: [u8; 16] = [0xca; 16];
         let cp_basic: [u8; 16] = [0xcb; 16];
@@ -1246,8 +1126,7 @@ mod tests {
             dp_login(&mut dp, &device_id, ip_a, "admin", b"admin-pw", cp_admin, [1u8; 16], &salt_a, now),
             Ok(())
         ));
-        // authenticated authorized action: the admin session may add mappings
-        // and read the ACL
+        // an authenticated admin session may add mappings and read the ACL
         assert_eq!(
             dp_enforce(&dp, ip_a, &required_role(DpTarget::WanIpConnection, "AddPortMapping"), now),
             Ok(()),
@@ -1258,8 +1137,7 @@ mod tests {
             Ok(()),
             "admin may read the ACL"
         );
-        // authenticated, authorized action: a Basic holder may map but may
-        // not administer the ACL
+        // an authenticated Basic holder may map but may not administer the ACL
         assert!(matches!(
             dp_login(&mut dp, &device_id, ip_b, "guest", b"guest-pw", cp_basic, [2u8; 16], &[12u8; 16], now),
             Ok(())
@@ -1274,8 +1152,7 @@ mod tests {
             Err(DpErr::NotAuthorized),
             "Basic may not administer the ACL"
         );
-        // authenticated unauthorized action: a session whose roles contain
-        // neither Basic nor Admin cannot map
+        // an authenticated session with neither Basic nor Admin cannot map
         assert!(matches!(
             dp_login(&mut dp, &device_id, ip_c, "guest", b"guest-pw", cp_readonly, [3u8; 16], &[12u8; 16], now),
             Ok(())
@@ -1286,8 +1163,7 @@ mod tests {
             "authed but unauthorized action denied"
         );
 
-        // invalid credentials: a wrong password fails 701 without logging
-        // out the existing session
+        // a wrong password fails 701 without logging out the existing session
         assert!(matches!(
             dp_login(&mut dp, &device_id, ip_a, "admin", b"wrong", cp_admin, [4u8; 16], &salt_a, now),
             Err(DpErr::AuthFailure)
@@ -1297,8 +1173,7 @@ mod tests {
             "a failed login does not degrade an existing session"
         );
 
-        // invalid authorization context: an unknown CP identity cannot log
-        // in even with the right password (2.6.6.5: identity in the ACL)
+        // an unknown CP identity cannot log in even with the right password
         assert!(matches!(
             dp_login(&mut dp, &device_id, ip_a, "admin", b"admin-pw", cp_unknown, [5u8; 16], &salt_a, now),
             Err(DpErr::AuthFailure)
@@ -1317,8 +1192,7 @@ mod tests {
             "expired Basic session denied"
         );
 
-        // ACL change: grant Basic to the readonly identity -> its session
-        // may now map; revoke -> denied again
+        // granting Basic takes effect on the live session; revoking it denies again
         now += 10;
         assert!(matches!(
             dp_login(&mut dp, &device_id, ip_c, "guest", b"guest-pw", cp_readonly, [6u8; 16], &[12u8; 16], now),
@@ -1340,8 +1214,7 @@ mod tests {
             Err(DpErr::NotAuthorized),
             "role revocation takes effect on the live session"
         );
-        // RemoveIdentity removes the principal entirely -> a fresh login as
-        // the removed identity fails
+        // a removed identity cannot authenticate afresh
         dp.remove_identity("readonly-cp");
         assert!(
             matches!(
@@ -1351,9 +1224,7 @@ mod tests {
             "removed identity cannot authenticate"
         );
 
-        // multiple simultaneous control points: separate principals,
-        // independent decisions, after a service restart (fresh logins at
-        // the new clock — the session store is transient, 26.15)
+        // separate control points decide independently, and the session store is transient
         assert!(matches!(
             dp_login(&mut dp, &device_id, ip_a, "admin", b"admin-pw", cp_admin, [8u8; 16], &salt_a, now),
             Ok(())
@@ -1372,18 +1243,14 @@ mod tests {
             "guest stays unauthorized while admin is authorized"
         );
 
-        // source-IP independence: the decision is a pure function of the
-        // principal's roles; an unauthenticated source is denied wherever
-        // it sits
+        // an unauthenticated source is denied wherever it sits
         assert_eq!(
             dp_enforce(&dp, ip_e, &required_role(DpTarget::WanIpConnection, "AddPortMapping"), now),
             Err(DpErr::NotAuthorized),
             "unauthenticated is denied from any source"
         );
 
-        // failure backstop: DP_LOGIN_FAILURE_LIMIT bad authenticators
-        // against ONE challenge free the session state (2.6.6.8), so the
-        // attacker must obtain a fresh challenge
+        // the failure limit frees the session state, so the attacker must obtain a fresh challenge
         let (_, challenge) = dp.begin_login(ip_d, "guest", [0x60; 16], now).unwrap();
         for i in 0..DP_LOGIN_FAILURE_LIMIT {
             let bad = hmac_sha256(&[0x99u8; 16], &challenge);
@@ -1401,7 +1268,7 @@ mod tests {
 
     #[test]
     fn base64_rfc4648_vectors() {
-        // RFC 4648 section 10 vectors
+        // RFC 4648 vectors
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
@@ -1456,9 +1323,7 @@ mod tests {
         assert_eq!(u2, users);
         assert_eq!(a2, acl);
 
-        // malformed rows are skipped, valid ones survive; unknown roles
-        // are dropped (2.6.12.3: the device rejects roles it does not
-        // understand)
+        // malformed rows are skipped, and an unknown role is dropped
         let mixed = "U\tbroken\nU\tok\t2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\t11111111111111111111111111111111\tBogusRole,Basic\nX\tjunk\n";
         let (u3, a3) = config_from_tsv(mixed);
         assert_eq!(a3.identities.len(), 0);

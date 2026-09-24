@@ -1,11 +1,4 @@
-//! ds-lite-punch — CGNAT-aware UDP relay for the Virgin Media ds-lite line.
-//!
-//! One socket bound to (192.168.0.21, R). Two jobs share it:
-//!   1. keep the AFTR mapping alive + observe it (STUN keepalive = discovery);
-//!   2. forward inbound peer datagrams to the br-lan target, source preserved.
-//! See plan/0004-ds-lite-punch/README.md for the full design and the measured
-//! CGNAT behavior this is built around (5-10 s idle timeout, EIM+EIF, no
-//! source-port preservation).
+//! CGNAT-aware UDP relay: one socket per slot keeps the AFTR mapping alive and forwards inbound to br-lan.
 mod cdc;
 mod ct;
 mod dp;
@@ -45,8 +38,7 @@ use upnpsvc::UpnpFacade;
 use vote::{VoteDecision, VoteState};
 use crate::publish::{emiteln, emitln};
 
-/// Format a static-map/restore rejection for logs (the enum stays heap-free
-/// in `slot.rs` for the Kani proofs; messages live only at this boundary).
+/// Format a static-map/restore rejection; the enum stays heap-free for the Kani proofs.
 fn fmt_static_err(e: StaticMapErr, lo: u16, hi: u16) -> String {
     match e {
         StaticMapErr::OutOfRange { port } => {
@@ -56,8 +48,7 @@ fn fmt_static_err(e: StaticMapErr, lo: u16, hi: u16) -> String {
     }
 }
 
-/// One static mapping R=ip:port (UDP). P1's `--bind`/`--target` pair is sugar
-/// for a single entry; `--static-map` is the repeatable form (B3).
+/// One static mapping R=ip:port (UDP), from `--static-map` or the legacy pair.
 #[derive(Clone, Copy, Debug)]
 struct StaticMap {
     bind_port: u16,
@@ -81,28 +72,20 @@ struct Config {
     observation: bool,
     max_refresh_attempts: u32,
     cdc: CdcKind,
-    /// The allowlist (call/0025): the devices the keepalive acts for. Empty means
-    /// nobody, and the observation arm keeps the admission it already had.
+    /// The devices the keepalive acts for; empty means nobody.
     allow: Vec<Ipv4Addr>,
-    /// Whether the keepalive actually holds: with an allowlist and no `--keepalive`,
-    /// the arm only reports what it would act on (plan/0009 stage 1).
+    /// Whether the keepalive holds; without `--keepalive` the arm only reports what it would act on.
     hold: bool,
-    /// The PCP and NAT-PMP listener on the shared port (call/0025's fourth
-    /// admission). PCP is entirely semantically private, so it is opt-in.
+    /// The PCP and NAT-PMP listener on the shared port; opt-in because PCP is private.
     pcp: bool,
-    /// Whether the PCP PEER opcode is answered; the datapath is
-    /// endpoint-independent, so PEER has nothing to install and is refused
-    /// unless the operator asks for the standards-shaped answer.
+    /// Whether the PCP PEER opcode is answered; the filtering here is endpoint-independent.
     pcp_peer: bool,
-    // UPnP IGD facade (plan/0007 phase E): br-lan only.
+    // UPnP IGD facade: br-lan only.
     upnp_enabled: bool,
     upnp_port: u16,
     lan_ip: Ipv4Addr,
     upnp_name: String,
-    /// The carrier watch (call/0033): whether the daemon counts the
-    /// cooperating helper's marked probe, how often the helper is expected to
-    /// send, how many intervals of silence raise `carrier-silent`, and how
-    /// often the counter is read.
+    /// The carrier watch: count the marked probe, over this interval, misses and poll cadence.
     carrier_probe: bool,
     carrier_probe_interval: u64,
     carrier_probe_misses: u64,
@@ -113,9 +96,7 @@ fn parse_args() -> Result<Config, String> {
     parse_args_from(std::env::args().collect())
 }
 
-/// The parser, with its argv supplied. Kept separate so the multi-instance
-/// form can be tested: `--static-map` is repeatable, and until this split the
-/// only way to exercise it was to run the binary.
+/// The parser with its argv supplied, so the repeatable `--static-map` form is testable.
 fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut bind: Option<SocketAddr> = None;
     let mut target: Option<SocketAddrV4> = None;
@@ -142,8 +123,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut carrier_probe_interval: u64 = 900;
     let mut carrier_probe_misses: u64 = 3;
     let mut carrier_probe_poll: u64 = 5;
-    // G1 primary = the nft flow_obs mirror (gating test passed 2026-09-02);
-    // /proc stays reachable as the fallback (--cdc proc).
+    // the nft flow_obs mirror is the default; /proc stays reachable as the fallback
     let mut cdc_kind = CdcKind::Nft;
 
     let mut i = 1;
@@ -164,7 +144,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 i += 2
             }
             "--static-map" => {
-                // R=ip:port — the repeatable multi-instance form (B3)
+                // R=ip:port — the repeatable multi-instance form
                 let spec = v()?;
                 let (r, rest) = spec
                     .split_once('=')
@@ -222,9 +202,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 i += 2
             }
             "--allowlist" => {
-                // One IPv4 address per line, `#` comments. Read here so a
-                // typo in the path or an address fails the start rather than
-                // the first hold.
+                // one IPv4 address per line, with # comments; read here so a typo fails the start
                 let allow_path = v()?;
                 let text = std::fs::read_to_string(&allow_path)
                     .map_err(|e| format!("--allowlist {}: {}", allow_path, e))?;
@@ -308,15 +286,12 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                // The same value `tools/argdoc` reads from the manifest for the
-                // help text's header, so the two cannot disagree.
+                // the same value tools/argdoc reads from the manifest, so the two cannot disagree
                 emitln!("ds-lite-punch {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--ct-probe" => {
-                // Diagnostic: bisect the netlink CT_DELETE encoding against
-                // a self-created conntrack entry (see ct.rs). Not a daemon
-                // flag — exits immediately.
+                // diagnostic: bisect the netlink CT_DELETE encoding against a self-created entry, then exit
                 crate::ct::self_test();
                 std::process::exit(0);
             }
@@ -324,7 +299,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         }
     }
 
-    // Legacy --bind/--target pair == one static map (P1 semantics).
+    // the legacy --bind/--target pair is one static map
     match (bind, target) {
         (Some(b), Some(t)) => {
             if !static_maps.is_empty() {
@@ -400,9 +375,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     })
 }
 
-/// The help text, generated by `tools/argdoc` from one clap definition. The
-/// flag-coverage test below holds it to the flags this file's parser takes,
-/// because the definition is a second copy of this command line.
+/// The help text, generated by tools/argdoc; the flag-coverage test holds it to the parser.
 const HELP: &str = include_str!("help.txt");
 
 /// Print the help text, without the trailing newline `emitln!` adds.
@@ -410,15 +383,12 @@ fn usage() {
     emitln!("{}", HELP.trim_end());
 }
 
-/// The rejected-command-line path, which writes to stderr so a procd log keeps
-/// the text beside the error.
+/// The rejected-command-line path: stderr, so a procd log keeps the text beside the error.
 fn usage_err() {
     emiteln!("{}", HELP.trim_end());
 }
 
-/// Force each STUN server's IP out the VM line: host route via the hub.
-/// Without this the default route (vdsl4, lower metric) wins and STUN maps the
-/// wrong NAT. Idempotent (`replace`).
+/// Force each STUN server's IP out the VM line; the default route would map the wrong NAT.
 fn add_stun_routes(servers: &[SocketAddrV4], gateway: &str) {
     for s in servers {
         let status = Command::new("ip")
@@ -432,24 +402,13 @@ fn add_stun_routes(servers: &[SocketAddrV4], gateway: &str) {
     }
 }
 
-/// Dedicated table for the relay's tuple-sourced egress (RCA 2026-09-13:
-/// the accepted TCP connections' replies and the TCP connection's outbound
-/// follow the kernel's output lookup, whose main-table default is the
-/// vdsl4 PPPoE, never the eth1 line the AFTR mapping lives on; the AFTR
-/// can translate a return path only on that line).
+/// Dedicated table for the relay's tuple-sourced egress; the main table's default is the wrong line.
 const EGRESS_TABLE: &str = "1001";
 const EGRESS_PRIO: &str = "25100";
-/// Lease-policy last-seen stamp interval: the datapath can fire many
-/// times a second; one write per slot per 15 s is ample resolution for a
-/// 24 h grace period.
+/// The last-seen stamp interval: one write per slot per 15 s, ample for a 24 h grace.
 const LEASE_STAMP_MIN_S: u64 = 15;
 
-/// Force every tuple-sourced egress out the VM line: a policy rule from
-/// the bind address into the dedicated table whose default is the hub.
-/// Local-destination replies still loop (the local table outranks the
-/// rule), so a self-sourced probe can never complete a handshake; the
-/// rule exists for genuinely remote peers. Idempotent; the init script
-/// removes the rule and flushes the table on stop.
+/// Force tuple-sourced egress out the VM line: a policy rule into the dedicated table.
 fn add_egress_rule(bind_ip: &SocketAddr, gateway: &str) {
     let from = bind_ip.ip().to_string();
     let _ = Command::new("ip")
@@ -489,17 +448,14 @@ async fn resolve_stun(hosts: &[String]) -> Vec<SocketAddrV4> {
     out
 }
 
-/// The slot keepalive loop. Spawned by the slot's caller (static path and
-/// the UPnP facade grant path) so that path owns the JoinHandle and can
-/// abort both tasks on teardown.
+/// The slot keepalive loop; the caller owns the JoinHandle so a teardown can abort it.
 pub(crate) async fn keepalive_loop(
     sock: Arc<UdpSocket>,
     state: Arc<Mutex<State>>,
     interval: Duration,
     phase_ms: u32,
 ) {
-    // Stagger: slot index i at (i * 2000/N) ms so N slots never burst one
-    // STUN server simultaneously.
+    // stagger slot i at (i * 2000/N) ms so N slots never burst one STUN server at once
     if phase_ms > 0 {
         tokio::time::sleep(Duration::from_millis(phase_ms as u64)).await;
     }
@@ -523,15 +479,7 @@ pub(crate) async fn keepalive_loop(
     }
 }
 
-/// One slot: keepalive task (staggered) + recv loop on its own socket.
-/// Byte-identical to v1 core when there is exactly one slot (no stagger:
-/// single socket, same forward path). `pub(crate)`: the UPnP facade grants
-/// spawn the same datapath for a granted UDP slot.
-///
-/// The keepalive task is NOT spawned here: the caller spawns it (and owns
-/// both JoinHandles) so a facade grant revocation can abort the keepalive
-/// too — otherwise the keepalive's own Arc clone would keep the slot socket
-/// bound after the recv loop is aborted (the 2026-09-14 leak).
+/// One slot's recv loop on its own socket; the caller spawns the keepalive and owns both handles.
 pub(crate) async fn run_slot(
     sock: Arc<UdpSocket>,
     state: Arc<Mutex<State>>,
@@ -540,9 +488,7 @@ pub(crate) async fn run_slot(
     publisher: Arc<Publisher>,
     bind_port: u16,
 ) {
-    // B6 STUN majority vote: publication happens only when >=2 servers
-    // agree on a new tuple; a single disagreeing observation marks the
-    // server suspect (rotate) without republishing.
+    // STUN majority vote: publication needs two servers to agree; one dissent marks suspect
     let vote = Arc::new(Mutex::new(VoteState::new()));
 
     // recv loop: classify STUN responses vs peer data; forward the latter.
@@ -564,8 +510,7 @@ pub(crate) async fn run_slot(
         let is_stun_server = state.lock().await.is_stun_server(src_v4);
         if is_stun_server {
             if let Some(tuple) = stun::parse_mapped(pkt) {
-                // Health bookkeeping first: any valid response clears
-                // silence, regardless of what the vote decides.
+                // health bookkeeping first: any valid response clears silence, whatever the vote decides
                 state.lock().await.note_response(tuple);
                 let server_idx = state.lock().await.server_index(src_v4);
                 let decision = match server_idx {
@@ -595,9 +540,7 @@ pub(crate) async fn run_slot(
             }
             // STUN packet we can't parse: ignore.
         } else {
-            // Peer data reaching the client = the mapping is in use: stamp
-            // the last-seen clock (rate-limited) so the lease policy can
-            // tell a live session from a ghost.
+            // peer data reaching the client means the mapping is in use: stamp the last-seen clock
             {
                 let mut t = table.lock().await;
                 t.stamp_activity_if_stale(bind_port, Epoch::now(), LEASE_STAMP_MIN_S);
@@ -628,28 +571,17 @@ async fn main() {
     add_stun_routes(&servers, &cfg.gateway);
     add_egress_rule(&cfg.bind, &cfg.gateway);
 
-    // Slot table: built entirely via restore() (B8) so statics are inserted
-    // exactly once — config statics are authoritative, persisted granted
-    // leases re-bind their exact Rs. Collisions/out-of-range are
-    // startup-fatal (config errors, not transient state).
+    // the table is built entirely through restore(), so config statics are inserted exactly once
     let allocator = PortAllocator::new(cfg.slot_lo, cfg.slot_hi)
         .expect("slot range validated in parse_args");
     let mut table = LeaseTable::new(allocator, cfg.max_slots, cfg.max_maps_per_client);
 
-    // B6/B7/B8 persistence: epoch survives respawn (tmpfs) and resets on
-    // reboot (correct: a reboot killed every CGNAT mapping); leases.tsv
-    // snapshots the table so respawn re-binds the same Rs before the
-    // first STUN round (deterministic rebind).
+    // the epoch survives a respawn (tmpfs) and resets on a reboot; leases.tsv re-binds the same Rs
     let persist_dir = Path::new(DEFAULT_DIR);
     let _ = load_epoch(persist_dir, Epoch::now());
     let now = Epoch::now();
 
-    // B8 respawn restore: re-bind the exact same Rs before the first STUN
-    // round. Config statics are authoritative; granted leases come back
-    // from leases.tsv (tmpfs survives a crash, not a reboot — which is the
-    // mapping's own end). A granted record's target is its own
-    // (client, int_port) tuple. A persisted grant whose R collides with a
-    // config static is stale (config wins) — dropped, not fatal.
+    // respawn restore re-binds the same Rs before STUN; a grant colliding with a static is dropped
     let static_tuples: Vec<(u16, Ipv4Addr, u16)> = cfg
         .static_maps
         .iter()
@@ -685,23 +617,15 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Snapshot the whole table (static + granted) back to disk so the
-    // respawn cycle is stable. One projection lives in persist::snapshot
-    // (the facade's persist() writes through it too); the boot path must
-    // not carry a second copy that can drift from it.
+    // one projection of the table lives in persist::snapshot; the boot path must not keep a second copy
     let persisted_snapshot: Vec<persist::PersistedSlot> = snapshot(table.slots(), now);
     if let Err(e) = write_leases(persist_dir, &persisted_snapshot) {
         emiteln!("warn: persist leases failed: {}", e);
     }
 
-    // B9 GC: scan every 60 s; free granted leases expired past
-    // (grace_factor x 60 s) with no inbound activity. Statics never GC. In
-    // facade mode the UPnP facade's own GC owns the per-slot teardown
-    // (nft element delete, task abort, entry removal) so the table-only
-    // loop here only runs without the facade.
-    // Snapshot the slots before the table is moved into the tasks: pins,
-    // accepts and slot tasks are all driven from this frozen set
-    // (facade-added leases get their own spawn path in phase E).
+    // GC scans every 60 s for leases expired past grace with no traffic; statics never GC
+
+    // the slot list is frozen before the table moves, because the ruleset and tasks drive from it
     let slots_snapshot: Vec<slot::Slot> = table.slots().to_vec();
     let table = Arc::new(Mutex::new(table));
     if !cfg.upnp_enabled {
@@ -724,19 +648,14 @@ async fn main() {
         });
     }
 
-    // The tuple watch carries the last published external IP: the facade's
-    // GetExternalIPAddress reads it and GENA events fire on its changes.
-    // Seeded from the persisted slot-0 tuple file (respawn continuity), so
-    // a pre-discovery request is answered from the last known value.
+    // the tuple watch carries the last published external IP, seeded from the persisted tuple files
     let (ip_tx, ip_rx) =
         watch::channel(seed_external_ip(&cfg.state_dir, cfg.bind.port()));
     let publisher = Arc::new(Publisher::with_watch(&cfg.state_dir, ip_tx));
     let state = Arc::new(Mutex::new(State::new(servers.clone())));
     let target = cfg.target;
 
-    // B4: install the fixed nft ruleset once, then pin + accept per slot.
-    // Pin key is uniform across statics and restored grants: the slot's own
-    // (target ip, target port) tuple -> (NAT_ADDR, R) (B4; I2).
+    // the ruleset installs once, then each slot gets the ingress translation and the accept, no pin
     if let Err(e) = ensure_ruleset() {
         emiteln!("fatal: nft ruleset install failed: {}", e);
         std::process::exit(1);
@@ -745,13 +664,7 @@ async fn main() {
         SocketAddr::V4(v4) => *v4.ip(),
         _ => Ipv4Addr::new(192, 168, 0, 21),
     };
-    // A restored slot gets exactly what a fresh grant installs: the ingress
-    // translation and the accept element. It does not get a pin. The pin's
-    // egress job is the one call/0014 settled against (one game holding two
-    // external tuples at once), and the ingress translation carries the other
-    // job the pin used to do. A restored lease that is pinned keeps that
-    // regress alive while a freshly granted one does not, and the two paths
-    // then disagree about the same slot.
+    // a restored slot gets what a fresh grant installs: the ingress translation and the accept, no pin
     for s in &slots_snapshot {
         if let Err(e) =
             nft::grant_datapath(s.target, s.target_port, s.bind_port, s.proto == slot::Proto::Tcp)
@@ -772,24 +685,16 @@ async fn main() {
         slots_snapshot.len()
     );
 
-    // Stagger slot i at (i * 2000/N) ms; single-slot keeps no stagger
-    // (byte-identical to v1 core): one socket, same keepalive + recv path.
+    // stagger slot i at (i * 2000/N) ms; a single slot keeps no stagger
     let n = slots_snapshot.len() as u32;
     let interval = cfg.interval;
     for (i, s) in slots_snapshot.iter().enumerate() {
-        // In facade mode, granted leases (respawn-restored from leases.tsv)
-        // have their datapath rebuilt and registered in the facade's task
-        // map by UpnpFacade::start — the one owner that can tear them down.
-        // A second spawn here would double-bind the slot socket and orphan
-        // the handles. Statics stay on this path: the facade never tears a
-        // static slot down, so main's discarded handles are correct for it.
+        // in facade mode the facade owns granted leases; a second spawn here would double-bind the socket
         if cfg.upnp_enabled && !s.is_static() {
             continue;
         }
         if s.proto == slot::Proto::Tcp {
-            // TCP slot datapath (call/0017): listener on the pin tuple
-            // with a STUN-over-TCP connection at the C3-sized interval. The
-            // connection publishes the slot's external TCP tuple per-R.
+            // a TCP slot: a listener on its bind port, and a STUN-over-TCP connection that publishes its tuple
             let listener = match tcpslot::bind_pin(s.bind_port).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -827,10 +732,7 @@ async fn main() {
         let target = SocketAddrV4::new(s.target, s.target_port);
         let publisher = publisher.clone();
         let bind_port = s.bind_port;
-        // The keepalive is a sibling task (not spawned inside run_slot):
-        // the caller owns both JoinHandles, so a facade grant revocation
-        // can abort them together. The static path here never tears a slot
-        // down, so the handles are deliberately discarded.
+        // the keepalive is a sibling task; the caller owns both handles so a revocation can abort them
         let ka_sock = sock.clone();
         let ka_state = state.clone();
         tokio::spawn(async move {
@@ -842,13 +744,7 @@ async fn main() {
         });
     }
 
-    // Phase E: the UPnP IGD facade (plan/0007). SSDP + description docs +
-    // SOAP (POST/M-POST) + GENA on br-lan; AddPortMapping grants UDP and
-    // TCP slots with real datapaths (the facade spawns a slot's runtime as
-    // its own job, per the D/E note above). In facade mode the facade's
-    // local GC owns the granted-lease teardown (the table-only GC above is
-    // skipped); the tuple watch feeds GetExternalIPAddress and the GENA
-    // events.
+    // the UPnP IGD facade on br-lan: SSDP, description, SOAP and GENA, and it owns granted leases
     let facade = if cfg.upnp_enabled {
         let facade_servers = servers.clone();
         match UpnpFacade::start(
@@ -886,11 +782,7 @@ async fn main() {
         None
     };
 
-    // The keepalive's local half (call/0025, plan/0009 #allowlist): the conntrack
-    // timeout policy for the named devices. It is installed only when the
-    // hold is on — the log-only stage touches nothing — and its presence is
-    // read back, because the evidence that matters is the live table's, not
-    // the exit status of the batch that wrote it.
+    // the hold policy for the named devices: installed only when the hold is on, then read back
     if cfg.hold && !cfg.allow.is_empty() {
         match nft::apply_hold(&cfg.allow) {
             Ok(()) => {
@@ -908,16 +800,9 @@ async fn main() {
         }
     }
 
-    // Phase G: observation refresh engine (--observation). The selected CDC
-    // produces live candidate flows; the engine claims them with shadow
-    // sockets that keep the AFTR mapping alive and forward inbound to the
-    // host P1-style (see engine.rs). Default CDC = the nft `flow_obs`
-    // mirror (gating test passed 2026-09-02); the `/proc` backend is the
-    // fallback; Aya is not wired yet.
+    // --observation: the engine claims candidate flows with shadow sockets that keep the mapping alive
     if cfg.observation {
-        // I1: inner tuples static/lease slots own — the engine never
-        // captures one. (Today the table holds statics only; facade-added
-        // leases extend this list in D/E.)
+        // the engine never captures a tuple a static or lease slot already owns
         let owned: Vec<(Ipv4Addr, u16)> = slots_snapshot
             .iter()
             .map(|s| (bind_ip, s.bind_port))
@@ -925,9 +810,7 @@ async fn main() {
         let cdc: Box<dyn cdc::Cdc> = match cfg.cdc {
             cdc::CdcKind::Proc => Box::new(cdc::ProcCdc::new(owned.clone(), cfg.max_refresh_attempts, cfg.allow.clone())),
             cdc::CdcKind::Nft => {
-                // The mirror is part of the daemon's ruleset but only when
-                // the observation engine is enabled — the production daemon
-                // (no --observation) keeps today's byte-identical ruleset.
+                // the flow_obs mirror installs only with --observation, so the default ruleset is unchanged
                 if let Err(e) = ensure_flow_obs() {
                     emiteln!("fatal: nft flow_obs mirror install failed: {}", e);
                     std::process::exit(1);
@@ -949,13 +832,10 @@ async fn main() {
             publisher.clone(),
             Arc::new(engine::NftPins),
         );
-        // The admission (call/0025): a named device's flows are held, and
-        // without --keepalive they are only reported.
+        // a named device's flows are held; without --keepalive they are only reported
         engine.allow = cfg.allow.clone();
         engine.hold = cfg.hold;
-        // The allocation side of the collision rule (call/0027 R1): the arm
-        // reads the live lease table, so a tuple a grant has taken since this
-        // arm started is not one it captures.
+        // the arm reads the live lease table, so a tuple a grant has taken is not one it captures
         engine.alloc = Some(table.clone());
         engine.bind_ip = bind_ip;
         let cdc_name = engine.name();
@@ -971,12 +851,7 @@ async fn main() {
         );
     }
 
-    // The carrier watch (call/0033): a cooperating helper on the external
-    // vantage sends a marked datagram to the mapping's learned external tuple,
-    // and the datapath counts the mark. The daemon cannot send from a foreign
-    // address, so this is the only way it is told that the carrier still
-    // forwards a stranger's traffic. The counter is read on its own short
-    // interval, while the period it measures is minutes long.
+    // the carrier watch counts a cooperating helper's marked probe at the datapath
     if cfg.carrier_probe {
         if let Err(e) = nft::ensure_carrier_probe() {
             emiteln!(
@@ -1008,15 +883,7 @@ async fn main() {
             loop {
                 tick.tick().await;
                 let now = epoch();
-                // The counting rules live in the firewall's tables, and a
-                // firewall rebuild takes them with it while leaving the counter
-                // object in place, so the reading stays plausible with nothing
-                // counting. Measured on the router on 2026-09-22: the counter
-                // stood at 10 for two and a half hours while the helper kept
-                // sending, and the watch raised carrier-silent at 22:59 UTC over
-                // its own missing rule. Converge here, and say so when the rules
-                // had to be put back, because a repaired instrument is a fact the
-                // operator needs and the counter cannot report.
+                // a firewall rebuild removes the counting rules, so reinstall them on every poll
                 match nft::ensure_carrier_probe() {
                     Ok(true) => emitln!(
                         "{{\"event\":\"carrier-watch-reinstalled\",\"counter\":\"{}\",\"epoch\":{}}}",
@@ -1054,11 +921,7 @@ async fn main() {
         });
     }
 
-    // The shared port (call/0025's fourth admission, plan/0009 #pcp): PCP and
-    // NAT-PMP on UDP 5351, LAN-only, using the same slot engine as every
-    // other admission. It is opt-in because PCP's semantics are entirely
-    // private to this daemon (plan/0004 section 7), and it needs the facade,
-    // which owns the grant machinery.
+    // PCP and NAT-PMP on UDP 5351, LAN-only, opt-in, and it needs the facade for its grant machinery
     if cfg.pcp {
         match &facade {
             Some(f) => match tokio::net::UdpSocket::bind(SocketAddrV4::new(cfg.lan_ip, pcp::PORT)).await {
@@ -1087,16 +950,11 @@ async fn main() {
         }
     }
 
-    // All work happens in spawned tasks; keep main alive. procd sends
-    // SIGTERM on stop. In facade mode a handler sends the SSDP byebye
-    // NOTIFYs before exiting (the init script's stop() removes the nft
-    // ruleset); without the facade the default SIGTERM action applies.
+    // main stays alive; procd sends SIGTERM, and the facade's handler sends the byebye NOTIFYs first
     if let Some(facade) = &facade {
         let f = facade.clone();
         tokio::spawn(async move {
-            // Exit only on a received SIGTERM: a registration failure here
-            // (the guard's Err arm) must leave the default SIGTERM action
-            // in place, never self-terminate moments after boot.
+            // only a received SIGTERM exits: a failed registration must leave the default action in place
             if let Ok(mut sigterm) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             {
@@ -1110,10 +968,7 @@ async fn main() {
     std::future::pending::<()>().await;
 }
 
-/// Seed the facade's external-IP watch from the persisted tuple files
-/// (slot-0's per-slot file first, then the aggregate): the last known
-/// value across respawns, so a pre-discovery GetExternalIPAddress is never
-/// answered with an unset address.
+/// Seed the external-IP watch from the persisted tuple files: the last known value across respawns.
 fn seed_external_ip(state_dir: &str, primary: u16) -> Ipv4Addr {
     let slot_file = format!("{}/tuple-{}", state_dir, primary);
     let agg_file = format!("{}/tuple", state_dir);
@@ -1139,8 +994,7 @@ mod tests {
         v
     }
 
-    /// Flags this parser takes and the help hides on purpose: the diagnostic
-    /// that exits immediately, which is not a daemon flag.
+    /// Flags this parser takes and the help hides on purpose, because it is a diagnostic.
     const HIDDEN: &[&str] = &["--ct-probe"];
 
     /// Whether a token is written like a flag.
@@ -1167,9 +1021,7 @@ mod tests {
             .collect()
     }
 
-    /// The flags this file's match arms take, read from the source above this
-    /// module. Reading the arms is what catches a flag added to the parser
-    /// without the help, which the help text alone cannot show.
+    /// The flags this file's match arms take, read from the source so a new flag cannot hide.
     fn parser_flags_from_source() -> std::collections::BTreeSet<String> {
         let src = include_str!("main.rs");
         let arms = src.split("#[cfg(test)]").next().unwrap_or(src);
@@ -1181,10 +1033,7 @@ mod tests {
             .collect()
     }
 
-    /// The CLI check. `tools/argdoc` holds a clap definition of this
-    /// command line and generates the help text from it, so that definition is
-    /// a second copy of the parser. This test is the seam between the copies:
-    /// the flags the parser takes and the flags the help names are one set.
+    /// The CLI check: tools/argdoc's clap definition and this parser are one set of flags.
     #[test]
     fn the_help_names_exactly_the_flags_the_parser_takes() {
         let parser = parser_flags_from_source();
@@ -1219,10 +1068,7 @@ mod tests {
             .replace("\\-", "-")
     }
 
-    /// The manual page comes from the same clap definition as the help text, so
-    /// it names the same flags, and the sections `tools/argdoc` appends have to
-    /// survive a regeneration. clap_mangen leaves `--help` to the page itself,
-    /// which is why that one flag is not an entry in its OPTIONS.
+    /// The manual page names the same flags as the help, and keeps the appended sections.
     #[test]
     fn the_man_page_names_the_flags_and_keeps_its_appended_sections() {
         let man = roff_text(include_str!("../deploy/man/ds-lite-punch.8"));
@@ -1245,9 +1091,7 @@ mod tests {
             !man.contains(".SH EXTRA"),
             "clap_mangen's EXTRA block is back, and the appended sections already cover it"
         );
-        // The header's centre is the fifth .TH field, which is where a reader
-        // sees this. A renderer's own table for the section shows through when
-        // the name is left in the fourth field, so the fifth is asserted here.
+        // the name is asserted in the fifth .TH field, where a reader sees it instead of the renderer's
         assert!(
             man.contains("\"\" \"Manual\""),
             "the manual's name is not in the header's fifth .TH field, so a reader \
@@ -1255,9 +1099,7 @@ mod tests {
         );
     }
 
-    /// The multi-instance CLI contract (plan/0004 B3): `--static-map` is
-    /// repeatable and order-preserving, the legacy pair is sugar for one entry
-    /// and cannot be combined with it, and every malformed shape names itself.
+    /// The multi-instance CLI contract: `--static-map` is repeatable, and the legacy pair is one entry.
     #[test]
     fn static_map_parse_is_repeatable_and_exclusive() {
         // the repeatable form, in order
@@ -1300,8 +1142,7 @@ mod tests {
         }
     }
 
-    /// The keepalive's flags (call/0025, plan/0009 #allowlist): the allowlist is
-    /// read and validated at parse time, and the two switches default off.
+    /// The keepalive's flags: the allowlist is validated at parse time, and the switches default off.
     #[test]
     fn the_allowlist_is_parsed_and_named() {
         let d = std::env::temp_dir().join(format!("dslp-allow-{}", std::process::id()));
@@ -1348,9 +1189,7 @@ mod tests {
 
     #[test]
     fn seed_external_ip_prefers_slot_over_aggregate() {
-        // Regression (review S6): the seeded GetExternalIPAddress answer
-        // depends on the file order and the trim-before-split; a regression
-        // here silently answered 501 after every reboot with a stale tuple.
+        // the seeded answer depends on the file order and the trim-before-split, so both are asserted here
         let d = std::env::temp_dir().join(format!("dslp-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
