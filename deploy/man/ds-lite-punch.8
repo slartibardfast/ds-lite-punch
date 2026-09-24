@@ -30,7 +30,7 @@ Seconds between the STUN writes that keep the mapping alive. The writes are what
 Next hop used to route STUN out the line the mapping is on. Without it the default route wins and STUN reports the wrong nat. Default 192.168.0.1.
 .TP
 \fB\-\-state\-dir\fR \fI<PATH>\fR
-Directory for the live state: the learned external tuple, the facade\*(Aqs leases, and the DeviceProtection store. It is expected to be on a temporary filesystem, so its contents do not survive a reboot. Default /run/ds\-lite\-punch.
+Directory for the published tuple, the facade\*(Aqs identity and the DeviceProtection store. The lease records and the epoch are kept at their own fixed path, /tmp/dslp. Both directories are on temporary filesystems, so neither survives a reboot. Default /run/ds\-lite\-punch.
 .TP
 \fB\-\-slot\-port\-range\fR \fI<LO\-HI>\fR
 Port range the slot engine allocates from, written LO\-HI. Ports in it must not overlap the relay socket. Default 30000\-39999.
@@ -203,6 +203,19 @@ at start when no store exists.
 .B /run/ds-lite-punch/tuple
 The mapping's learned external address and port, as the carrier reports it.
 Read this file to see the mapping the line currently has.
+.PP
+The lease records keep a path of their own, \fB/tmp/dslp\fR, and not the state
+directory. The daemon writes them there on every change:
+.TP
+.B /tmp/dslp/epoch
+One line: the unix seconds at which the lease table was first created. Read at
+start to continue the PCP announce epoch across a restart.
+.TP
+.B /tmp/dslp/leases.tsv
+One row per slot, and the record a restart re-binds its slots from.
+.TP
+.B /tmp/dslp/upnp.tsv
+The facade's own state, including the mapping it reports to control points.
 .TP
 .B /run/ds-lite-punch/tuple-R
 The same external tuple for the slot whose port is R, one file per slot.
@@ -210,13 +223,6 @@ The same external tuple for the slot whose port is R, one file per slot.
 .B /run/ds-lite-punch/upnp-ident
 The facade's own identity, the uuid it reports to control points. It is stable
 across restarts of the daemon.
-.TP
-.B /run/ds-lite-punch/leases.tsv
-The facade's live leases. The file is written when the facade has leases to
-keep.
-.TP
-.B /run/ds-lite-punch/upnp.tsv
-The facade's own state, including the mapping it reports to control points.
 .TP
 .B /run/ds-lite-punch/dp.tsv
 The DeviceProtection store: users and identities. The directory is on a

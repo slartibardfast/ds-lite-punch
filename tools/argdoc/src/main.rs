@@ -136,12 +136,12 @@ fn cli(version: &str) -> Command {
             Arg::new("state-dir")
                 .long("state-dir")
                 .value_name("PATH")
-                .help("Directory for the live state: the tuple, the leases and the stores.")
+                .help("Where the tuple, the facade identity and the DeviceProtection store live.")
                 .long_help(
-                    "Directory for the live state: the learned external tuple, the facade's \
-                     leases, and the DeviceProtection store. It is expected to be on a \
-                     temporary filesystem, so its contents do not survive a reboot. Default \
-                     /run/ds-lite-punch.",
+                    "Directory for the published tuple, the facade's identity and the \
+                     DeviceProtection store. The lease records and the epoch are kept at \
+                     their own fixed path, /tmp/dslp. Both directories are on temporary \
+                     filesystems, so neither survives a reboot. Default /run/ds-lite-punch.",
                 ),
         )
         .arg(

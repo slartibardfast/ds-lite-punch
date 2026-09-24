@@ -23,7 +23,7 @@ Options:
           Next hop used to route STUN out the line the mapping is on. Without it the default route wins and STUN reports the wrong nat. Default 192.168.0.1.
 
       --state-dir <PATH>
-          Directory for the live state: the learned external tuple, the facade's leases, and the DeviceProtection store. It is expected to be on a temporary filesystem, so its contents do not survive a reboot. Default /run/ds-lite-punch.
+          Directory for the published tuple, the facade's identity and the DeviceProtection store. The lease records and the epoch are kept at their own fixed path, /tmp/dslp. Both directories are on temporary filesystems, so neither survives a reboot. Default /run/ds-lite-punch.
 
       --slot-port-range <LO-HI>
           Port range the slot engine allocates from, written LO-HI. Ports in it must not overlap the relay socket. Default 30000-39999.

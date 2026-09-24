@@ -20,19 +20,23 @@ cat /run/ds-lite-punch/tuple
 That file is the answer to "what does the line hold now". A client that others
 must reach uses that address and port, and the carrier chose the port.
 
-## The state directory
+## The state files
 
-`/run/ds-lite-punch` is on a temporary filesystem, so every file in it is written
-again after a reboot.
+They sit in two directories, and both are on temporary filesystems, so every file
+is written again after a reboot.
 
 | File | What it holds |
 |---|---|
-| `tuple` | the mapping's external address and port |
-| `tuple-R` | the same for the slot whose port is `R`, one file per slot |
-| `upnp-ident` | the facade's own identity, the uuid it reports to control points |
-| `leases.tsv` | the facade's live leases, written when it has any |
-| `upnp.tsv` | the facade's own state |
-| `dp.tsv` | the DeviceProtection store: users and identities, seeded at start from `/etc/ds-lite-punch.acl` |
+| `/run/ds-lite-punch/tuple` | the mapping's external address and port |
+| `/run/ds-lite-punch/tuple-R` | the same for the slot whose port is `R`, one file per slot |
+| `/run/ds-lite-punch/upnp-ident` | the facade's own identity, the uuid it reports to control points |
+| `/run/ds-lite-punch/dp.tsv` | the DeviceProtection store: users and identities, seeded at start from `/etc/ds-lite-punch.acl` |
+| `/tmp/dslp/epoch` | the unix seconds the lease table was first created |
+| `/tmp/dslp/leases.tsv` | one row per slot, and what a restart re-binds its slots from |
+| `/tmp/dslp/upnp.tsv` | the facade's own state |
+
+The first group follows `--state-dir`. The lease records under `/tmp/dslp` keep
+that fixed path whatever `--state-dir` says.
 
 ## Read the events
 
