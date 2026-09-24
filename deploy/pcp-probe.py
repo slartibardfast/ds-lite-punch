@@ -15,8 +15,7 @@ printed as a drop, which is what a mapping whose discovery is still in
 flight must look like: the client's own retransmission is the recovery
 the protocol provides, so a MAP is retried once after four seconds.
 
-Result codes are the RFC 6877 section 7.4 numbering, which is the one
-the daemon ships (the implementation notes' compressed table was wrong).
+Result codes are RFC 6877's numbering, the one the daemon ships.
 """
 import argparse
 import socket
@@ -28,25 +27,15 @@ VERSION = 2
 OP_ANNOUNCE, OP_MAP, OP_PEER = 0, 1, 2
 OPT_THIRD_PARTY, OPT_PREFER_FAILURE, OPT_FILTER = 1, 2, 3
 
-RC = {
-    0: "SUCCESS",
-    1: "UNSUPP_VERSION",
-    2: "NOT_AUTHORIZED",
-    3: "MALFORMED_REQUEST",
-    4: "UNSUPP_OPCODE",
-    5: "UNSUPP_OPTION",
-    6: "MALFORMED_OPTION",
-    7: "NETWORK_FAILURE",
-    8: "NO_RESOURCES",
-    9: "UNSUPP_PROTOCOL",
-    10: "USER_EX_QUOTA",
-    11: "CANNOT_PROVIDE_EXTERNAL",
-    12: "ADDRESS_MISMATCH",
-    13: "EXCESSIVE_REMOTE_PEERS",
-}
+RC = dict(enumerate([
+    "SUCCESS", "UNSUPP_VERSION", "NOT_AUTHORIZED", "MALFORMED_REQUEST",
+    "UNSUPP_OPCODE", "UNSUPP_OPTION", "MALFORMED_OPTION", "NETWORK_FAILURE",
+    "NO_RESOURCES", "UNSUPP_PROTOCOL", "USER_EX_QUOTA",
+    "CANNOT_PROVIDE_EXTERNAL", "ADDRESS_MISMATCH", "EXCESSIVE_REMOTE_PEERS",
+]))
 
-NP = {0: "SUCCESS", 1: "UNSUPP_VERSION", 2: "NOT_AUTHORIZED", 3: "NETWORK_FAILURE",
-      4: "NO_RESOURCES", 5: "UNSUPP_OPCODE"}
+NP = dict(enumerate(["SUCCESS", "UNSUPP_VERSION", "NOT_AUTHORIZED",
+                     "NETWORK_FAILURE", "NO_RESOURCES", "UNSUPP_OPCODE"]))
 
 NONCE = bytes.fromhex("0f1e2d3c4b5a69788796a5b4")
 
