@@ -1,12 +1,4 @@
-//! Shared runtime state + tuple health state machine.
-//!
-//! States, per the design doc:
-//!  - healthy: STUN responses arriving, tuple known.
-//!  - churn:   tuple changed between responses (mapping died + re-created, or
-//!             pool/port-block rotated). Re-publish.
-//!  - blind:   N consecutive keepalives with no response. Rotate STUN server.
-//!             Refresh still works while blind (any outbound UDP refreshes the
-//!             mapping); only *observation* is degraded.
+//! Shared runtime state and the tuple health machine: healthy, churn, and blind after silent keepalives.
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Instant;
 
@@ -61,15 +53,12 @@ impl State {
         changed
     }
 
-    /// Index of a resolved STUN server address, if known.
-    /// Used by the majority vote to attribute an observation to a server.
+    /// Index of a resolved STUN server address, so the vote can attribute an observation to it.
     pub fn server_index(&self, a: SocketAddrV4) -> Option<usize> {
         self.servers.iter().position(|&s| s == a)
     }
 
-    /// Rotate immediately on a disagreeing observation (majority vote
-    /// "mark suspect, rotate on"). Unlike `note_silence`, this does not
-    /// wait for the threshold. No-op (returns false) with a single server.
+    /// Rotate at once on a disagreeing observation; a single server has nowhere to rotate to.
     pub fn mark_suspect(&mut self) -> bool {
         if self.servers.len() > 1 {
             self.server_idx = (self.server_idx + 1) % self.servers.len();
@@ -127,8 +116,7 @@ mod tests {
     }
 }
 
-/// Kani proofs for the pure parts of the state machine (no `Instant`, which
-/// Kani cannot model). Run with `cargo kani`.
+/// Kani proofs for the pure parts of the state machine, which carry no `Instant` for Kani to model.
 #[cfg(kani)]
 mod verify {
     use super::*;
@@ -169,8 +157,7 @@ mod verify {
         kani::assume((1..=8).contains(&threshold));
         st.rotate_after = threshold;
         let only = st.current_server();
-        // With a single server there is nothing to rotate to, so note_silence
-        // must never report a rotation, no matter the threshold.
+        // A single server has nowhere to rotate to, so no threshold ever produces a rotation.
         let n: u32 = kani::any();
         kani::assume(n <= 16);
         for _ in 0..n {
@@ -182,9 +169,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(6)] // len is concretely 2 here
     fn suspect_rotates_within_bounds() {
-        // mark_suspect rotates at most one step and always stays in range,
-        // resets silence; with a single server it is a no-op. DRIVER: no
-        // Instant anywhere, fully Kani-modelable.
+        // mark_suspect moves at most one step, stays in range and resets silence.
         let mut st = two_servers();
         assert!(st.mark_suspect());
         let servers = st.servers.len();

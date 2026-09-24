@@ -1,64 +1,20 @@
-//! The allowlist admission (call/0025, plan/0009 #allowlist): which devices
-//! get the keepalive, and the local ruleset that grants it.
-//!
-//! Two halves make the keepalive, and neither is sufficient. Locally, the router's
-//! own conntrack entry for a quiet device's flow is what the router's NAT
-//! needs in order to translate inbound for that device, and it is reaped at
-//! `nf_conntrack_udp_timeout` (60 s one-way) today. Remotely, only a datagram
-//! from the flow's own post-NAT tuple refreshes the AFTR mapping. This module
-//! owns the local half: the policy objects and the chain that selects them.
-//!
-//! The chain's hook is at mangle priority rather than at raw, and that is a
-//! measurement rather than a preference: at a pre-conntrack priority the
-//! assignment has no effect on this build, and one hook later it does. Both
-//! readings are in this milestone's results record.
-//!
-//! The policy lives in the daemon's own datapath table (`ip dslp`), beside the
-//! named map and the CDC mirror, for one reason: the allowlist drives both
-//! halves of the keepalive, so the process that owns the arm owns the policy, and
-//! there is no file, table or list that can drift from the daemon's own view
-//! of who is admitted. fw4's generator carries no `flush ruleset`, so a
-//! firewall reload regenerates fw4's own tables and leaves this one alone --
-//! the same fact the deployed snat map already relies on. The alternative
-//! (a script include under `/etc/nftables.d`, the pattern the v6 anti-spoof
-//! table uses) is the durable form if the policy should outlive the daemon;
-//! plan/0009's results record names the exact means.
-//!
-//! The allowlist grants maintenance and never authority (call/0025): nothing
-//! here is readable or writable through UPnP, and no role derives from an
-//! entry. The address is the key because the admitted devices are DHCP-pinned;
-//! `ether saddr` is bridge-family and unavailable in the family the datapath
-//! table uses.
+//! The allowlist admission (call/0025): which devices get the keepalive, and the local policy that holds them.
 
 use std::net::Ipv4Addr;
 
-/// The daemon's datapath table: `--static-map` pins, the CDC mirror and this
-/// policy share it.
+/// The daemon's datapath table, shared by the `--static-map` pins, the CDC mirror and this policy.
 pub const TABLE: &str = "ip dslp";
-/// Policy-object names. Both carry the project prefix: nft object names are
-/// global to the table, and the table is shared with the rest of the datapath.
+/// Policy-object names carry the project prefix, because nft object names are global to the shared table.
 pub const UDP_POLICY: &str = "dslp_udp_long";
 pub const TCP_POLICY: &str = "dslp_tcp_long";
-/// The selection chain. Its hook is measured rather than reasoned about: the
-/// same statement at a pre-conntrack raw priority left every entry at the
-/// default sixty seconds on this build, and the same statement one hook later
-/// attaches the policy to the entry the conntrack hook has just created.
-/// Mangle priority sits after conntrack, and fw4's own prerouting chain at the
-/// same priority does not interact with this one.
+/// The selection chain, at prerouting priority -150: a pre-conntrack priority has no effect on this build.
 pub const CHAIN: &str = "hold";
-/// UDP: five minutes in both directions, against the two-minute floor the
-/// mapping requirements set (RFC 4787's UDP mapping lifetime, carried into the
-/// carrier-grade requirements). Above the floor on purpose: the cost of a
-/// longer entry is one dormant conntrack row.
+/// UDP: five minutes in both directions, against the two-minute floor RFC 4787 sets.
 pub const UDP_POLICY_BODY: &str = "policy = { unreplied : 5m, replied : 5m }";
-/// TCP: the established figure RFC 5382 sets (two hours four minutes), which
-/// is also what the router's own default already carries.
+/// TCP: the established figure RFC 5382 sets, two hours four minutes.
 pub const TCP_POLICY_BODY: &str = "policy = { established : 2h4m }";
 
-/// Parse an allowlist file: one IPv4 address per line, `#` starts a comment,
-/// blank lines are ignored. Returns the admitted addresses (in file order,
-/// de-duplicated) and the lines that could not be read as an address, so a
-/// malformed entry is reported rather than silently dropped.
+/// Parse an allowlist file: one IPv4 address per line, `#` starts a comment, and an unreadable entry is reported.
 pub fn parse(text: &str) -> (Vec<Ipv4Addr>, Vec<String>) {
     let mut list = Vec::new();
     let mut bad = Vec::new();
@@ -79,15 +35,12 @@ pub fn parse(text: &str) -> (Vec<Ipv4Addr>, Vec<String>) {
     (list, bad)
 }
 
-/// Whether `ip` is admitted for the keepalive. Pure membership: the entry carries
-/// no role, so this answer is only ever "maintain this flow", never "trust".
+/// Whether `ip` is admitted for the keepalive: pure membership, since an entry carries no role.
 pub fn allowed(list: &[Ipv4Addr], ip: Ipv4Addr) -> bool {
     list.contains(&ip)
 }
 
-/// The nft batch that installs the policy for `list`. Empty when the list is
-/// empty: no admitted device means no policy object, no chain, and every flow
-/// keeps the router's own timeouts.
+/// The nft batch that installs the policy for `list`; an empty list installs nothing.
 pub fn ruleset(list: &[Ipv4Addr]) -> String {
     if list.is_empty() {
         return String::new();
@@ -118,8 +71,7 @@ pub fn ruleset(list: &[Ipv4Addr]) -> String {
     )
 }
 
-/// The nft batch that removes the policy: the chain first (the selection),
-/// then the two objects. Idempotent by the caller's tolerance, not here.
+/// The nft batch that removes the policy: the chain first, then the two policy objects.
 pub fn teardown() -> String {
     format!(
         "delete chain {table} {chain}\n\
@@ -132,9 +84,7 @@ pub fn teardown() -> String {
     )
 }
 
-/// Whether `nft list table ip dslp` output already carries the policy. The
-/// install is guarded by this because re-adding an existing `ct timeout`
-/// object is an error under `nft -f`, and the batch would then apply nothing.
+/// Whether the listing already carries the policy; a re-added `ct timeout` object is an error under `nft -f`.
 pub fn present(listed: &str) -> bool {
     listed.contains(&format!("ct timeout {}", UDP_POLICY))
 }
@@ -190,15 +140,12 @@ mod tests {
         assert!(rs.contains(UDP_POLICY_BODY), "{}", rs);
         assert!(rs.contains(&format!("ct timeout {}", TCP_POLICY)), "{}", rs);
         assert!(rs.contains(TCP_POLICY_BODY), "{}", rs);
-        // the keyword this build accepts in an object, and not the one it
-        // rejects there; `l4proto` is the selection matcher's, and the split
-        // keeps the two apart
+        // The object carries `protocol`; `meta l4proto` is the selection matcher's keyword.
         let objects = rs.split(&format!("chain {CHAIN}")).next().unwrap();
         assert!(objects.contains("protocol udp"), "{}", objects);
         assert!(objects.contains("protocol tcp"), "{}", objects);
         assert!(!objects.contains("l4proto"), "object keyword: {}", objects);
-        // the selection, as one inline list (the whole batch is regenerated
-        // from the allowlist, so a set object would buy nothing)
+        // The selection is one inline list, since the whole batch is regenerated from the allowlist.
         assert!(
             rs.contains("ip saddr { 192.168.21.68, 192.168.21.138 } meta l4proto udp ct timeout set"),
             "{}",
@@ -209,12 +156,7 @@ mod tests {
             "{}",
             rs
         );
-        // The hook is measured, not chosen: `ct timeout set` at a
-        // pre-conntrack raw priority has no effect on this build (the entry
-        // keeps the default 60 s), while the same statement at mangle
-        // priority attaches the policy to the entry the conntrack hook has
-        // just created. Both were read back from `/proc/net/nf_conntrack` on
-        // the router, 2026-09-18.
+        // The hook is measured: at a pre-conntrack priority the entry keeps the default 60 s on this build.
         assert!(rs.contains("hook prerouting priority -150"), "{}", rs);
         assert!(!rs.contains("priority raw"), "the hook that does not work: {}", rs);
         // `ether saddr` is bridge-family; the key is the address
@@ -228,16 +170,12 @@ mod tests {
 
     #[test]
     fn ruleset_is_the_validated_table_block_form() {
-        // The shape validated on the router (2026-09-17) is a table block
-        // applied with `nft -f`, not a sequence of `nft add` calls: the
-        // objects are declared inside the block, exactly as validated. The
-        // batch adds; it never deletes anything of its own.
+        // The shape validated on the router is one table block applied with `nft -f`.
         let rs = ruleset(&[a("192.168.21.68")]);
         assert!(rs.starts_with(&format!("table {} {{\n", TABLE)), "{}", rs);
         assert!(rs.contains(&format!("\tchain {} {{\n", CHAIN)), "{}", rs);
         assert!(!rs.contains("delete"), "install never deletes: {}", rs);
-        // the table block is re-entered, not declared fresh: the datapath
-        // table (named map, CDC mirror) is already there and stays there
+        // The table block is re-entered, since the named map and the CDC mirror are already there.
         assert!(!rs.contains("flush"), "install never flushes: {}", rs);
     }
 

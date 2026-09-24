@@ -1,10 +1,4 @@
-//! Source-preserving UDP forward. The relay must deliver inbound peer
-//! datagrams to the br-lan target with the *peer's* public source address
-//! intact (the console's NAT-traversal logic depends on seeing real peer
-//! addresses). A normal bound socket would stamp the router's address, so we
-//! open an IP_TRANSPARENT socket, bind it to the peer's (ip, port), and send
-//! — validated on-box 2026-08-29 (PoC in MEMORY.md). One socket per datagram
-//! is deliberately simple; swap for a pooled/raw socket if pps ever matters.
+//! Source-preserving UDP forward: an `IP_TRANSPARENT` socket bound to the peer's (ip, port).
 use std::io;
 use std::net::SocketAddrV4;
 

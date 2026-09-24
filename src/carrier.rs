@@ -1,18 +1,6 @@
-//! The watcher for the carrier's filtering (call/0033).
-//!
-//! The daemon cannot send from a foreign address, so a cooperating helper on
-//! the external vantage sends a marked datagram to the mapping's learned
-//! external tuple. The datapath counts that mark in a named `nft` counter, and
-//! this module turns the counter's readings into the two events the decision
-//! names: `carrier-probe` when a probe arrived, and `carrier-silent` when
-//! three intervals pass with none.
-//!
-//! The state machine is pure. The caller supplies the epoch and the counter's
-//! reading, which keeps the detection arithmetic testable away from the box.
+//! The carrier-filtering watcher (call/0033): a rising counter is `carrier-probe`, silence `carrier-silent`.
 
-/// The mark the helper puts in the first eight bytes of the datagram's
-/// payload. The datapath matches it with `@th,64,64`, and the length is the
-/// contract: a shorter or longer mark is a different rule.
+/// The mark in the payload's first eight bytes, matched with `@th,64,64`; a different length is a different rule.
 pub const MARK: &[u8; 8] = b"dslp-prb";
 
 /// The mark as the 64-bit word the `nft` rule compares against.
@@ -22,8 +10,7 @@ pub const MARK_WORD: u64 = u64::from_be_bytes(*MARK);
 pub enum Event {
     /// A probe arrived since the last poll.
     Probe { count: u64 },
-    /// No probe was seen for `misses` intervals. `last_seen` is `None` when
-    /// the watch has never seen one.
+    /// No probe for `misses` intervals; `last_seen` is the last probe's epoch, or `None` when there has been none.
     Silent {
         last_seen: Option<u64>,
         waited: u64,

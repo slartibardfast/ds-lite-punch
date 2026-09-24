@@ -1,20 +1,9 @@
-//! Is a device on the LAN? One rule, used by everything that holds a mapping
-//! for a device: the arm's holds and the facade's leases both need it.
-//!
-//! The neighbour table is the instrument, not an echo. Measured on the router:
-//! a console that drops ICMP still answers ARP, and a device that is off
-//! leaves FAILED or INCOMPLETE behind. An ICMP echo is only a trigger, to make
-//! the kernel settle an entry we cannot read, and never the answer.
-//!
-//! A probe that cannot run answers "up": a broken instrument must never
-//! release a live mapping.
+//! Is a device on the LAN? One rule, used by the arm's holds and the facade's leases alike.
 
 use std::net::Ipv4Addr;
 use std::process::Command;
 
-/// Consecutive misses before a caller treats the device as gone. Two is the
-/// default: one miss can be a Wi-Fi blip or a sleeping radio, two in a row is
-/// a device that is not answering on the LAN.
+/// Consecutive misses before a caller treats the device as gone: two, because one miss can be a Wi-Fi blip.
 pub const MISSES_TO_ABSENT: u8 = 2;
 
 pub fn device_up(ip: Ipv4Addr) -> bool {
@@ -42,10 +31,7 @@ fn neigh_state(ip: &str) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// Whether a neighbour listing says the device answered on the LAN. A listing
-/// with a link-layer address means it did, whatever the state; FAILED or
-/// INCOMPLETE means a probe went unanswered; anything else counts as present,
-/// so a failure of this instrument never releases a live mapping.
+/// Whether a listing says the device answered: `FAILED` or `INCOMPLETE` means no, anything else present.
 pub fn neigh_answers(listing: &str) -> bool {
     let l = listing.trim();
     if l.is_empty() {
@@ -57,13 +43,7 @@ pub fn neigh_answers(listing: &str) -> bool {
     true
 }
 
-/// The release rule for a mapping that belongs to a client: a requested
-/// mapping ends when its client is no longer on the LAN, and never for the
-/// client being quiet — a lobby, a paused game and a sleeping screen all look
-/// like quiet, and the mapping is exactly what must survive them. A static
-/// mapping is the operator's configuration and is never released here.
-///
-/// Pure, so the policy is testable without a network.
+/// Whether to release a client's mapping: a device past the miss threshold, and never a static or a quiet one.
 pub fn release_absent(is_static: bool, misses: u8) -> bool {
     !is_static && misses >= MISSES_TO_ABSENT
 }
@@ -74,8 +54,7 @@ mod tests {
 
     #[test]
     fn the_neighbour_table_is_the_presence_signal() {
-        // Measured shapes from the router: the Switch present with a MAC and
-        // dropping ICMP, the PS3 absent and answering no ARP at all.
+        // Measured shapes: a console that drops ICMP still answers ARP, and a device that is off leaves FAILED.
         assert!(neigh_answers("192.168.21.68 dev br-lan lladdr 80:d2:e5:6d:d1:00 DELAY"));
         assert!(neigh_answers("192.168.21.68 dev br-lan lladdr 80:d2:e5:6d:d1:00 STALE"));
         assert!(!neigh_answers("192.168.21.138 dev br-lan FAILED"));
