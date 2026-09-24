@@ -1,26 +1,16 @@
 #!/bin/sh /etc/rc.common
-# ds-lite-punch — CGNAT-aware UDP relay for the Virgin Media ds-lite line.
-# ImmortalWrt uses procd (not systemd); config lives in /etc/ds-lite-punch.env.
+# ds-lite-punch: the CGNAT-aware UDP relay, run by procd, configured in /etc/ds-lite-punch.env.
 USE_PROCD=1
 START=95
 STOP=10
 
 PROG=/usr/bin/ds-lite-punch
 CONF=/etc/ds-lite-punch.env
-# The DeviceProtection bootstrap (call/0023). The ACL and user store lives in
-# the state directory, which is tmpfs and therefore lost on reboot, and the
-# daemon has no in-band way to create its first identity (the introduction
-# protocol is deferred, call/0021). So a root-owned file here seeds it: on
-# start, if no store exists yet, the file is copied in as dp.tsv. Absent the
-# file the store stays empty and every role-gated action answers 606, which is
-# the fail-closed default. Set DEVICE_PROTECTION_ACL= to something else in the
-# env file to move it, or to "none" to disable the seed.
+# Seed the DeviceProtection store from /etc/ds-lite-punch.acl at start, when no store exists; without it every gated action answers 606.
 ACL_DEFAULT=/etc/ds-lite-punch.acl
 STATE=/run/ds-lite-punch
 
-# Remove the ds-lite-punch nft datapath: the named-map ruleset table plus
-# any per-slot input-accepts (comments dslitepunch / dslitepunch-<R>).
-# Idempotent; keeps the router state clean after stop (merge-gate item).
+# Remove the daemon's datapath: its own table, and the per-slot accepts it inserted in the firewall's tables.
 cleanup_nft() {
     nft delete table ip dslp 2>/dev/null
     for h in $(nft -a list chain inet fw4 input 2>/dev/null \
@@ -54,43 +44,28 @@ start_service() {
         fi
     fi
 
-    # Legacy single-map input-accept (P1 path). The daemon installs its own
-    # per-slot accepts (comment dslitepunch-<R>) at startup (B4); this rule
-    # is kept while P1 flag semantics are supported.
+    # A legacy single-map input accept, kept while the single-map form is supported.
     if ! nft list chain inet fw4 input 2>/dev/null | grep -q dslitepunch; then
         nft insert rule inet fw4 input iifname "eth1" udp dport "${BIND##*:}" accept comment dslitepunch
     fi
 
-    # The facade is default-on; an operator with a real IGD on the LAN (or
-    # a dead UDP 1900) can disable it via UPNP=0 in the env file — the rc
-    # the environment must carry the flag, or an opkg upgrade would overwrite
-    # every fix.
+    # An opkg upgrade replaces this script, so the settings belong in the env file.
     NO_UPNP=
     [ "${UPNP:-1}" = "1" ] || NO_UPNP=--no-upnp
 
-    # The keepalive's admission (call/0025): the allowlist names the devices whose
-    # flows get the RFC lifetimes, and KEEPALIVE=1 turns the arm from reporting
-    # them to keeping them alive. The conntrack policy is installed in the daemon's own
-    # table (ip dslp), so cleanup_nft's table delete reverts it with the rest
-    # of the datapath and no firewall include has to be kept in step.
+    # The keepalive: the allowlist names the devices, and KEEPALIVE=1 turns the arm from reporting their flows to keeping their mappings alive.
     ALLOW=
     if [ -n "$ALLOWLIST" ] && [ -f "$ALLOWLIST" ]; then
         ALLOW="--allowlist $ALLOWLIST"
         [ "${KEEPALIVE:-0}" = "1" ] && ALLOW="$ALLOW --keepalive"
     fi
 
-    # The shared port (plan/0009 #pcp): PCP and NAT-PMP on UDP 5351. Off by
-    # default, because PCP is a whole dialect this daemon owns privately and
-    # nothing on the LAN asked for it.
+    # The shared port: PCP and NAT-PMP on UDP 5351, off by default because nothing on a LAN asks for PCP.
     PCPF=
     [ "${PCP:-0}" = "1" ] && PCPF="--pcp"
     [ "${PCP_PEER:-0}" = "1" ] && PCPF="$PCPF --pcp-peer"
 
-    # The carrier watch (call/0033): the counter that records the cooperating
-    # helper's marked probe, and the silence that raises carrier-silent. Off
-    # by default, because arming it obliges the helper (deploy/
-    # carrier-probe.py) to run on a host outside the line: a helper that
-    # stopped and a carrier that stopped look the same to the counter.
+    # The carrier watch: the counter that records the helper's marked probe, and the alarm when it stops rising.
     WATCHF=
     [ "${CARRIER_PROBE:-0}" = "1" ] && WATCHF="--carrier-probe"
     [ -n "$CARRIER_PROBE_INTERVAL" ] &&

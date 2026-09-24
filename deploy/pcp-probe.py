@@ -70,10 +70,7 @@ def option(code, payload):
 
 
 def send(sock, payload, wait=4.0):
-    # The socket is connected, so the kernel picks the source address and the
-    # probe can name it in the PCP client field: a request whose field does
-    # not match the source it arrives with earns ADDRESS_MISMATCH, which is
-    # the rule the server must apply (RFC 6887 section 8.2).
+    # Connected, so the kernel picks the source address the client field must name: a mismatch earns ADDRESS_MISMATCH.
     sock.send(payload)
     sock.settimeout(wait)
     try:
@@ -168,8 +165,7 @@ def main():
               + option(OPT_PREFER_FAILURE, b""))
     show_pcp("MAP with PREFER_FAILURE", send(sock, prefer), time.time())
 
-    # The real thing: a MAP, retried once because a mapping whose discovery
-    # has not been answered yet is dropped, and no guess is sent.
+    # A MAP, retried once: a mapping whose discovery is unanswered is dropped, and the retry follows the grace.
     req = pcp_header(OP_MAP, args.lifetime, client) + pcp_map_body(args.proto, args.int_port, args.suggest)
     sent_at = time.time()
     resp = send(sock, req, wait=4.0)
@@ -179,12 +175,7 @@ def main():
         sent_at = time.time()
         got = show_pcp("MAP (retry)", send(sock, req, wait=8.0), sent_at)
     if args.hold and got is not None and got[3] == 0:
-        # The mapping is held open on purpose. The client now goes silent and
-        # answers nothing, and this socket is where the outside's probes land.
-        # The association the requests used is dissolved first: a connected
-        # UDP socket delivers only from the peer it is connected to, and the
-        # probes come from an unrelated address; Linux dissolves the
-        # association when the socket is connected to the wildcard.
+        # The outside's probes must land here, so the association is dissolved first: a connected socket delivers only from its peer.
         sock.connect(("0.0.0.0", 0))
         sock.settimeout(None)
         print("KEEPALIVEING: the client is silent; the mapping is the daemon's", flush=True)

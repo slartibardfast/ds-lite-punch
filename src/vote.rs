@@ -1,52 +1,21 @@
-//! STUN majority vote (brief v2, B6).
-//!
-//! EIM means every contacted STUN server must return the same
-//! XOR-MAPPED-ADDRESS for our tuple; a *disagreement* is either a churn
-//! event or a lying/broken server. Publishing on a single server's word
-//! would flap the tuple file on transient lies, so: one server reporting a
-//! NEW value marks it suspect (rotation candidate, no republish); the
-//! second agreeing server confirms churn and triggers republish. Re-seeing
-//! the confirmed tuple clears all suspicion (the disagreement was
-//! transient).
-//!
-//! The confirmed tuple (NOT the per-server observations) is the canonical
-//! value consumed by publication (B6) and by E3 GetExternalIPAddress.
-//!
-//! Pure data + small fixed arrays so Kani can prove the truth table:
-//!   - first observation ever confirms immediately (P1 startup behavior:
-//!     no forwarding before a tuple exists);
-//!   - re-seeing `confirmed` is always Stable and clears suspicion;
-//!   - one disagreeing observation is never Churn;
-//!   - two agreeing observations on the same new value are always Churn;
-//!   - confirmed only ever moves to an observed, 2-server-agreed value.
-//!
-//! Interim `dead_code` allowance (p2-slot-engine): `confirmed()` is
-//! consumed by the E3 facade; publication reads the Churn tuple directly.
-//! Remove this allow when the facades are finished (D/E) and the merge-gate build
-//! runs `cargo build -D warnings`.
+//! STUN majority vote: the confirmed tuple is canonical, and it moves only to a value two servers agree on.
 #![allow(dead_code)]
 use std::net::Ipv4Addr;
 
-/// Max STUN servers the vote tracks. Must be >= 2 for the vote to work;
-/// the daemon ships 2+ by default.
+/// Max STUN servers the vote tracks; must be >= 2 for the vote to work.
 pub const MAX_VOTE_SERVERS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VoteDecision {
-    /// Response matched `confirmed` (or confirmed was already this value):
-    /// no state change, no publication.
+    /// Response matched confirmed, or confirmed was already this value: no state change and no publication.
     Stable,
-    /// One server reported a value differing from `confirmed`: mark suspect
-    /// (rotate), do NOT republish.
+    /// One server reported a value differing from confirmed: mark it suspect and do not republish.
     Disagree(usize),
-    /// `confirmed` moved to a new tuple: republish. Also returned for the
-    /// very first observation (startup).
+    /// confirmed moved to a new tuple, or this is the first observation ever: republish.
     Churn((Ipv4Addr, u16)),
 }
 
-/// Per-server latest observation within the current decision window,
-/// sentinel-slotted: `None` = server has not weighed in yet. Servers map to
-/// slots by index, so there is no collision bookkeeping.
+/// Per-server latest observation, sentinel-slotted (None = not weighed in): no collision bookkeeping.
 #[derive(Clone, Debug)]
 pub struct VoteState {
     confirmed: Option<(Ipv4Addr, u16)>,
@@ -69,10 +38,7 @@ impl VoteState {
         self.pend = [None; MAX_VOTE_SERVERS];
     }
 
-    /// Record `server` observing `t` and return the decision.
-    /// `server` must index within MAX_VOTE_SERVERS (caller contract: the
-    /// daemon passes the index of a resolved STUN server; the rotation list
-    /// is capped by the config, default 2).
+    /// Record server observing t and return the decision; server must index within MAX_VOTE_SERVERS.
     pub fn observe(&mut self, server: usize, t: (Ipv4Addr, u16)) -> VoteDecision {
         if self.confirmed == Some(t) {
             // Re-seeing the confirmed value heals any transient suspicion.
@@ -94,8 +60,7 @@ impl VoteState {
             self.clear_pend();
             return VoteDecision::Churn(t);
         }
-        // Not yet agreed -> if this is the very first observation ever,
-        // confirm immediately (single-server startup, P1 parity).
+        // not yet agreed, and this is the very first observation ever, so confirm on one server's word
         if self.confirmed.is_none() {
             self.confirmed = Some(t);
             self.clear_pend();
@@ -159,9 +124,7 @@ mod tests {
         v.observe(1, (B, 50000)); // disagree
         assert_eq!(v.observe(1, (A, 40000)), VoteDecision::Stable, "re-agree with confirmed clears suspicion");
         assert_eq!(v.confirmed(), Some((A, 40000)));
-        // after heal, the old disagreeing server still participates: it must
-        // re-report the new value before churn can happen - and now B is the
-        // value under test, with server 1 the only server on the old value -> Disagree.
+        // after a heal the old disagreeing server still participates, and must re-report the new value
         assert!(matches!(v.observe(1, (B, 50000)), VoteDecision::Disagree(_)));
     }
 }
@@ -203,8 +166,7 @@ mod verify {
         let u = addr_u8();
         kani::assume(t != u);
         v.observe(0, t);
-        // Only one server (0) has reported; a differing observation from any
-        // single slot must not churn.
+        // only one server has reported, so a differing observation from a single slot must not churn
         assert!(!matches!(v.observe(1, u), VoteDecision::Churn(_)));
         assert_eq!(v.confirmed(), Some(t));
     }

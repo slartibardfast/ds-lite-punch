@@ -12,8 +12,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 libc = "0.2"
 
-# Register the `kani` cfg so rustc doesn't warn about the #[cfg(kani)] proof
-# modules when Kani isn't running.
+# Register the kani cfg so rustc stays quiet about the proof modules when Kani is not running.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 

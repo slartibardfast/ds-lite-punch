@@ -1,10 +1,5 @@
 #!/bin/sh
-# Check that every relative link in the authored docs resolves to a file in this
-# repository. External links are not fetched, so the check stays offline and
-# cannot fail because of a network.
-#
-# Run from the repository root:
-#   sh tools/link-check.sh
+# Fail when a relative link in the authored docs resolves to nothing; external links are never fetched. Run it from the repository root as: sh tools/link-check.sh
 set -u
 
 missing=0

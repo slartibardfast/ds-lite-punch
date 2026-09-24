@@ -1,33 +1,11 @@
-//! Slot engine core: deterministic per-mapping state, lease table with two
-//! lookup indices (PCP key / UPnP key), fixed-port-range allocator, epoch
-//! and lease persistence.
-//!
-//! All table logic is pure over small `Vec`s (max `--max-slots`, default 32)
-//! so Kani can prove it; the runtime layer (sockets, nft, STUN) lives in
-//! `main.rs` and the facade modules. Linear scans are deliberate: at ≤32
-//! slots they are nanoseconds, and they keep the proofs simple.
-//!
-//! Invariants (Kani-checked):
-//!   - one slot per distinct (client, int_port); two indices never diverge;
-//!   - bind ports are unique and drawn from [lo, hi] (allocator);
-//!   - delete returns the port to the allocator; respawn-restore re-allocates
-//!     the exact same ports;
-//!   - epoch never decreases for a fixed `created_unix` and restarts near 0
-//!     after a simulated reboot (tmpfs loss).
-//!
-//! Interim `dead_code` allowance (p2-slot-engine): consumers appear
-//! incrementally — nft element calls (B4), persistence (B6), GC timer (B9),
-//! PCP/UPnP facades (D/E). Remove this allow when the B10 merge gate runs
-//! `cargo build -D warnings`.
+//! Slot engine core: deterministic per-mapping state, the lease table, the port allocator and the epoch.
 #![allow(dead_code)]
 use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---- protocol ----
 
-/// UDP and TCP. TCP was structurally refused until C3 measured the AFTR
-/// TCP mapping idle lifetime (results/RESULTS-2026-09-13-c3.md); the
-/// refusal is lifted by call/0017.
+/// UDP and TCP, the two protocols a slot can carry.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Proto {
     Udp,
@@ -51,9 +29,7 @@ pub enum LeaseKind {
     Granted,
 }
 
-/// A mapping grant. `expires_at_unix` is wall-clock seconds (0 = none for
-/// Static). Kept as plain integers — not `Instant` — so expiry/GC arithmetic
-/// is Kani-provable.
+/// A mapping grant; wall-clock seconds, kept integral so the expiry arithmetic is provable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lease {
     Static,
@@ -91,7 +67,7 @@ pub struct Slot {
     pub target: Ipv4Addr,
     pub target_port: u16,
     pub lease: Lease,
-    /// STUN stagger offset in ms (see B5); 0 for the single-slot baseline.
+    /// STUN stagger offset in ms; 0 for the single-slot baseline.
     pub phase_ms: u32,
     /// Wall-clock seconds of last inbound traffic (0 = none seen yet).
     pub last_activity_unix: u64,
@@ -102,8 +78,7 @@ impl Slot {
         matches!(self.lease, Lease::Static)
     }
 
-    /// PCP key: (proto, internal port, client). Slots without a client (Static)
-    /// are not addressable by PCP.
+    /// PCP key: (proto, internal port, client); slots without a client (Static) are not addressable by PCP.
     pub fn pcp_key(&self) -> Option<(Proto, u16, Ipv4Addr)> {
         match self.lease {
             Lease::Granted { client, int_port, .. } => Some((self.proto, int_port, client)),
@@ -121,11 +96,7 @@ impl Slot {
 
 // ---- port allocator ----
 
-/// Fixed-range allocator over `[lo, hi]`. Lowest free port first → respawn
-/// restores are deterministic. The *used* set is a sorted `Vec` (≤
-/// `--max-slots` entries): at that bound linear membership is nanoseconds,
-/// and arrays/slices are what the Kani proofs can model — a `BTreeSet`
-/// stalled the solver.
+/// Fixed-range allocator over [lo, hi], lowest free port first, with a sorted Vec the proofs can model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortAllocator {
     pub lo: u16,
@@ -140,8 +111,7 @@ impl PortAllocator {
         Some(PortAllocator { lo, hi })
     }
 
-    /// Allocate the first free port in [lo,hi] not present in `used`
-    /// (sorted, unique). Returns None when the range is exhausted.
+    /// Allocate the first free port in [lo,hi] not present in used; None when the range is exhausted.
     pub fn allocate(&self, used: &[u16]) -> Option<u16> {
         for port in self.lo..=self.hi {
             if !used.contains(&port) {
@@ -158,8 +128,7 @@ impl PortAllocator {
 
 // ---- lease table ----
 
-/// Result of a MAP/AddPortMapping upsert. Mirrors the facade result codes
-/// (0 = success path).
+/// Result of a MAP/AddPortMapping upsert, mirroring the facade result codes (0 = success path).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UpsertOutcome {
     Granted { bind_port: u16 },
@@ -168,19 +137,14 @@ pub enum UpsertOutcome {
     TableFull,
 }
 
-/// The slot table. `slots` is the single source of truth; the two lookup
-/// indices are derived views kept in sync by the mutation operations.
+/// The slot table; slots is the single source of truth, and the two lookup indices are derived views.
 #[derive(Clone, Debug)]
 pub struct LeaseTable {
     slots: Vec<Slot>,
     allocator: PortAllocator,
     max_slots: usize,
     max_maps_per_client: u16,
-    /// Ports a live flow already holds: the punch collision rule (call/0027).
-    /// A tuple the change-data-capture shows live belongs to whoever punched
-    /// it, so the allocator MUST NOT put a slot on it. Sorted and unique, and
-    /// replaced on every refresh rather than accumulated, so a tuple that
-    /// goes quiet stops reserving its port.
+    /// Ports a live flow already holds: a live tuple belongs to whoever punched it, not to a new slot.
     avoid: Vec<u16>,
 }
 
@@ -207,13 +171,7 @@ impl LeaseTable {
         self.allocator
     }
 
-    /// First free port in [lo,hi] scanning live slots directly — no
-    /// intermediate collection, so Kani only sees iteration over arrays.
-    /// The first bind port neither this table nor a live punch holds: the
-    /// allocation's probe before it claims (call/0027 R3). A port a live flow
-    /// already uses is not available, because the AFTR keys its mapping on
-    /// the inner tuple and two local owners of one tuple share one inbound
-    /// path.
+    /// First bind port neither this table nor a live punch holds: the probe before the allocation claims.
     fn find_free_bind_port(&self) -> Option<u16> {
         for port in self.allocator.lo..=self.allocator.hi {
             if self.avoid.contains(&port) {
@@ -226,10 +184,7 @@ impl LeaseTable {
         None
     }
 
-    /// Replace the live-tuple reservation. Callers pass the ports of the
-    /// post-NAT tuples the change-data-capture currently shows, which is the
-    /// same liveness the observation arm reads, so both mechanisms cannot
-    /// disagree about what is in use (call/0027 R2/R3).
+    /// Replace the live-tuple reservation with the ports the change-data-capture currently shows.
     pub fn avoid_ports(&mut self, live: &[u16]) {
         self.avoid = live
             .iter()
@@ -240,15 +195,7 @@ impl LeaseTable {
         self.avoid.dedup();
     }
 
-    /// The bind ports a device's flow has taken: call/0028's signature, a
-    /// connection entry whose NAT side is one of our tuples while its origin
-    /// is a br-lan host. The slot's own punch egresses from the NAT address
-    /// and an outside peer's datagram carries the peer's source, so neither
-    /// reads as a collision; a device's flow does, because that flow is the
-    /// incumbent (call/0027 R2) and the port is not ours to take back.
-    ///
-    /// The addresses are the daemon's constants, the same ones the
-    /// observation arm's predicate uses, so both mechanisms read one world.
+    /// The bind ports a device's flow has taken: a connection whose NAT side is our tuple.
     pub fn collided(&self, proc_text: &str) -> Vec<u16> {
         let ctx = crate::obs::brlan_ctx();
         let mut out: Vec<u16> = Vec::new();
@@ -260,11 +207,7 @@ impl LeaseTable {
             if nat != ctx.vm_nat || !ctx.is_brlan(e.orig_src) {
                 continue;
             }
-            // A static is the operator's configuration (call/0030), so a
-            // device's flow on a static's port is reported and the port is
-            // left where the config put it: moving it would diverge the
-            // running state from the config that produced it. A granted
-            // lease is the daemon's, and R4 yields it.
+            // A static is the operator's, so a device's flow on its port is reported and the port is left alone.
             if self
                 .slots
                 .iter()
@@ -278,15 +221,10 @@ impl LeaseTable {
         out
     }
 
-    /// R4: yield a port a device's flow has taken. The slot keeps its client,
-    /// its internal port and the label the client asked for; it takes a port
-    /// the probe leaves free, and the caller re-establishes the datapath on
-    /// the new one and reports the substitution (R5). `None` means the range
-    /// had nowhere to go, and the slot keeps what it has.
+    /// Yield a port a device's flow has taken, keeping the lease's client, port and label; None when full.
     pub fn move_bind_port(&mut self, old: u16) -> Option<u16> {
         let idx = self.slots.iter().position(|s| s.bind_port == old)?;
-        // the old port's tuple is a device's now, so the probe must not hand
-        // it back to us
+        // the old port's tuple is a device's now, so the probe must not hand it back to us
         if !self.avoid.contains(&old) {
             self.avoid.push(old);
             self.avoid.sort_unstable();
@@ -296,23 +234,19 @@ impl LeaseTable {
         Some(new)
     }
 
-    /// Put a lease back where it was when a move could not be completed. The
-    /// port it came from stays in the probe's view, because a device's flow
-    /// holds it now.
+    /// Put a lease back where it was when a move could not be completed; the old port stays reserved.
     pub fn restore_bind_port(&mut self, from: u16, to: u16) {
         if let Some(s) = self.slots.iter_mut().find(|s| s.bind_port == from) {
             s.bind_port = to;
         }
     }
 
-    /// What the rule is currently steering around, for the log (R5).
+    /// What the rule is currently steering around, for the log.
     pub fn reserved_ports(&self) -> Vec<u16> {
         self.avoid.clone()
     }
 
-    /// The ports the probe skipped on the way to `chosen`: live tuples below
-    /// the port it took, which are the ones the rule actually decided. Empty
-    /// means the choice was free and no collision was in play.
+    /// The live tuples the probe skipped on the way to chosen; empty means the choice was free.
     pub fn avoid_steering(&self, chosen: u16) -> Vec<u16> {
         self.avoid
             .iter()
@@ -336,11 +270,7 @@ impl LeaseTable {
 
     /// UPnP index: (bookkeeping ext port, proto) -> slot.
     pub fn by_upnp_key(&self, ext_port: u16, proto: Proto) -> Option<&Slot> {
-        // Bookkeeping external port == bind port for UPnP grants: the AFTR's
-        // real external port is discovered via STUN and reported separately
-        // (E3 GetExternalIPAddress / D4). The UPnP control point key is the
-        // port it requested; we treat R as that key so delete/enumerate are
-        // unambiguous and unique.
+        // The bookkeeping external port is the bind port, since the AFTR's real port is learned by STUN.
         self.slots.iter().find(|s| s.bind_port == ext_port && s.proto == proto)
     }
 
@@ -363,8 +293,7 @@ impl LeaseTable {
 
     // -- mutations --
 
-    /// Insert or refresh a PCP-keyed lease. Returns the slot's bind port.
-    /// Errors: quota / capacity / TCP. Never duplicates a (client,int_port).
+    /// Insert or refresh a PCP-keyed lease; never duplicates a (client, int_port).
     pub fn upsert_pcp(
         &mut self,
         proto: Proto,
@@ -376,8 +305,7 @@ impl LeaseTable {
         target_port: u16,
     ) -> UpsertOutcome {
         if let Some(idx) = self.index_of_key(proto, int_port, client) {
-            // refresh: extend expiry, keep R and target. The client is
-            // provably present (it just sent Add): stamp last-seen too.
+            // refresh: extend expiry, keep R and target, and stamp last-seen since the client is present
             self.slots[idx].lease = Lease::Granted {
                 client,
                 int_port,
@@ -416,13 +344,7 @@ impl LeaseTable {
         UpsertOutcome::Granted { bind_port }
     }
 
-    /// Insert a static lease from config (`--static-map R=ip:port`).
-    /// Statics are UDP by definition: the classic relay datapath. A TCP
-    /// pin arrives via the grant path (call/0017).
-    ///
-    /// Error is a `Copy` enum, not `String`: the Kani proofs exercise
-    /// `restore`/`insert_static` and must not model heap allocation in the
-    /// error paths; messages are formatted at the call site.
+    /// Insert a static lease from config; a static is UDP, and a TCP pin comes via the grant path.
     pub fn insert_static(
         &mut self,
         bind_port: u16,
@@ -451,13 +373,7 @@ impl LeaseTable {
         self.slots.iter().position(|s| s.pcp_key() == Some((proto, int_port, client)))
     }
 
-    /// Remove a lease by UPnP key (bookkeeping ext port == bind port).
-    /// Returns the freed bind port, or None if absent.
-    ///
-    /// `swap_remove` (not `remove`): slot order is semantically irrelevant
-    /// — every lookup is key-driven and facades sort at enumeration — and a
-    /// single-element copy is what the Kani proofs can model (a tail memmove
-    /// stalls the solver).
+    /// Remove a lease by UPnP key and return the freed bind port; slot order carries no meaning.
     pub fn delete_by_ext_port(&mut self, ext_port: u16) -> Option<u16> {
         let idx = self.slots.iter().position(|s| s.bind_port == ext_port)?;
         let port = self.slots[idx].bind_port;
@@ -469,8 +385,7 @@ impl LeaseTable {
         self.delete_by_ext_port(bind_port)
     }
 
-    /// GC scan: drop leases expired for `grace` seconds past expiry with no
-    /// inbound activity. Static leases are never GC'd. Returns freed ports.
+    /// GC scan: drop leases expired for grace seconds with no inbound activity; a static is never GC'd.
     pub fn gc(&mut self, now_unix: u64, grace_secs: u64) -> Vec<u16> {
         let cutoff_with_activity = now_unix.saturating_sub(grace_secs);
         let mut freed = Vec::new();
@@ -494,9 +409,7 @@ impl LeaseTable {
         freed
     }
 
-    /// The lease policy's last-seen stamp, rate-limited: the datapath can
-    /// fire many times a second, so one write per slot per
-    /// `min_interval_secs` is plenty of clock resolution for a 24 h policy.
+    /// The lease policy's last-seen stamp, rate-limited to one write per slot per min_interval_secs.
     pub fn stamp_activity_if_stale(
         &mut self,
         bind_port: u16,
@@ -511,13 +424,7 @@ impl LeaseTable {
         }
     }
 
-    /// Backstop sweep of the lease policy: reap UDP grants whose client
-    /// has shown no activity (datapath or control) for `backstop_secs`,
-    /// whatever the pool state. Statics never reap. TCP grants are out of
-    /// the lease policy entirely: a live TCP splice can be control-silent,
-    /// so reaping on the control clock would break a live session (the
-    /// AFTR already reaps an idle TCP mapping at the C3 bound). Returns
-    /// the freed bind ports.
+    /// Backstop sweep: reap UDP grants silent for backstop_secs; statics and TCP grants never reap.
     pub fn gc_idle(&mut self, now_unix: u64, backstop_secs: u64) -> Vec<u16> {
         let cutoff = now_unix.saturating_sub(backstop_secs);
         let mut freed = Vec::new();
@@ -536,10 +443,7 @@ impl LeaseTable {
         freed
     }
 
-    /// The pressure-eviction candidate: the longest-idle UDP grant of a
-    /// client OTHER than `requester`, idle past `grace`. The requesting
-    /// client's own grants are never evicted (its live mappings stay).
-    /// Returns the slot identity the caller needs to tear it down.
+    /// The pressure-eviction candidate: the longest-idle UDP grant of a client other than requester.
     pub fn evict_idle_client(
         &self,
         now_unix: u64,
@@ -566,10 +470,7 @@ impl LeaseTable {
         best.map(|(_, bind, client, int_port)| (bind, client, int_port, Proto::Udp))
     }
 
-    /// Build the table from persisted lease records after a respawn
-    /// (B8). Re-allocates the exact same bind ports; static leases come from
-    /// config; granted leases are re-bound with their remaining lifetime.
-    /// Returns at most one error naming the first malformed record.
+    /// Build the table from persisted lease records after a respawn, re-allocating the exact same bind ports.
     pub fn restore(
         &mut self,
         static_maps: &[(u16, Ipv4Addr, u16)],
@@ -602,9 +503,7 @@ impl LeaseTable {
                     expires_at_unix,
                 },
                 phase_ms: 0,
-                // a restored grant counts as freshly active: never insta-reap
-                // a mapping that survived a respawn (the last-seen clock is
-                // not persisted; a restart resets it conservatively)
+                // a restored grant counts as freshly active, since the last-seen clock is not persisted
                 last_activity_unix: now_unix,
             });
         }
@@ -625,8 +524,7 @@ pub struct GrantedRecord {
     pub expires_at_unix: u64,
 }
 
-/// Static-map / restore rejection reason. `Copy`, never carries heap — the
-/// Kani proofs walk these error paths.
+/// Static-map / restore rejection reason; Copy and heap-free, because the proofs walk these error paths.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StaticMapErr {
     /// Bind port outside [slot_lo, slot_hi].
@@ -637,9 +535,7 @@ pub enum StaticMapErr {
 
 // ---- epoch ----
 
-/// PCP ANNOUNCE epoch (B7): seconds since the lease table was first created.
-/// Persisted so respawn continues the epoch; reboot restarts near 0 — which
-/// is correct, because a reboot killed every CGNAT mapping.
+/// PCP ANNOUNCE epoch: seconds since the table was created, and a reboot clears every mapping.
 #[derive(Clone, Copy, Debug)]
 pub struct Epoch {
     pub created_unix: u64,
@@ -674,8 +570,7 @@ mod tests {
 
     #[test]
     fn stamp_rate_limits_and_upsert_seeds_activity() {
-        // The lease policy's clock: a grant starts seen at its own
-        // creation, and the rate-limited stamp only advances it.
+        // The lease policy's clock: a grant starts seen at its own creation, and the stamp only advances it.
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 50);
         let g = t.upsert_pcp(Proto::Udp, 3478, c, 300, NOW, c, 3478);
@@ -774,8 +669,7 @@ mod tests {
 
     #[test]
     fn restore_counts_grants_freshly_active() {
-        // a respawned grant must never be insta-reaped by the backstop:
-        // restore seeds last-seen = now (the clock is not persisted).
+        // a respawned grant must never be insta-reaped by the backstop: restore seeds last-seen = now
         let mut t = table();
         t.restore(
             &[],
@@ -868,9 +762,7 @@ mod tests {
 
     #[test]
     fn tcp_grant_and_udp_share_the_table_proto_dimension() {
-        // C3 unlocked TCP grants (call/0017): the same (client, int_port)
-        // across protocols yields distinct slots with their own bind
-        // ports, matching the AFTR's per-protocol external ports.
+        // the same (client, int_port) across protocols yields distinct slots with their own bind ports
         assert_eq!(Proto::Udp.code(), 17);
         assert_eq!(Proto::Tcp.code(), 6);
         let mut t = table();
@@ -925,8 +817,7 @@ mod tests {
         else {
             panic!()
         };
-        // GC at NOW+100: lease (expires NOW+60) is past expiry and past the
-        // 30 s grace; activity at NOW+90 is inside the grace window -> keep.
+        // GC at NOW+100: the lease expired at NOW+60, past the 30 s grace; activity at NOW+90 is inside it
         let idx = t.slots.iter().position(|s| s.bind_port == bind_port).unwrap();
         t.slots[idx].last_activity_unix = NOW + 90;
         let freed = t.gc(NOW + 100, 30);
@@ -996,25 +887,19 @@ mod tests {
 
     #[test]
     fn a_live_punch_reserves_its_port_from_allocation() {
-        // R2/R3: the incumbent keeps the tuple, and the allocator probes
-        // before it claims. Slot 30000 is live from a punch nobody allocated,
-        // so a fresh grant takes the next free port instead of sharing a
-        // tuple the AFTR would then key as one mapping.
+        // the incumbent keeps the tuple, so a fresh grant takes the next free port instead
         let mut t = table();
         t.avoid_ports(&[30000]);
         let c = Ipv4Addr::new(192, 168, 21, 68);
         let g = t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
         assert_eq!(g, UpsertOutcome::Granted { bind_port: 30001 });
-        // and the choice is reportable: the ports the rule steered around,
-        // below the one it took
+        // and the choice is reportable: the ports the rule steered around, below the one it took
         assert_eq!(t.avoid_steering(30001), vec![30000]);
     }
 
     #[test]
     fn a_renewal_keeps_its_port_even_when_the_probe_would_avoid_it() {
-        // R4's neighbour: a refresh allocates nothing. The slot's own punch
-        // puts its tuple in the live set, so a renewal must not read that
-        // set as a reason to move.
+        // a refresh allocates nothing, so a renewal must not read its own punch as a reason to move
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 68);
         assert_eq!(
@@ -1031,9 +916,7 @@ mod tests {
 
     #[test]
     fn the_reservation_follows_the_live_set_and_is_not_a_leak() {
-        // The set is replaced, never accumulated: a tuple that goes quiet
-        // stops being reserved, so a port cannot be lost to a flow that is
-        // gone. (One refresh, one set.)
+        // the reservation is replaced, never accumulated: a tuple that goes quiet stops reserving its port
         let mut t = table();
         t.avoid_ports(&[30000]);
         t.avoid_ports(&[]);
@@ -1047,16 +930,14 @@ mod tests {
 
     #[test]
     fn steering_ignores_what_the_range_cannot_allocate() {
-        // A live tuple outside the slot range costs nothing and is not
-        // reported as a decision: the allocator never considered it.
+        // a live tuple outside the slot range costs nothing and is not reported as a decision
         let mut t = table();
         t.avoid_ports(&[12345, 30002]);
         let c = Ipv4Addr::new(192, 168, 21, 68);
         let g = t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
         assert_eq!(g, UpsertOutcome::Granted { bind_port: 30000 });
         assert!(t.avoid_steering(30000).is_empty(), "nothing was skipped");
-        // with the low ports live, the third port is the first free one and
-        // the two it skipped are named
+        // with the low ports live, the third port is the first free one and the two it skipped are named
         let mut t = table();
         t.avoid_ports(&[30000, 30001]);
         assert_eq!(
@@ -1068,19 +949,16 @@ mod tests {
 
     #[test]
     fn a_client_outside_the_allowlist_is_not_a_collision() {
-        // R7 stated as a test: the probe knows tuples, not identities. A
-        // live tuple is reserved whatever its origin, and its owner is not
-        // thereby admitted to anything.
+        // the probe knows tuples, not identities: a live tuple is reserved whatever its origin
         let mut t = table();
         t.avoid_ports(&[candidate("192.168.21.59", 30000).1]);
         assert_eq!(t.avoid_steering(30001), vec![30000]);
         assert_eq!(t.reserved_ports(), vec![30000]);
     }
 
-    // ---- R4: the late collision (call/0027, call/0028) ----
+    // ---- the late collision (call/0027, call/0028) ----
 
-    /// A device's flow on a leased tuple, in the shape the router prints it:
-    /// its pre-NAT origin is the device, and the NAT side is the bind port.
+    /// A device's flow on a leased tuple, in the router's shape: origin the device, NAT side the bind port.
     fn device_flow(host: &str, sport: u16) -> String {
         format!(
             "ipv4     2 udp      17 100 src={} dst=8.8.8.8 sport={} dport=53 packets=1 bytes=92 \
@@ -1091,8 +969,7 @@ mod tests {
 
     #[test]
     fn a_device_flow_on_a_leased_tuple_is_a_collision() {
-        // The signature call/0028 names: a connection entry whose NAT side is
-        // our bind tuple and whose origin is a device.
+        // The collision signature: a connection whose NAT side is our bind tuple, origin a device.
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 68);
         assert_eq!(
@@ -1105,13 +982,7 @@ mod tests {
 
     #[test]
     fn a_static_is_the_operators_and_is_never_the_slot_that_moves() {
-        // call/0030: a static mapping is the operator's configuration, and
-        // the same rule that releases a console's mapping leaves the
-        // configured relay alone. A device's flow that takes a static's
-        // port is still a collision, and the log is where it becomes
-        // visible, but the port is not the daemon's to take: yielding it
-        // would put the operator's own relay on a port they never chose, and
-        // the running state would diverge from the config that produced it.
+        // a static mapping is the operator's: a device's flow on its port is logged, not taken
         let mut t = table();
         assert!(t
             .insert_static(30002, Ipv4Addr::new(192, 168, 21, 12), 40000)
@@ -1125,8 +996,7 @@ mod tests {
 
     #[test]
     fn the_slots_own_punch_is_not_a_collision() {
-        // A slot's keepalive egresses from (NAT, R) itself: the origin is the
-        // NAT address, not a device, and that is the flow we own.
+        // A slot's keepalive egresses from (NAT, R) itself: the origin is the NAT address, not a device.
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 68);
         t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
@@ -1136,9 +1006,7 @@ mod tests {
 
     #[test]
     fn an_outside_peer_on_the_tuple_is_not_a_collision() {
-        // An external prober's datagram reaches the same tuple and must not
-        // make the slot move: the incumbent rule is about a device's flow,
-        // not about who is knocking.
+        // An external prober's datagram on the tuple is not a collision: the rule is about a device's flow.
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 68);
         t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
@@ -1148,16 +1016,14 @@ mod tests {
 
     #[test]
     fn a_device_flow_on_an_unleased_port_is_not_ours_to_move() {
-        // R7: a punch nobody allocated is left to its owner, and the table
-        // only speaks for the ports it holds.
+        // a punch nobody allocated is left to its owner; the table only speaks for the ports it holds
         let t = table();
         assert!(t.collided(&device_flow("192.168.21.68", 30000)).is_empty());
     }
 
     #[test]
     fn a_yield_takes_a_free_port_and_keeps_the_label() {
-        // R4: the slot moves, the client's label does not, and the lease's
-        // client and internal port are untouched.
+        // the slot moves and the client's label does not, nor do its client and internal port
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 68);
         t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
@@ -1172,9 +1038,7 @@ mod tests {
 
     #[test]
     fn a_failed_yield_can_be_put_back() {
-        // The caller moves the lease first and establishes the datapath after,
-        // so a failure needs the row back where it was: the old port stays in
-        // the probe's view either way, since a device's flow holds it.
+        // The caller moves the lease before establishing the datapath, so a failure needs the row back.
         let mut t = table();
         let c = Ipv4Addr::new(192, 168, 21, 68);
         t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
@@ -1186,8 +1050,7 @@ mod tests {
 
     #[test]
     fn a_yield_with_nowhere_to_go_reports_and_leaves_it() {
-        // The range is a budget: when it is full the slot stays where it is
-        // and says so, which is R5's report rather than a silent failure.
+        // The range is a budget: when it is full the slot stays where it is and reports it.
         let mut t = LeaseTable::new(PortAllocator::new(30000, 30001).unwrap(), 4, 2);
         let c = Ipv4Addr::new(192, 168, 21, 68);
         t.upsert_pcp(Proto::Udp, 3478, c, 600, NOW, c, 3478);
@@ -1209,12 +1072,9 @@ mod verify {
 
     #[kani::proof]
     fn allocator_never_double_allocates() {
-        // Concrete small range: the allocate loop has a fixed bound; Kani
-        // explores membership, not range arithmetic.
+        // Concrete small range: the allocate loop has a fixed bound, so Kani explores membership only.
         let a = PortAllocator { lo: 30001, hi: 30004 };
-        // Fixed-size symbolic used-set, sentinel-padded: entries are either
-        // in-range or 0 (inert, since lo >= 1). No counters, no dynamic
-        // array writes — just element reads, which CBMC handles cheaply.
+        // Fixed-size symbolic used-set, sentinel-padded with 0 (inert, since lo >= 1), for cheap reads.
         let used: [u16; 4] = kani::any();
         for p in used.iter() {
             kani::assume(*p == 0 || a.contains(*p));
@@ -1249,10 +1109,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(8)] // max_slots assumed <= 7 below
     fn upsert_unique_key_never_duplicates() {
-        // I1 core: same (proto, int_port, client) key never yields a second
-        // connection. Symbolic in the key dimensions; time/life concrete (the
-        // property does not depend on them and symbolic u64 inflated the
-        // Vec-push state space).
+        // the same key never yields a second connection; time and lifetime stay concrete for the solver
         let mut t = LeaseTable::new(alloc_ok(), 7, 4);
         let octets: [u8; 4] = kani::any(); // Ipv4Addr is not kani::Arbitrary
         let c = Ipv4Addr::from(octets);
@@ -1260,8 +1117,7 @@ mod verify {
         let r1 = t.upsert_pcp(Proto::Udp, ip, c, 300, 1_000, c, ip);
         let n1 = t.len();
         let r2 = t.upsert_pcp(Proto::Udp, ip, c, 300, 1_001, c, ip);
-        // Fresh key on an empty table always grants; the same key always
-        // refreshes (the key check precedes quota/capacity).
+        // a fresh key on an empty table always grants; the same key always refreshes before quota is checked
         let UpsertOutcome::Granted { bind_port: p1 } = r1 else {
             panic!("first upsert must grant on an empty table");
         };
@@ -1278,9 +1134,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(8)]
     fn delete_removes_only_target_slot() {
-        // Delete semantics: removing ext_port p1 leaves every other slot
-        // intact and frees the port for reuse. Concrete ports (the property
-        // is about the delete operation, not the port values).
+        // removing ext_port p1 leaves every other slot intact and frees the port for reuse
         let mut t = LeaseTable::new(alloc_ok(), 8, 4);
         let c = Ipv4Addr::new(192, 168, 21, 50);
         let UpsertOutcome::Granted { bind_port: p1 } =
@@ -1310,11 +1164,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(8)]
     fn restore_rebinds_exact_port() {
-        // B8: respawn restore re-binds the exact same R. Single record —
-        // multi-record ordering is unit-tested (restore_is_deterministic);
-        // the proof owns the mechanical guarantee per record, symbolically
-        // in the record's port so both in-range and out-of-range bind ports
-        // are explored.
+        // restore re-binds the exact same R, with the record's port symbolic so both ranges are explored
         let a = Ipv4Addr::new(192, 168, 21, 50);
         let port: u16 = kani::any();
         kani::assume(port <= 30009); // alloc_ok() hi bound
@@ -1348,8 +1198,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(8)]
     fn restore_rejects_collision() {
-        // A static map already holding the port must make restore refuse the
-        // granted record rather than double-allocate.
+        // A static map already holding the port must make restore refuse the record, not double-allocate.
         let a = Ipv4Addr::new(192, 168, 21, 50);
         let mut t = LeaseTable::new(alloc_ok(), 8, 4);
         assert!(t.insert_static(30005, a, 4444).is_ok());

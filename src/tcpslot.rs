@@ -1,14 +1,4 @@
-//! TCP slot datapath (call/0017). A listener on the slot's pin tuple
-//! accepts AFTR-forwarded inbound connections and splices them to the
-//! slot target. A persistent STUN-over-TCP connection from the same tuple
-//! keeps the mapping alive at an interval under the C3 bound: an
-//! idle AFTR TCP mapping survives 120 s of silence and dies by 300 s
-//! (results/RESULTS-2026-09-13-c3.md), so the connection refreshes at a
-//! interval strictly under the lower bound. The connection's XOR-MAPPED is
-//! the slot's external TCP tuple, published per slot on churn. The
-//! connection lifecycle is the Kani-proven state machine. The fw4 TCP input
-//! accept is mandatory for the splice: the box drops forwarded TCP NEW
-//! silently (the C3 finding).
+//! TCP slot datapath: the listener splices AFTR-forwarded connections, and a STUN-over-TCP link keeps the mapping alive.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -23,16 +13,10 @@ use crate::publish::Publisher;
 use crate::stun;
 use crate::vote::{VoteDecision, VoteState};
 
-/// Keepalive interval for a TCP slot, strictly under the C3 silent-death
-/// lower bound (120 s). See the Kani proof `cadence_under_bound`.
+/// Keepalive interval for a TCP slot, strictly under the on-box 120 s silent-death bound.
 pub const TCP_KEEPALIVE_SECS: u64 = 60;
 
-// ---- connection lifecycle (the Kani-provable part) ----
-
-/// The mapping's connection state machine. Live means a live STUN-over-TCP
-/// connection from the pin tuple, hence a live AFTR TCP mapping; Dead
-/// means the connection errored (RST or silent expiry) and the mapping
-/// is re-establishing on the next interval.
+/// The mapping's connection state: Live while a STUN-over-TCP connection is up, Dead once it errored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnectionState {
     Live,
@@ -44,33 +28,20 @@ impl ConnectionState {
         *self == ConnectionState::Live
     }
 
-    /// A connection error kills the live mapping: Dead.
+    /// A connection error kills the live mapping.
     pub fn on_error(&mut self) {
         if *self == ConnectionState::Live {
             *self = ConnectionState::Dead;
         }
     }
 
-    /// Re-establishment restores the mapping: Live.
+    /// Re-establishment restores the mapping.
     pub fn on_established(&mut self) {
         *self = ConnectionState::Live;
     }
 }
 
-// ---- runtime ----
-
-/// Bind the slot's TCP pin. The listener binds WILDCARD: the connection must
-/// own the specific (ip, R) tuple to originate the outbound flow that
-/// creates and maintains the AFTR mapping, and a specific bind beside a
-/// specific listener is EADDRINUSE under every SO_REUSE* combination
-/// (verified on this kernel 2026-09-13: reuseaddr+reuseaddr refused,
-/// reuseport+reuseport misroutes inbound SYNs into the non-listening
-/// connection, reuseport-listener + reuseaddr-connection refuses the connection).
-/// The specific-vs-wildcard bind is SO_REUSEADDR's classic exception:
-/// no REUSEPORT group exists, so inbound SYNs (dst the slot's tuple)
-/// reach this listener's accept queue, the connection's established replies
-/// reach it, and eth1-scoping of inbound is enforced by the nft input
-/// accept, not by the bind.
+/// Binds wildcard, so the connection can own the slot's tuple while the listener still queues its SYNs.
 pub async fn bind_pin(r: u16) -> io::Result<TcpListener> {
     let sock = tokio::net::TcpSocket::new_v4()?;
     sock.set_reuseaddr(true)?;
@@ -81,8 +52,7 @@ pub async fn bind_pin(r: u16) -> io::Result<TcpListener> {
     sock.listen(128)
 }
 
-/// The accept loop: each inbound connection (the AFTR forwarding a peer
-/// SYN through the slot's TCP mapping) is spliced to the slot target.
+/// Accepts each AFTR-forwarded connection on the slot's mapping and splices it to the target.
 pub async fn run_tcp_slot(listener: TcpListener, target: SocketAddrV4) {
     loop {
         match listener.accept().await {
@@ -94,10 +64,7 @@ pub async fn run_tcp_slot(listener: TcpListener, target: SocketAddrV4) {
     }
 }
 
-/// Bidirectional copy between the accepted peer and the slot target.
-/// Kernel-dominated (copy_bidirectional); the lifecycle around it is
-/// minimal: one dial per accept, dial failure closes the peer, copy end
-/// closes both.
+/// One dial per accept; the copy dominates, and a failed dial closes the peer.
 async fn splice(mut peer: TcpStream, target: SocketAddrV4) {
     match TcpStream::connect(target).await {
         Ok(mut upstream) => {
@@ -107,14 +74,7 @@ async fn splice(mut peer: TcpStream, target: SocketAddrV4) {
     }
 }
 
-/// One connection round: open the STUN-over-TCP connection and read the
-/// observed external tuple. The connection originates from an EPHEMERAL
-/// local port folded to the slot's tuple by the relay's own nft snat_map
-/// (add_pin below): the AFTR's mapping is created for (bind_ip, r)
-/// without a second socket ever binding that tuple, which this kernel
-/// refuses beside the wildcard listener (verified 2026-09-13 across all
-/// SO_REUSE* combinations). The fold element is cleaned up on
-/// re-establish; the connection is returned to be held.
+/// Opens the STUN connection from an ephemeral port the relay's own snat_map folds to the slot's tuple.
 async fn connection_round(
     bind_ip: Ipv4Addr,
     r: u16,
@@ -139,10 +99,7 @@ async fn connection_round(
     Ok((tuple, conn, local_port))
 }
 
-/// The connection task: at each interval, refresh the persistent connection
-/// (the STUN traffic re-arms the AFTR idle timer) and publish the
-/// observed tuple on churn; on connection error, drop it and re-establish
-/// on the next interval, rotating servers.
+/// Refreshes the held connection each interval and re-establishes on error, rotating servers.
 pub async fn run_connection(
     bind_ip: Ipv4Addr,
     r: u16,
@@ -158,8 +115,7 @@ pub async fn run_connection(
     loop {
         interval.tick().await;
         if state.is_live() && conn.is_some() {
-            // Refresh the held connection: the STUN traffic re-arms the
-            // AFTR idle timer.
+            // Refresh the held connection: the STUN traffic re-arms the AFTR idle timer.
             let Some(c) = conn.as_mut() else {
                 continue;
             };
@@ -185,7 +141,7 @@ pub async fn run_connection(
                 }
             }
         } else {
-            // Dead: re-establish on the next interval, rotating servers.
+            // Dead: re-establish next interval, rotating servers, after deleting the previous fold.
             state.on_error();
             conn = None;
             if let Some(lp) = last_local.take() {
@@ -231,10 +187,7 @@ mod proofs {
 
     #[kani::proof]
     fn cadence_under_bound() {
-        // C3: an idle AFTR TCP mapping survives 120 s of silence and
-        // dies by 300 s on the measured node/session. The connection refresh
-        // interval must sit strictly under the silent-death lower bound so
-        // a reachable mapping is refreshed before the AFTR can expire it.
+        // The harness asserts the interval is non-zero and strictly under the 120 s bound.
         assert!(TCP_KEEPALIVE_SECS < 120);
         assert!(TCP_KEEPALIVE_SECS > 0);
     }
@@ -242,9 +195,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(4)]
     fn holder_cycles_through_both_states_without_unknown() {
-        // Reachability: the two-state machine cycles Held -> Dead (error)
-        // and Dead -> Held (re-establish) with no other state; a sequence
-        // of error/established transitions alternates strictly.
+        // The harness drives three alternating transitions and asserts the state each one leaves.
         let mut h = ConnectionState::Dead;
         for i in 0..3 {
             if i % 2 == 0 {
@@ -252,8 +203,6 @@ mod proofs {
             } else {
                 h.on_error();
             }
-            // The state is always one of the two variants; Held after an
-            // established, Dead after an error.
             assert!(match h {
                 ConnectionState::Live => i % 2 == 0,
                 ConnectionState::Dead => i % 2 == 1,

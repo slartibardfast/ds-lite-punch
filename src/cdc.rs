@@ -1,33 +1,15 @@
-//! G1 change-data-capture (brief v2 §10.1, DECIDED 2026-09-01).
-//!
-//! One `Cdc` trait, three backends, one contract: *live bidirectional UDP
-//! candidates with shadow-bind tuples at an interval of at most 2 s*.
-//!
-//!   (a) nft `flow_obs` dynamic-set mirror  — primary. Gating test PASSED
-//!       2026-09-02: a filter-postrouting observer at priority 110 (> fw4
-//!       srcnat 100) records post-NAT tuples, so elements ARE the
-//!       shadow-bind tuples `(192.168.0.21, R_nat)` directly.
-//!   (b) Aya TC hook on br-lan              — performance tier (first-class,
-//!       not an escalation; BTF confirmed on-box). Not wired yet.
-//!   (c) `/proc/net/nf_conntrack` polling   — fallback (`--cdc proc`;
-//!       David: "I don't like 1, keep it as a fallback").
-//!
-//! Both the nft mirror and the proc read feed the same Kani-proven `obs`
-//! predicate; the mirror's 15 s kernel expiry is the silence detector, the
-//! proc table provides identity (host, host_port) for fresh tuples.
+//! Change-data-capture: the backends that supply live refresh candidates to the observation engine.
 use crate::obs::{scan, ObsCtx, RefreshCandidate};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use crate::publish::{emiteln};
 
-/// One live candidate: the shadow-bind tuple (`bind_tuple`, alias of
-/// `obs::RefreshCandidate`) + the br-lan flow origin (`host`/`host_port`,
-/// the pin key).
+/// One live candidate: the shadow-bind tuple, plus the br-lan flow origin that pins it.
 pub type Candidate = RefreshCandidate;
 
-/// br-lan prefix (hosts eligible for refresh) and the hub-LAN NAT address
-/// flows egress from — defaults matching `obs::brlan_ctx`.
+/// br-lan prefix: the hosts eligible for refresh.
 pub const BR_LAN: (Ipv4Addr, u8) = (Ipv4Addr::new(192, 168, 21, 0), 24);
+/// The hub-LAN NAT address the refreshable flows egress from.
 pub const VM_NAT: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 21);
 pub const PROC_PATH: &str = "/proc/net/nf_conntrack";
 
@@ -39,20 +21,16 @@ pub enum CdcKind {
     Aya,
 }
 
-/// The backends are used behind an `Arc` inside a spawned task, and the
-/// engine now reads the lease table across an await while it holds one, so
-/// the trait carries both bounds the runtime needs.
+/// A backend held behind an `Arc` in a spawned task and read across an await, so it is `Send + Sync`.
 pub trait Cdc: Send + Sync {
-    /// Live candidates this tick. Cheap by contract: capped at the refresh
-    /// budget, no blocking beyond a kernel table read, a 2 s interval.
+    /// Live candidates this tick, capped at the refresh budget and cheap enough for a 2 s interval.
     fn tick(&mut self) -> Vec<Candidate>;
     fn name(&self) -> &'static str;
 }
 
-/// `/proc/net/nf_conntrack` polling backend (G1 fallback).
+/// The `/proc/net/nf_conntrack` polling backend.
 pub struct ProcCdc {
-    /// The allowlist: the admission for a flow the device itself has not
-    /// been answered on (call/0029).
+    /// The allowlist of devices whose unanswered flows are admitted.
     allowed: Vec<Ipv4Addr>,
     path: String,
     brlan: (Ipv4Addr, u8),
@@ -62,7 +40,7 @@ pub struct ProcCdc {
 }
 
 impl ProcCdc {
-    /// held = inner tuples static/lease slots own (I1: never capture one).
+    /// `owned` lists the inner tuples static and lease slots hold, which are never captured.
     pub fn new(owned: Vec<(Ipv4Addr, u16)>, max_refresh_attempts: u32, allowed: Vec<Ipv4Addr>) -> Self {
         ProcCdc {
             path: PROC_PATH.to_string(),
@@ -100,13 +78,7 @@ impl Cdc for ProcCdc {
     }
 }
 
-/// nft `flow_obs` mirror backend (G1 primary; gating test PASSED
-/// 2026-09-02). The mirror carries the shadow-bind tuples `(192.168.0.21,
-/// R_nat)` directly (post-NAT, port-preserving) with a 15 s kernel expiry —
-/// the silence detector. Identity (host, host_port — the pin key and the
-/// promotion target) is not in the mirror: it is resolved once per fresh
-/// tuple from a `/proc` scan, then cached until the mirror evicts the tuple.
-/// Steady state does zero proc reads.
+/// The nft `flow_obs` mirror backend; identity comes from one `/proc` scan per fresh tuple, then is cached.
 pub struct NftCdc {
     known: HashMap<(Ipv4Addr, u16), Candidate>,
     owned: Vec<(Ipv4Addr, u16)>,
@@ -155,11 +127,7 @@ impl Cdc for NftCdc {
     }
 }
 
-/// Pure reconcile: given the live mirror tuples and (optionally) a proc
-/// snapshot, return the live candidates — resolving + caching identity for
-/// tuples not yet known, pruning evicted ones. Unit-tested with real list-
-/// set output and proc lines (Kani non-goal, like the rest of the CLI
-/// boundary).
+/// Returns the live candidates, resolving and caching identity for fresh tuples and pruning evicted ones.
 fn reconcile(
     live: &[(Ipv4Addr, u16)],
     proc_text: Option<&str>,
@@ -198,8 +166,7 @@ fn reconcile(
 mod tests {
     use super::*;
 
-    // Real line captured on the router (2026-08-31): a br-lan container UDP
-    // flow egressing the VM line — same shape as obs.rs's GOOD fixture.
+    // A br-lan container UDP flow egressing the VM line, the same shape as obs.rs's fixture.
     const GOOD: &str = "ipv4     2 udp      17 56 src=192.168.21.10 dst=8.8.8.8 sport=54322 dport=53 packets=1 bytes=92 [UNREPLIED] src=8.8.8.8 dst=192.168.0.21 sport=53 dport=54322 packets=0 bytes=0 mark=0 zone=0 use=2";
 
     /// Make the flow bidirectional ([ASSURED], reply packets > 0).
@@ -281,8 +248,6 @@ mod tests {
         assert!(cdc.tick().is_empty(), "unreadable table -> empty tick, not panic");
     }
 
-    // --- nft mirror backend (reconcile) ---
-
     fn mirror_live() -> Vec<(Ipv4Addr, u16)> {
         vec![(VM_NAT, 54322)]
     }
@@ -319,8 +284,7 @@ mod tests {
         let mut known = HashMap::new();
         let live = mirror_live();
         assert_eq!(reconcile(&live, Some(&proc_fixture()), &mut known, &[], 8, &[]).len(), 1);
-        // mirror loses the flow (15 s element expiry is the silence
-        // detector): nothing live -> nothing returned, cache pruned
+        // the mirror lost the flow: nothing live comes back, and the cache is pruned
         let out = reconcile(&[], None, &mut known, &[], 8, &[]);
         assert!(out.is_empty());
         assert!(known.is_empty());
@@ -330,10 +294,10 @@ mod tests {
     fn reconcile_skips_held_and_unresolvable() {
         let mut known = HashMap::new();
         let live = mirror_live();
-        // held: the I1 predicate drops it during identity resolution
+        // held: the owned-tuple predicate drops it during identity resolution
         let out = reconcile(&live, Some(&proc_fixture()), &mut known, &[(VM_NAT, 54322)], 8, &[]);
         assert!(out.is_empty());
-        // unresolvable: proc tuple absent from the snapshot -> no identity
+        // unresolvable: the proc tuple is absent from the snapshot, so no identity
         let mut known = HashMap::new();
         let out = reconcile(&live, Some("ipv4     2 tcp       6 50 src=9.9.9.9 dst=1.1.1.1 sport=1 dport=1 packets=1 bytes=1 src=1.1.1.1 dst=9.9.9.9 sport=1 dport=1 packets=0 bytes=0 mark=0 zone=0 use=2\n"), &mut known, &[], 8, &[]);
         assert!(out.is_empty());

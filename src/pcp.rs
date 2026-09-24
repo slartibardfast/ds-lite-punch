@@ -1,52 +1,17 @@
-//! PCP (RFC 6887) and NAT-PMP (RFC 6886) on their shared port.
-//!
-//! The fourth admission path (call/0025): a LAN-only listener on UDP 5351
-//! carrying both protocols, as the design's own implementation notes specify
-//! (plan/0004 section 7). Only the codec lives here; the admission itself
-//! uses the same slot engine as the UPnP facade and the observation arm, so
-//! a mapping created in this dialect is indistinguishable from one created by
-//! `AddPortMapping` except in the wire format it is described with.
-//!
-//! Two things in this file are transcribed from the RFCs and are worth the
-//! reader's attention because both were checked against the source text rather
-//! than recalled:
-//!
-//! * The result codes. The implementation notes carried a compressed sketch
-//!   ("0 to 8, plus CANNOT_PROVIDE_EXTERNAL_PORT = 9") and told the
-//!   implementer to verify the numerics. RFC 6887 section 7.4 numbers them
-//!   0..13, with `NO_RESOURCES` at 8 and `UNSUPP_PROTOCOL` at 9, so the
-//!   sketch's ninth entry is `UNSUPP_PROTOCOL` and the external-port refusal
-//!   is 11. The RFC's numbering is what ships; the milestone's results record
-//!   notes the divergence.
-//! * The divergence channel. The notes said a learned tuple "follows in an
-//!   ANNOUNCE". An ANNOUNCE response has no opcode-specific payload at all
-//!   (RFC 6887 section 14.1.1), so it cannot carry a tuple. The place the
-//!   truth goes is the MAP response's assigned external port and address,
-//!   which is what this codec builds; a mapping whose discovery is still in
-//!   flight is dropped, and the client's own retransmission (the protocol's
-//!   only recovery mechanism) brings it back once the tuple is known.
-//!
-//! The client's identity comes from the datagram's source address, compared
-//! with the header's client field (section 8.2: a mismatch is
-//! `ADDRESS_MISMATCH`). A request is only ever served on the LAN side; the
-//! listener binds the LAN address and never the wildcard.
+//! PCP (RFC 6887) and NAT-PMP (RFC 6886) codec: both dialects on their one shared port.
 
 use crate::slot::UpsertOutcome;
 use std::net::Ipv4Addr;
 
-/// The one port both protocols share (RFC 6887 section 6).
+/// The one port both protocols share (RFC 6887).
 pub const PORT: u16 = 5351;
 /// PCP version this server speaks.
 pub const VERSION: u8 = 2;
-/// The longest mapping lifetime this server grants, in seconds. It bounds how
-/// stale a client's idea of its own tuple can be after a re-key: the client's
-/// refresh is what reports the new one.
+/// The longest mapping lifetime this server grants, in seconds; a client's refresh reports a re-key.
 pub const MAX_LIFETIME: u32 = 600;
-/// NAT-PMP has no lifetime negotiation beyond the client's request, and the
-/// specification recommends this figure; the mapping's own lease is what
-/// actually expires it.
+/// NAT-PMP's recommended lifetime, in seconds; the mapping's own lease is what expires it.
 pub const NPMP_LIFETIME: u32 = 7200;
-/// RFC 6887 section 8.2: a request longer than this is malformed.
+/// A request longer than this is malformed (RFC 6887).
 pub const MAX_MSG: usize = 1100;
 /// The shortest legal PCP request is the common header alone.
 pub const HEADER: usize = 24;
@@ -57,7 +22,7 @@ pub const OP_ANNOUNCE: u8 = 0;
 pub const OP_MAP: u8 = 1;
 pub const OP_PEER: u8 = 2;
 
-/// RFC 6887 section 7.4, verbatim numbering.
+/// The PCP result codes, verbatim numbering (RFC 6887).
 pub mod rc {
     pub const SUCCESS: u8 = 0;
     pub const UNSUPP_VERSION: u8 = 1;
@@ -75,7 +40,7 @@ pub mod rc {
     pub const EXCESSIVE_REMOTE_PEERS: u8 = 13;
 }
 
-/// RFC 6886 section 3.5.
+/// The NAT-PMP result codes (RFC 6886).
 pub mod np {
     pub const SUCCESS: u8 = 0;
     pub const UNSUPP_VERSION: u8 = 1;
@@ -92,11 +57,9 @@ pub mod np {
     pub const RESP: u8 = 0x80;
 }
 
-/// What the admission path answers a MAP with, or the reason it answers
-/// nothing yet.
+/// What the admission path answers a MAP with, or the reason it answers nothing yet.
 pub enum MapAnswer {
-    /// Drop the datagram: discovery for this mapping has not completed. The
-    /// client's own retransmission is the recovery the protocol provides.
+    /// Drop the datagram: discovery has not completed, and a client retransmission recovers.
     Drop,
     /// Answer with this result code, lifetime and assigned tuple.
     Answer {
@@ -107,7 +70,7 @@ pub enum MapAnswer {
     },
 }
 
-/// The option codes this server reads (RFC 6887 section 13).
+/// The option codes this server reads (RFC 6887).
 pub const OPT_THIRD_PARTY: u8 = 1;
 pub const OPT_PREFER_FAILURE: u8 = 2;
 pub const OPT_FILTER: u8 = 3;
@@ -115,9 +78,7 @@ pub const OPT_FILTER: u8 = 3;
 pub const OPT_THIRD_PARTY_LEN: u16 = 16;
 pub const OPT_FILTER_LEN: u16 = 20;
 
-/// Read the IPv4 address a field carries. RFC 6887 section 5 puts an IPv4
-/// address in the IPv4-mapped IPv6 form; a field that is not that form reads
-/// as the unspecified address, which the caller's comparison then refuses.
+/// Read an IPv4 field in IPv4-mapped IPv6 form; a field not in that form reads as unspecified.
 fn unmapped(a: &[u8]) -> Ipv4Addr {
     if a.len() < 16 || a[10] != 0xff || a[11] != 0xff || a[..10].iter().any(|b| *b != 0) {
         return Ipv4Addr::UNSPECIFIED;
@@ -134,8 +95,7 @@ fn mapped(ip: Ipv4Addr) -> [u8; 16] {
     a
 }
 
-/// A response's common header (RFC 6887 section 7.2): twenty-four octets,
-/// the R bit set, the reserved fields zero.
+/// A response's common header: twenty-four octets, the R bit set, the reserved fields zero.
 fn resp_header(opcode: u8, code: u8, lifetime: u32, epoch: u32) -> Vec<u8> {
     let mut b = vec![VERSION, opcode | 0x80, 0, code];
     b.extend_from_slice(&lifetime.to_be_bytes());
@@ -144,8 +104,7 @@ fn resp_header(opcode: u8, code: u8, lifetime: u32, epoch: u32) -> Vec<u8> {
     b
 }
 
-/// One MAP or PEER response body: the request's nonce, protocol and internal
-/// port come back, and the assigned external port and address are ours.
+/// One MAP or PEER response body: nonce, protocol, 3 reserved octets, internal port, then the tuple.
 fn resp_body(nonce: &[u8; 12], proto: u8, int_port: u16, ext_port: u16, ext_ip: Ipv4Addr) -> Vec<u8> {
     let mut b = nonce.to_vec();
     b.push(proto);
@@ -156,10 +115,7 @@ fn resp_body(nonce: &[u8; 12], proto: u8, int_port: u16, ext_port: u16, ext_ip: 
     b
 }
 
-/// Walk the options that follow the opcode data. `map` is the request being
-/// built; options that belong to another opcode are ignored, and an unknown
-/// option refuses the request only when it is marked mandatory (the option
-/// code's top bit clear).
+/// Walk the options after the opcode data; an unknown option refuses only with its top bit clear.
 fn read_options(buf: &[u8], from: usize, map: &mut MapReq) -> Result<(), Refusal> {
     let mut i = from;
     while i + 4 <= buf.len() {
@@ -181,8 +137,7 @@ fn read_options(buf: &[u8], from: usize, map: &mut MapReq) -> Result<(), Refusal
             OPT_PREFER_FAILURE if len == 0 => map.prefer_failure = true,
             OPT_FILTER if len as u16 == OPT_FILTER_LEN => {
                 if val[1] == 0 {
-                    // a zero prefix length is "no filter", and removes the
-                    // ones already asked for (RFC 6887 section 13.3)
+                    // a zero prefix length is "no filter" and removes the ones already asked for
                     map.filters.clear();
                 } else {
                     map.filters.push(Filter {
@@ -217,8 +172,7 @@ fn read_options(buf: &[u8], from: usize, map: &mut MapReq) -> Result<(), Refusal
     Ok(())
 }
 
-/// A refused request: either silence, or an error response with this result
-/// code and the request's opcode echoed (RFC 6887 section 8.2).
+/// A refused request: silence, or an error response with the request's opcode echoed (RFC 6887).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// Drop the datagram without answering.
@@ -227,8 +181,7 @@ pub enum Refusal {
     Code { opcode: u8, code: u8 },
 }
 
-/// One filter a MAP request asked for (RFC 6887 section 13.3). A prefix
-/// length of zero means "no filter" and clears the ones already asked for.
+/// One filter a MAP request asked for: a prefix length of zero means "no filter" and clears those.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Filter {
     pub prefix_len: u8,
@@ -250,9 +203,7 @@ pub struct MapReq {
     pub filters: Vec<Filter>,
 }
 
-/// A PEER request (RFC 6887 section 12). Addressed, never filtered: this
-/// server's filtering is endpoint-independent, so a peer request's only
-/// meaning here is "confirm the mapping that already carries this flow".
+/// A PEER request; this server's filtering is endpoint-independent, so it confirms a mapping.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerReq {
     pub lifetime: u32,
@@ -270,8 +221,7 @@ pub enum Req {
     Peer(PeerReq),
 }
 
-/// Parse one PCP request. `src` is the source address of the datagram that
-/// carried it, which section 8.2 compares against the header's client field.
+/// Parse one PCP request; `src` is compared against the header's client field.
 pub fn parse_pcp(buf: &[u8], src: Ipv4Addr) -> Result<Req, Refusal> {
     if buf.len() < 2 {
         return Err(Refusal::Silent);
@@ -315,6 +265,7 @@ pub fn parse_pcp(buf: &[u8], src: Ipv4Addr) -> Result<Req, Refusal> {
                     code: rc::MALFORMED_REQUEST,
                 });
             }
+            // request offsets: nonce 24..36, protocol 36, internal port 40..42, suggested port 42..44
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&buf[24..36]);
             let proto = buf[36];
@@ -325,6 +276,7 @@ pub fn parse_pcp(buf: &[u8], src: Ipv4Addr) -> Result<Req, Refusal> {
                     nonce,
                     proto,
                     int_port,
+                    // PEER adds the peer port at 60..62 and the peer address at 64..80
                     peer_port: u16::from_be_bytes([buf[60], buf[61]]),
                     peer_ip: unmapped(&buf[64..80]),
                 }));
@@ -357,9 +309,7 @@ pub fn parse_pcp(buf: &[u8], src: Ipv4Addr) -> Result<Req, Refusal> {
     }
 }
 
-/// A MAP response (RFC 6887 section 11.1, response side): the client's nonce,
-/// protocol and internal port come back, and the assigned external port and
-/// address are the server's.
+/// A MAP response: the client's nonce, protocol and internal port come back with the assigned tuple.
 pub fn build_map_response(
     req: &MapReq,
     epoch: u32,
@@ -373,7 +323,7 @@ pub fn build_map_response(
     out
 }
 
-/// A PEER response: the same layout as MAP's (RFC 6887 section 12.1).
+/// A PEER response: the same layout as MAP's (RFC 6887).
 pub fn build_peer_response(
     req: &PeerReq,
     epoch: u32,
@@ -387,15 +337,12 @@ pub fn build_peer_response(
     out
 }
 
-/// An ANNOUNCE response has no opcode-specific payload: the header alone
-/// (RFC 6887 section 14.1.1).
+/// An ANNOUNCE response has no opcode-specific payload: the header alone (RFC 6887).
 pub fn build_announce_response(epoch: u32) -> Vec<u8> {
     resp_header(OP_ANNOUNCE, rc::SUCCESS, 0, epoch)
 }
 
-/// An error response for a request that could not be acted on: the request's
-/// own payload comes back (RFC 6887 section 8.2's error-response rule) with
-/// the response fields set.
+/// An error response: the request's own payload comes back with the response fields set (RFC 6887).
 pub fn build_error(req: &[u8], code: u8, epoch: u32) -> Vec<u8> {
     let keep = req.len().min(MAX_MSG);
     let mut out = req[..keep].to_vec();
@@ -407,9 +354,7 @@ pub fn build_error(req: &[u8], code: u8, epoch: u32) -> Vec<u8> {
     out[4..8].copy_from_slice(&error_lifetime(code).to_be_bytes());
     out[8..12].copy_from_slice(&epoch.to_be_bytes());
     if out.len() >= HEADER {
-        // a request that did not parse: its client field comes back in the
-        // reserved field so the client can still match the answer to its own
-        // request (RFC 6887 section 7.2)
+        // a request that did not parse: its client field comes back so the client can match an answer
         let mut field = [0u8; 12];
         field.copy_from_slice(&out[12..24]);
         out[12..24].copy_from_slice(&field);
@@ -417,20 +362,16 @@ pub fn build_error(req: &[u8], code: u8, epoch: u32) -> Vec<u8> {
     out
 }
 
-/// The lifetime an error response advertises: the RFC recommends thirty
-/// seconds for its short-lifetime codes and thirty minutes for the rest.
+/// The error lifetime: 30 s for the three short-lifetime codes, 1800 s for the rest.
 pub fn error_lifetime(code: u8) -> u32 {
     match code {
         rc::NETWORK_FAILURE | rc::NO_RESOURCES | rc::USER_EX_QUOTA => 30,
-        // CANNOT_PROVIDE_EXTERNAL's lifetime "depends on the reason"; ours is
-        // structural (the uplink's own NAT owns the external port), so it is
-        // the long figure: retrying will not change the answer
+        // CANNOT_PROVIDE_EXTERNAL is structural (the uplink's NAT owns the port), so it is long
         _ => 1800,
     }
 }
 
-/// The lifetime a grant answers with, bounded by what the keepalive can maintain.
-/// A zero request is the delete form and stays zero.
+/// Bound a grant's lifetime by its dialect's ceiling; a zero request is the delete form and stays zero.
 pub fn lifetime_cap(requested: u32, cap: u32) -> u32 {
     if requested == 0 {
         0
@@ -448,11 +389,7 @@ pub fn outcome_code(o: &UpsertOutcome) -> u8 {
     }
 }
 
-/// Which protocol a datagram on the shared port belongs to. The first octet
-/// is the discriminator (a PCP request is version 2, a NAT-PMP request
-/// version 0); anything else is resolved by length, because a NAT-PMP
-/// version error and a PCP version-negotiation both start with an
-/// unrecognised octet and differ in the shape of what follows.
+/// Which dialect a datagram on the shared port belongs to, by first octet and then by length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sniff {
     Pcp,
@@ -465,16 +402,13 @@ pub fn sniff(buf: &[u8]) -> Sniff {
         None => Sniff::Unknown,
         Some(&0) => Sniff::Npmp,
         Some(&VERSION) => Sniff::Pcp,
-        // An unrecognised version octet. A PCP request is at least a common
-        // header long; a NAT-PMP request is twelve octets at most, so the
-        // length is what separates a future PCP version (answered with
-        // UNSUPP_VERSION) from a NAT-PMP version error.
+        // an unrecognised version octet: at least 24 octets is a PCP version to refuse, less is NAT-PMP
         Some(_) if buf.len() >= HEADER => Sniff::Pcp,
         Some(_) => Sniff::Npmp,
     }
 }
 
-/// A NAT-PMP request (RFC 6886 section 3).
+/// A NAT-PMP request (RFC 6886).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NpmpReq {
     PublicAddress,
@@ -521,7 +455,7 @@ pub fn parse_npmp(buf: &[u8]) -> Result<NpmpReq, NpmpErr> {
     }
 }
 
-/// A NAT-PMP mapping response (RFC 6886 section 3.3).
+/// A NAT-PMP mapping response, sixteen octets (RFC 6886).
 pub fn build_npmp_map(
     op: u8,
     code: u8,
@@ -539,7 +473,7 @@ pub fn build_npmp_map(
     b
 }
 
-/// A NAT-PMP public-address response (RFC 6886 section 3.2).
+/// A NAT-PMP public-address response, twelve octets (RFC 6886).
 pub fn build_npmp_public(code: u8, epoch: u32, ip: Ipv4Addr) -> Vec<u8> {
     let mut b = vec![0u8, np::OP_PUBLIC | np::RESP];
     b.extend_from_slice(&u16::from(code).to_be_bytes());
@@ -548,8 +482,7 @@ pub fn build_npmp_public(code: u8, epoch: u32, ip: Ipv4Addr) -> Vec<u8> {
     b
 }
 
-/// The version-error response: the short form, with the opcode zeroed
-/// (RFC 6886 section 3.5's own diagram).
+/// The NAT-PMP version error: the short form, with the opcode zeroed (RFC 6886).
 pub fn build_npmp_version_error(epoch: u32) -> Vec<u8> {
     let mut b = vec![0u8, np::OP_PUBLIC];
     b.extend_from_slice(&u16::from(np::UNSUPP_VERSION).to_be_bytes());
@@ -557,12 +490,10 @@ pub fn build_npmp_version_error(epoch: u32) -> Vec<u8> {
     b
 }
 
-/// The unsupported-opcode response: the request itself comes back with the
-/// response bit set and the result code 5 (RFC 6886 section 3.5).
+/// The unsupported-opcode response: the request echoes back with the response bit and code 5 (RFC 6886).
 pub fn build_npmp_echo(req: &[u8], epoch: u32) -> Vec<u8> {
     if req.len() < 12 {
-        // no room for a result code in the request's own shape: the short
-        // public-address form carries it
+        // no room for a result code in the request's own shape: the short public-address form carries it
         return build_npmp_public(np::UNSUPP_OPCODE, epoch, Ipv4Addr::UNSPECIFIED);
     }
     let mut out = req[..12].to_vec();
@@ -597,7 +528,7 @@ mod tests {
         b
     }
 
-    /// The MAP opcode-specific data, request side (RFC 6887 section 11.1).
+    /// The MAP opcode-specific data, request side (RFC 6887).
     fn map_body(proto: u8, int_port: u16, sug_port: u16, sug_ip: Ipv4Addr) -> Vec<u8> {
         let mut b = vec![0xAB; 12];
         b.push(proto);
@@ -644,7 +575,7 @@ mod tests {
     fn parse_announce_has_no_opcode_data() {
         let buf = header(OP_ANNOUNCE, 0, CLIENT, &[]);
         assert_eq!(parse_pcp(&buf, CLIENT), Ok(Req::Announce));
-        // lifetime is ignored on reception (section 14.1.1)
+        // lifetime is ignored on reception
         let buf = header(OP_ANNOUNCE, 9, CLIENT, &[]);
         assert_eq!(parse_pcp(&buf, CLIENT), Ok(Req::Announce));
     }
@@ -957,8 +888,7 @@ mod tests {
         assert_eq!(u32::from_be_bytes([out[8], out[9], out[10], out[11]]), 41);
         // the payload comes back verbatim so the client can match the answer
         assert_eq!(&out[24..], &req[24..]);
-        // and the client's own field comes back in the reserved field, which
-        // is how a request that did not parse is still correlated
+        // and the client's own field comes back, so a request that did not parse still correlates
         assert_eq!(&out[12..24], &req[12..24]);
         // and a long message is cut at the maximum the RFC allows
         let mut big = req.clone();
@@ -987,8 +917,7 @@ mod tests {
 
     #[test]
     fn a_granted_lifetime_is_bounded_by_its_dialect() {
-        // PCP: the keepalive's ceiling. NAT-PMP: the figure its own spec
-        // recommends, which is what a legacy client expects to read back.
+        // PCP's keepalive ceiling, and NAT-PMP's recommended figure a legacy client expects to read
         assert_eq!(lifetime_cap(0, MAX_LIFETIME), 0, "a zero request is a delete");
         assert_eq!(lifetime_cap(120, MAX_LIFETIME), 120);
         assert_eq!(lifetime_cap(MAX_LIFETIME, MAX_LIFETIME), MAX_LIFETIME);
@@ -1050,8 +979,7 @@ mod tests {
             parse_npmp(&[1u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(NpmpErr::Code(np::UNSUPP_VERSION))
         );
-        // the specification's own diagram for this one: eight octets, OP zero
-        // (the result code, not the response bit, is what marks it an error)
+        // the specification's own diagram: eight octets with the opcode zeroed
         let out = build_npmp_version_error(41);
         assert_eq!(out.len(), 8);
         assert_eq!(out[0], 0);
@@ -1088,8 +1016,7 @@ mod tests {
         assert_eq!(out[1], 9 | np::RESP, "the request's opcode with the response bit");
         assert_eq!(u16::from_be_bytes([out[2], out[3]]), u16::from(np::UNSUPP_OPCODE));
         assert_eq!(u32::from_be_bytes([out[4], out[5], out[6], out[7]]), 41);
-        // a two-octet unknown opcode has nowhere to put a code: the short
-        // form answers it
+        // a two-octet unknown opcode has nowhere to put a code: the short public-address form answers
         let out = build_npmp_echo(&[0u8, 9], 41);
         assert_eq!(out.len(), 12);
         assert_eq!(u16::from_be_bytes([out[2], out[3]]), u16::from(np::UNSUPP_OPCODE));

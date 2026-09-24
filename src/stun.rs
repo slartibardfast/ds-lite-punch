@@ -1,5 +1,4 @@
-//! Minimal STUN (RFC 5389) codec — just enough for Binding Request / Success
-//! Response with (XOR-)MAPPED-ADDRESS extraction. No crate needed.
+//! Minimal STUN (RFC 5389) codec: Binding Request and Success Response with (XOR-)MAPPED-ADDRESS.
 use std::net::Ipv4Addr;
 
 pub const MAGIC: u32 = 0x2112A442;
@@ -18,8 +17,7 @@ pub fn binding_request(txn: &[u8; 12]) -> Vec<u8> {
     b
 }
 
-/// Cheap non-crypto txn id: LCG seeded from the clock. Uniqueness vs.
-/// correctness only — STUN is unauthenticated anyway.
+/// Cheap non-crypto transaction id: an LCG seeded from the clock, since STUN is unauthenticated anyway.
 pub fn random_txn() -> [u8; 12] {
     let mut t = [0u8; 12];
     let seed = std::time::SystemTime::now()
@@ -36,8 +34,7 @@ pub fn random_txn() -> [u8; 12] {
     t
 }
 
-/// Parse a Binding Success Response and return the reflexive (ip, port) the
-/// NAT reports for us. Handles both MAPPED-ADDRESS and XOR-MAPPED-ADDRESS.
+/// Parse a Binding Success Response and return the reflexive (ip, port) the NAT reports for us.
 pub fn parse_mapped(resp: &[u8]) -> Option<(Ipv4Addr, u16)> {
     if resp.len() < 20 {
         return None;
@@ -80,9 +77,7 @@ pub fn parse_mapped(resp: &[u8]) -> Option<(Ipv4Addr, u16)> {
     None
 }
 
-/// Build a syntactically valid Binding Success Response carrying a single
-/// (XOR-)MAPPED-ADDRESS attribute. Shared by the unit tests and the Kani
-/// proofs so both exercise the exact same wire format.
+/// Build a valid Binding Success Response with one (XOR-)MAPPED-ADDRESS attribute, shared by tests and proofs
 #[cfg(any(test, kani))]
 fn build_mapped_response(xor: bool, ip: [u8; 4], port: u16) -> Vec<u8> {
     let attr_type = if xor { ATTR_XOR_MAPPED } else { ATTR_MAPPED };
@@ -137,13 +132,7 @@ mod tests {
     }
 }
 
-/// Kani verification harnesses — run with `cargo kani`. These prove properties
-/// for ALL inputs, complementing the example-based unit tests:
-///   * the parser never panics on any byte stream (robustness / memory safety);
-///   * the (XOR-)MAPPED-ADDRESS decode is an exact inverse of the encode;
-///   * the Binding Request always has the on-wire layout RFC 5389 requires;
-///   * a `Some` result implies the header was a genuine Binding Success
-///     Response (no false positives on garbage).
+/// Kani verification harnesses, which prove these properties for all inputs rather than by example.
 #[cfg(kani)]
 mod verify {
     use super::*;
@@ -205,8 +194,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(6)]
     fn truncated_response_is_none_or_valid() {
-        // Cutting a valid response at any point must yield None (never a
-        // bogus tuple), since the attribute can't be complete.
+        // Cutting a valid response at any point must yield None, since the attribute cannot be complete.
         let ip: [u8; 4] = kani::any();
         let port: u16 = kani::any();
         let full = build_mapped_response(true, ip, port);
@@ -214,9 +202,7 @@ mod verify {
         kani::assume(cut < full.len());
         let truncated = &full[..cut];
         if let Some(t) = parse_mapped(truncated) {
-            // A truncated buffer can only still parse if the cut falls after
-            // the complete attribute — i.e. nothing was actually removed from
-            // the attribute itself.
+            // A truncated buffer parses only if the cut falls after the complete attribute, removing nothing.
             assert_eq!(t, (Ipv4Addr::from(ip), port));
         }
     }

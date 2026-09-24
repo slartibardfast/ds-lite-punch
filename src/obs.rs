@@ -1,48 +1,10 @@
-//! Observation refresh engine (brief v2, Phase G) — G1/G2/G9.
-//!
-//! G1 CDC: `/proc/net/nf_conntrack` polling. C4 measured (2026-08-31): on
-//! this ImmortalWrt 6.12.35 build, netlink conntrack events DO NOT reach
-//! userspace (CT_GET dump works, event multicast silent even with
-//! nf_conntrack_events=1) — so the change-data-capture for observing
-//! flows is a poll of the proc table: existence, [UNREPLIED]/[ASSURED],
-//! and the reply-direction tuple (which reveals the post-NAT router-side
-//! source the shadow socket must bind).
-//!
-//! G2 policy predicate (console-agnostic, Kani truth table):
-//!   proto UDP
-//!   && src ∈ br-lan prefix
-//!   && dst off-LAN (not br-lan, not hub-LAN, not loopback/private-local)
-//!   && flow is bidirectional (reply seen — a peer cares about this flow)
-//!   && flow egresses the VM line (reply dst == the hub-LAN NAT address:
-//!      only flows through the AFTR have a CGNAT mapping to refresh; vdsl4
-//!      flows are directly routable and need nothing)
-//!   && inner tuple (NAT addr, reply dport) not owned by a static/lease
-//!      slot (I1 — observation never captures an owned tuple)
-//!   && refreshes for this flow < --max-refresh-attempts
-//! No hostname/MAC/port allowlists — review rejects any.
-//!
-//! G9: the predicate's truth table is Kani-proven. Parsing itself is
-//! numeric (no heap in the decision path); the parse→entry→evaluate chain
-//! is unit-tested against real proc lines captured on the router.
-//!
-//! `dead_code` allowance (p2-slot-engine, Phase G): the parse + predicate
-//! layer feeds the engine via `cdc::ProcCdc` → `scan`, but the evidence
-//! fields (orig_dport, unreplied, assured) are consumed only by tests and
-//! the G8 wire-shaping logs, so they stay untouched in the shipped binary.
-//! Do not remove this allowance without consuming those fields.
+//! The conntrack parser and the predicate that selects the br-lan UDP flows egressing the VM line.
+
+// The evidence fields are read only by tests, so the allowance stays.
 #![allow(dead_code)]
 use std::net::Ipv4Addr;
 
-/// Parsed one line of /proc/net/nf_conntrack.
-/// Field layout (6.12):
-///   ipv4 2 <proto> <number> <timeout_left> \
-///   src=A dst=B sport=N dport=M packets=.. bytes=.. [UNREPLIED]/[ASSURED] \
-///   src=C dst=D sport=N dport=M packets=.. bytes=.. mark=0 zone=0 use=K
-///
-/// The *reply* direction's dst/dport is the router-side post-NAT source
-/// tuple for that flow (what packets coming back arrive as) — the shadow
-/// socket binds exactly that (I2). Parsed after NAT via the reply side,
-/// because conntrack's orig side shows the pre-NAT LAN tuple.
+/// One parsed line of `/proc/net/nf_conntrack`, with both directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CtEntry {
     pub proto: u8, // 17 = UDP, 6 = TCP, 1 = ICMP
@@ -68,40 +30,27 @@ impl CtEntry {
         self.proto == 17
     }
 
-    /// Router-side post-NAT source tuple for this flow (what the shadow
-    /// socket binds): reply-direction *dst* + *dport*. The reply tuple in
-    /// /proc/net/nf_conntrack is src=<peer> dst=<router NAT addr>
-    /// sport=<peer port> dport=<router NAT port> — the NAT'd local side is
-    /// (dst, dport).
+    /// The router-side post-NAT (address, port) the shadow socket binds: reply dst + dport.
     pub fn nat_src(&self) -> (Ipv4Addr, u16) {
         (self.reply_dst, self.reply_dport)
     }
 
-    /// Boolean: the reply direction has carried packets (bidirectional —
-    /// this is the flow a peer actually cares about).
+    /// Whether the reply direction has carried packets, so a peer cares about the flow.
     pub fn has_seen_reply(&self) -> bool {
         self.reply_packets > 0
     }
 }
 
-/// Immutable decision context. `'a` borrows the owned-tuple slice so the
-/// runtime can hand a live slot list per scan (the engine owns the slab;
-/// the Kani harnesses use `'static` const arrays).
+/// The decision context for one scan; `'a` borrows the owned-tuple slice.
 #[derive(Clone, Copy, Debug)]
 pub struct ObsCtx<'a> {
-    /// The allowlist (call/0025). A named device's flow is admitted on its
-    /// own outbound tuple: the mapping a console's NAT type depends on is the one
-    /// its own packets create, and once it goes quiet only our writes can
-    /// keep it alive, so an unanswered flow is exactly the one that needs us
-    /// (call/0029). An unnamed flow keeps the reply requirement, where the
-    /// heuristic is all there is to go on.
+    /// The allowlist: a named device's flow is admitted without a reply.
     pub allowed: &'a [Ipv4Addr],
     /// br-lan prefix (hosts eligible for refresh). Default 192.168.21.0/24.
     pub brlan: (Ipv4Addr, u8),
-    /// hub-LAN NAT address — only flows egressing the VM line (AFTR) have
-    /// a CGNAT mapping to refresh.
+    /// The hub-LAN NAT address: only flows egressing the VM line have a CGNAT mapping to refresh.
     pub vm_nat: Ipv4Addr,
-    /// Inner tuples already owned by static/lease slots (I1).
+    /// Inner tuples already held by a static or lease slot, never to be captured.
     pub owned: &'a [(Ipv4Addr, u16)],
     /// per-flow refresh budget
     pub max_refresh_attempts: u32,
@@ -122,8 +71,7 @@ impl<'a> ObsCtx<'a> {
 
     pub fn is_private_local(&self, a: Ipv4Addr) -> bool {
         let v = u32::from(a);
-        // 10/8, 172.16/12, 192.168/16, 127/8, 0/8 — nothing a peer needs to
-        // reach, and dst in these would be a LAN or self-address.
+        // 10/8, 172.16/12, 192.168/16 and 127/8 are never a peer's destination.
         (v & 0xff00_0000) == 0x0a00_0000
             || (v & 0xfff0_0000) == 0xac10_0000
             || (v & 0xffff_0000) == 0xc0a8_0000
@@ -135,7 +83,7 @@ impl<'a> ObsCtx<'a> {
     }
 }
 
-/// G2 predicate. Pure; Kani-provable.
+/// The admission predicate: true for a flow worth a shadow keepalive.
 pub fn should_refresh(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
     if !e.is_udp() {
         return false;
@@ -144,19 +92,17 @@ pub fn should_refresh(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
         return false;
     }
     if ctx.is_private_local(e.orig_dst) {
-        return false; // off-LAN requirement: dst must be a routable public
+        return false; // the destination must be routable, not a LAN or local address
     }
-    // Bidirectional, or named: a peer must be able to care about this flow,
-    // and for a named device our own writes are what let it care at all.
+    // Bidirectional, or named: for a named device our own writes are what keep it alive.
     if !e.has_seen_reply() && !ctx.allowed.contains(&e.orig_src) {
         return false;
     }
-    // VM line only: the reply's destination is the hub-LAN NAT address,
-    // so the flow crossed the AFTR and has a CGNAT mapping to refresh.
+    // VM line only: the reply's destination is the hub-LAN NAT address, so the flow crossed the AFTR.
     if e.reply_dst != ctx.vm_nat {
         return false;
     }
-    // I1: never capture a tuple a static/lease slot holds.
+    // A tuple a static or lease slot holds is never captured.
     if ctx.is_owned(e.nat_src()) {
         return false;
     }
@@ -166,29 +112,19 @@ pub fn should_refresh(e: &CtEntry, ctx: &ObsCtx<'_>) -> bool {
     true
 }
 
-/// A flow the observation engine has decided to refresh. The shadow socket
-/// binds `nat_src` = (192.168.0.21, R_nat) and STUN-keepalives it; a pin
-/// element `(orig_src, orig_sport) -> R_nat` goes in after C5 (shadow-bind
-/// proven) so all future traffic from that host port shares the tuple.
+/// A flow the engine has decided to refresh: the shadow socket binds `bind_tuple`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefreshCandidate {
-    /// inner tuple the shadow socket will bind — the flow's post-NAT
-    /// (source, port) as the AFTR sees it
+    /// The shadow socket's bind tuple: the flow's post-NAT (address, port) as the AFTR sees it.
     pub bind_tuple: (Ipv4Addr, u16),
-    /// br-lan host + port the pin must anchor (orig direction, pre-NAT)
+    /// The br-lan host and port the pin anchors, pre-NAT.
     pub host: Ipv4Addr,
     pub host_port: u16,
-    /// Peer side of the observed flow (reply src) — the other half of the
-    /// conntrack orig tuple the claim deletes (netlink CT_DELETE, see
-    /// engine.rs: without the delete the kernel NAPT's the shadow
-    /// keepalives to an ephemeral port and the refresh targets the wrong
-    /// tuple; measured 41077 → 1024 on-box, 2026-09-02).
+    /// The reply source of the observed flow.
     pub peer: (Ipv4Addr, u16),
 }
 
-/// Scan `/proc/net/nf_conntrack` and collect eligible refresh candidates.
-/// Returns candidates in stable (line) order. Never allocates per line
-/// beyond the return list.
+/// Collects eligible candidates from a conntrack table in stable line order.
 pub fn scan(f: &str, ctx: &ObsCtx<'_>) -> Vec<RefreshCandidate> {
     let mut out = Vec::new();
     let mut refreshes = 0u32;
@@ -214,8 +150,7 @@ pub fn scan(f: &str, ctx: &ObsCtx<'_>) -> Vec<RefreshCandidate> {
     out
 }
 
-/// Find `key=` in a whitespace-tokenized conntrack line section and return
-/// the value. No allocation.
+/// Finds `key=` in a whitespace-tokenized section, without allocating.
 fn kv_at<'a>(fields: &'a [&str], key: &str) -> Option<&'a str> {
     fields.iter().find_map(|f| {
         let (k, v) = f.split_once('=')?;
@@ -223,14 +158,13 @@ fn kv_at<'a>(fields: &'a [&str], key: &str) -> Option<&'a str> {
     })
 }
 
-/// Parse one /proc/net/nf_conntrack line. Returns None on any malformed
-/// field (never panics). Only the fields the engine needs are extracted.
+/// Parses one conntrack line; returns None on any malformed field and never panics.
 pub fn parse_line(line: &str) -> Option<CtEntry> {
     let t: Vec<&str> = line.split_whitespace().collect();
     if t.len() < 16 {
         return None;
     }
-    // t[0]=family t[1]=2 t[2]=proto-name t[3]=proto-number t[4]=timeout
+    // tokens: 0 family, 1 =2, 2 proto name, 3 proto number, 4 timeout
     let proto: u8 = t.get(3)?.parse().ok()?;
     let timeout_left: u32 = t.get(4)?.parse().ok()?;
 
@@ -241,8 +175,7 @@ pub fn parse_line(line: &str) -> Option<CtEntry> {
     let orig_packets: u64 = kv_at(orig, "packets")?.parse().ok()?;
     let orig_bytes: u64 = kv_at(orig, "bytes")?.parse().ok()?;
 
-    // Reply side: after the orig window (which ends at the [flags] token,
-    // position of the second "src=" token in the whole line).
+    // The reply window starts at the second "src=" token, where the orig window ends.
     let reply_off = (t.iter().enumerate().filter(|(_, f)| f.starts_with("src=")).nth(1))
         .map(|(i, _)| i)
         .unwrap_or(t.len());
@@ -292,8 +225,7 @@ pub fn brlan_ctx() -> ObsCtx<'static> {
 mod tests {
     use super::*;
 
-    // Real line captured on the router (2026-08-31): a br-lan container
-    // UDP flow egressing the VM line via the relay pin.
+    // A br-lan container UDP flow egressing the VM line, as captured on the router.
     const GOOD: &str = "ipv4     2 udp      17 56 src=192.168.21.10 dst=8.8.8.8 sport=54322 dport=53 packets=1 bytes=92 [UNREPLIED] src=8.8.8.8 dst=192.168.0.21 sport=53 dport=54322 packets=0 bytes=0 mark=0 zone=0 use=2";
 
     #[test]
@@ -313,10 +245,7 @@ mod tests {
 
     #[test]
     fn an_unreplied_flow_from_a_named_device_is_refreshed() {
-        // call/0029: the mapping a console's NAT type depends on is the one its
-        // own packets create, and its flows to game peers are frequently
-        // unanswered. A named device is admitted on that tuple; an unnamed
-        // one is not.
+        // A named device is admitted on an unanswered flow; an unnamed one waits for a reply.
         let l = GOOD;
         let e = parse_line(l).expect("fixture parses");
         assert!(e.unreplied, "the fixture is the unanswered case");
@@ -336,8 +265,7 @@ mod tests {
     #[test]
     fn an_unreplied_flow_from_an_unnamed_device_is_not_refreshed() {
         let e = parse_line(GOOD).unwrap();
-        // no reply seen → predicate false (wait for a reply; mapping matters
-        // to a peer)
+        // No reply seen, so the predicate is false: an unnamed device waits for a peer.
         assert!(!should_refresh(&e, &brlan_ctx()));
     }
 
@@ -360,7 +288,7 @@ mod tests {
 
     #[test]
     fn vdsl4_flow_not_refreshed() {
-        // reply dst = the vdsl4 public IP (not the VM NAT): no AFTR mapping
+        // reply dst is the vdsl4 public IP, not the VM NAT, so there is no AFTR mapping
         let line = GOOD
             .replace("dst=192.168.0.21", "dst=84.203.115.61")
             .replace("[UNREPLIED]", "")
@@ -371,7 +299,7 @@ mod tests {
 
     #[test]
     fn tcp_flow_not_refreshed() {
-        // TCP is out of scope until C3 measured.
+        // TCP is out of scope for the UDP observation arm.
         let line = GOOD
             .replace("udp      17", "tcp       6")
             .replace("packets=0 bytes=0 mark=", "[ASSURED] packets=3 bytes=210 mark=");
@@ -382,7 +310,7 @@ mod tests {
 
     #[test]
     fn dest_off_lan_required() {
-        // dst in a private block → not a peer-reachable flow
+        // a private destination is not a peer-reachable flow
         let line = GOOD
             .replace("dst=8.8.8.8", "dst=10.1.2.3")
             .replace("[UNREPLIED]", "")
@@ -393,7 +321,7 @@ mod tests {
 
     #[test]
     fn owned_tuple_never_refreshed() {
-        // I1: a lease/static slot already holds (192.168.0.21, 54322)
+        // a lease or static slot already holds (192.168.0.21, 54322)
         let line = replied_line();
         let e = parse_line(&line).unwrap();
         let mut ctx = brlan_ctx();

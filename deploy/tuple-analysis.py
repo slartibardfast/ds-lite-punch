@@ -101,9 +101,7 @@ def main():
             if m:
                 pairs.append((t, ts, m.group(1), m.group(2)))
         elif kind == "rescue":
-            # The rescue line's third field is the router's own translated
-            # port, before the AFTR: a different namespace from the external
-            # tuples, so it is kept apart rather than compared with them.
+            # The refresh line's third field is the router's own translated port, a namespace of its own beside the external tuples.
             m = RESCUE.search(d.get("detail", ""))
             if m:
                 pairs.append((t, ts, m.group(1), f"router:{m.group(2)}"))

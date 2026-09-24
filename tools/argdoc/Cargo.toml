@@ -1,19 +1,4 @@
-# argdoc — the CLI authoring tool.
-#
-# This crate holds one clap definition of the command line and writes two files
-# from it: the help text the daemon prints (`src/help.txt`) and the manual page
-# (`deploy/man/ds-lite-punch.8`). Nothing here links into the daemon, so the
-# shipping crate keeps a dependency tree of tokio and libc.
-#
-# The empty `[workspace]` table below is what guarantees that: it makes this
-# crate its own workspace root, so the shipping crate's `Cargo.toml` and
-# `Cargo.lock` do not move and the recorded artifact hash cannot change because
-# this tool exists.
-#
-# The crate tree's `.cargo/config.toml` sends every cargo command to
-# x86_64-unknown-linux-musl, so name the host target when running this:
-#
-#   cargo run --manifest-path tools/argdoc/Cargo.toml --target x86_64-unknown-linux-gnu
+# The CLI authoring tool. Run it with an explicit host target, because the tree pins musl for every cargo command: cargo run --manifest-path tools/argdoc/Cargo.toml --target x86_64-unknown-linux-gnu
 [workspace]
 
 [package]
@@ -28,8 +13,7 @@ clap = { version = "4.6.7", default-features = false, features = [
     "help",
     "usage",
     "error-context",
-    # The version string is read from the shipping crate's manifest at run
-    # time, so clap has to take an owned string.
+    # The version comes from the shipping crate's manifest at run time, so clap needs its string feature.
     "string",
 ] }
 clap_mangen = "0.3.3"
