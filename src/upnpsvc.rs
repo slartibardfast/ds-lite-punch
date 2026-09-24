@@ -1,15 +1,4 @@
-//! UPnP IGDv1 facade runtime (plan/0007 phase E): the SSDP responder, the
-//! HTTP service (description docs + SOAP with POST/M-POST parity + GENA),
-//! the grant/teardown datapaths for AddPortMapping (UDP slot via the v1
-//! `run_slot`, TCP slot via the call/0017 datapath), and the tuple watch
-//! that feeds GetExternalIPAddress and the GENA ExternalIPAddress events.
-//! The pure, Kani-proven layer is `upnp.rs`; this module is the io+nft
-//! wiring (Kani non-goal, like every nft/FFI boundary in the crate).
-//!
-//! E8 hardening: request head/body caps (`HTTP_CAP`), LAN-only binds (the
-//! HTTP listener binds the br-lan address; SSDP joins the group on br-lan),
-//! no panics (every parse is fallible), capped logging (one line per SOAP
-//! action; SSDP answers are not logged per packet).
+//! UPnP IGDv1 facade runtime: SSDP, HTTP/SOAP/GENA, grant datapaths, tuple watch; the io+nft wiring, outside Kani.
 
 use std::collections::HashMap;
 use std::io;
@@ -35,41 +24,24 @@ use crate::upnp::*;
 use crate::vote::VoteState;
 use crate::publish::{emiteln, emitln};
 
-/// Concurrency cap for the HTTP service (E8: bounded connections).
+/// Concurrency cap for the HTTP service.
 const HTTP_CONN_CAP: usize = 16;
-/// plan/0008 R6 mount gate: the IGD:2 facade is served only when its
-/// complete service set (WIP2 + DeviceProtection:1) is real. The
-/// #v2-service-set task flips it here, and it stays on: the v2 mount
-/// carries the 21-action WANIPConnection:2 SCPD, the DP SCPD, and the
-/// DeviceProtection service in the root description (sections 26.4 and
-/// 26.11, which forbid an IGD:2 facade without DP). The v1 presentation
-/// stays served beside it (section 26.12).
+/// The IGD:2 mount gate: the v2 facade is served only with WANIPConnection:2 and an enforced DeviceProtection:1.
 const IGD_V2_ENABLED: bool = true;
-/// plan/0008 R6: the per-control-point discovery window. 1 s is the UDA
-/// default for a missing MX, so a deferred ssdp:all response always
-/// falls inside its own allowed response window.
+/// The per-control-point discovery window: 1 s, the UDA default for a missing MX.
 const DISCOVERY_DEBOUNCE_MS: u64 = 1000;
-/// The versioned description URLs (plan/0008's LOCATION design).
+/// The versioned description URLs.
 const DOC_V1: &str = "/igd/v1/rootDesc.xml";
 const DOC_V2: &str = "/igd/v2/rootDesc.xml";
-/// The WANIPConnection:2 maximum lease (table 2-6): the version 2 reading
-/// of a lease of 0, where version 1 read it as a static mapping.
+/// The WANIPConnection:2 maximum lease: the version 2 reading of a lease of 0, where v1 reads a static mapping.
 const WIP2_MAX_LEASE: u32 = 604_800;
-/// The floor of an automatic external-port choice, the AddAnyPortMapping
-/// wildcard of section 2.5.17.
+/// The floor of an automatic external-port choice (the AddAnyPortMapping wildcard).
 const ANY_PORT_BASE: u16 = 1024;
-/// The stored length of a control point's mapping description (2.3.22).
-/// The format is application-defined and the spec imposes no bound; this
-/// keeps the record and the persisted index line bounded.
+/// The stored length of a mapping description: application-defined, so this only keeps the index line bounded.
 const DESC_MAX: usize = 64;
-/// Lease policy (2026-09-15): the granted lease appears infinite
-/// (U32_MAX wire/index) while the effective lifetime is managed
-/// underneath. A UDP grant becomes a reap candidate when its client has
-/// shown no evidence (datapath peer data or any SOAP action) for
-/// `LEASE_GRACE_S`; the 7-day backstop catches true ghosts whatever the
-/// pool state. TCP grants are outside the policy (a live splice can be
-/// control-silent; the AFTR reaps idle TCP at the C3 bound).
+/// A grant's lease reads as infinite; a UDP one is reaped after LEASE_GRACE_S of client silence, and TCP never.
 const LEASE_GRACE_S: u64 = 86_400;
+/// The backstop sweep: a UDP grant silent this long is a ghost whatever the pool state.
 const LEASE_BACKSTOP_S: u64 = 604_800;
 /// The GENA prune interval (subscriptions live at 2x the requested timeout).
 const GENA_PRUNE_S: u64 = 60;
@@ -90,22 +62,14 @@ pub struct UpnpConfig {
     pub grace_secs: u64,
 }
 
-/// One granted mapping's control-plane record. `req_ext` is the requested
-/// external port — the UPnP key — while the slot's `bind_port` is the
-/// granted inner R; the AFTR's real external tuple is discovered via STUN
-/// and reported through the tuple watch ("report-requested", E3). `desc`
-/// is the control point's own label (2.3.22), kept so the enumeration and
-/// the Listing can return what the control point actually sent.
+/// One granted mapping: req_ext is the UPnP key, bind_port the granted inner R, desc the client's own label.
 #[derive(Clone, Debug)]
 struct FacadeEntry {
     req_ext: u16,
     proto: Proto,
-    /// The control point that asked for the mapping: the per-client key, and
-    /// what the containment compares against. A lifted control point may name
-    /// another host as the target, so this is not the target.
+    /// The control point that asked (the per-client key), which need not be the target a lifted caller names.
     owner: Ipv4Addr,
-    /// The datapath target (`NewInternalClient`): where inbound datagrams are
-    /// forwarded.
+    /// The datapath target (`NewInternalClient`), where inbound datagrams are forwarded.
     client: Ipv4Addr,
     int_port: u16,
     bind_port: u16,
@@ -114,8 +78,7 @@ struct FacadeEntry {
     desc: String,
 }
 
-/// One GENA subscription (E5): callback URL validated to be http + br-lan,
-/// expiry at 2x the requested timeout, per-subscription eventKey.
+/// One GENA subscription: callback URL, expiry at twice the requested timeout, per-subscription eventKey.
 #[derive(Clone, Debug)]
 struct Sub {
     sid: Sid,
@@ -125,14 +88,11 @@ struct Sub {
     timeout_secs: u32,
     expires_at_unix: u64,
     seq: u32,
-    /// The control point that subscribed, captured at SUBSCRIBE: containment
-    /// keys on the caller, and the callback address is not the caller.
+    /// The control point that subscribed: containment keys on the caller, not on the callback address.
     caller: Ipv4Addr,
-    /// The face it subscribed on. The port floor binds the v2 face only, so
-    /// the subscriber's own count is scoped the way its reads are.
+    /// The face it subscribed on: the port floor binds the v2 face only, so its count is scoped as its reads are.
     v2: bool,
-    /// The declared evented variables as this subscriber last saw them, so a
-    /// NOTIFY carries exactly what moved (call/0025).
+    /// The declared evented variables as this subscriber last saw them, so a NOTIFY carries exactly what moved.
     sent: Option<EventView>,
 }
 
@@ -140,24 +100,20 @@ struct Sub {
 struct GenaState {
     subs: Vec<Sub>,
     sids: SidSet,
-    /// SystemUpdateID: bumped when a mapping appears or goes, so a subscriber
-    /// that only reads the evented state variables still sees the table move.
+    /// SystemUpdateID: bumped when a mapping appears or goes, so a subscriber sees the table move.
     update_id: u32,
 }
 
-/// plan/0008's ssdp:all rule and its state machine: what the responder does with one
-/// M-SEARCH target. `v2_enabled` is the IGD_V2_ENABLED mount gate.
+/// What the responder does with one M-SEARCH target, `v2_enabled` being the IGD_V2_ENABLED mount gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryAction {
     /// answer immediately from the v1 compatibility facade
     ReplyV1(SearchTarget),
     /// answer immediately from the v2 facade (gate on only)
     ReplyV2(SearchTarget),
-    /// the target is not offered (a v2 target while the gate is off,
-    /// or anything unknown)
+    /// the target is not offered (a v2 target while the gate is off, or anything unknown)
     Ignore,
-    /// ssdp:all with v2 mounted: open or join the per-control-point
-    /// burst and defer the response (R6)
+    /// ssdp:all with v2 mounted: open or join the per-control-point burst and defer the response
     DeferAll,
 }
 
@@ -175,14 +131,11 @@ fn discovery_action(st: SearchTarget, v2_enabled: bool) -> DiscoveryAction {
     }
 }
 
-/// Resolve a deferred ssdp:all burst: true when an IGD:2 search flipped
-/// the watch before the debounce elapsed, false on the default
-/// (plan/0008's bounded burst debounce: seen_v2 ? v2 : v1).
+/// Resolve a deferred ssdp:all burst: true when an IGD:2 search flipped the watch before the debounce elapsed.
 async fn burst_resolves_v2(mut rx: watch::Receiver<bool>, debounce: Duration) -> bool {
     tokio::select! {
         changed = rx.changed() => {
-            // changed() errors only if the sender dropped (cleanup); the
-            // last value still decides
+            // changed() errors only if the sender dropped; the last value still decides
             let _ = changed;
             *rx.borrow()
         }
@@ -201,33 +154,18 @@ pub struct UpnpFacade {
     udn: String,
     started_unix: u64,
     ssdp: Arc<UdpSocket>,
-    /// plan/0008 R6: pending ssdp:all bursts, keyed by control point
-    /// (src addr + port). The sender's value flips true when an IGD:2
-    /// search is observed inside the window; entries live only while a
-    /// response is deferred and are removed by the deferred task.
+    /// pending ssdp:all bursts keyed by control point; the value flips when an IGD:2 search is seen in the window
     bursts: Arc<StdMutex<HashMap<(Ipv4Addr, u16), watch::Sender<bool>>>>,
-    /// plan/0008 #v2-service-set: the DeviceProtection:1 service state
-    /// (users + ACL persisted, sessions transient per section 26.15).
+    /// The DeviceProtection:1 service state (users and ACL persisted, sessions transient).
     dp: StdMutex<dp::DpState>,
-    /// PCP mappings whose discovery has not completed yet: bind port -> the
-    /// second the wait began. A request that cannot be answered yet is
-    /// dropped; past DISCOVERY_GRACE_S the answer is the network error.
+    /// PCP mappings still discovering: bind port to the second the wait began, dropped past DISCOVERY_GRACE_S.
     pcp_wait: StdMutex<HashMap<u16, u64>>,
-    /// Consecutive LAN-presence misses per slot. This lives on the facade
-    /// because the GC runs as one pass per tick, so a counter local to the
-    /// pass would reset before it ever reached the threshold.
+    /// Consecutive LAN-presence misses per slot, held here because the GC pass is local to one tick.
     presence_misses: StdMutex<HashMap<u16, u8>>,
 }
 
 impl UpnpFacade {
-    /// Build and start the facade: identity, seed the tuple watch, spawn
-    /// the SSDP (alive + M-SEARCH), HTTP, GENA-event, prune and local-GC
-    /// tasks. Returns the handle (used for the SIGTERM byebye).
-    ///
-    /// The only hard failure is the privileged SSDP bind (UDP 1900): Err on
-    /// that (or on a bind of the LAN address the daemon does not own) makes
-    /// the facade degrade at the call site instead of taking the daemon
-    /// down with it — the keepalive datapath runs regardless.
+    /// Start the facade; an Err is the privileged SSDP or LAN bind, which the caller turns into a degrade.
     pub async fn start(
         cfg: UpnpConfig,
         table: Arc<Mutex<LeaseTable>>,
@@ -236,10 +174,7 @@ impl UpnpFacade {
     ) -> io::Result<Arc<UpnpFacade>> {
         let (udn, _boot_id) = load_identity(&cfg.state_dir, cfg.lan_ip, cfg.bind_ip);
 
-        // Rebuild the control-plane entry index from the persisted upnp.tsv
-        // (requested-ext key -> slot), so delete/enumerate survive a
-        // respawn alongside the slot table restore. Drop entries whose slot
-        // is no longer in the (restored) table.
+        // Rebuild the control-plane entry index from the persisted upnp.tsv, dropping entries whose slot is gone.
         let mut entries = restore_entries();
         {
             let t = table.lock().await;
@@ -267,13 +202,10 @@ impl UpnpFacade {
             presence_misses: StdMutex::new(HashMap::new()),
         });
 
-        // Respawn-restored grants: main skipped their datapath spawn (its
-        // loop owns statics only in facade mode), so their socket runtime
-        // is rebuilt here and registered for teardown.
+        // Respawn-restored grants: their socket runtime is rebuilt here, as main spawns statics only.
         facade.spawn_restored_grants().await;
 
-        // Alive NOTIFY: the first tick fires immediately (startup
-        // announcement), then every max-age/2.
+        // Alive NOTIFY: the first tick fires immediately (startup announcement), then every max-age/2.
         let f = facade.clone();
         tokio::spawn(async move {
             f.ssdp_alive_loop().await;
@@ -285,9 +217,7 @@ impl UpnpFacade {
             f.ssdp_recv_loop().await;
         });
 
-        // GENA event loop: every tuple publication (churn/republish) sends
-        // an ExternalIPAddress NOTIFY to every subscription. The receiver
-        // is owned here (changed() needs &mut).
+        // GENA event loop: every tuple publication sends an ExternalIPAddress NOTIFY to every subscription.
         let mut event_rx = facade.ip_rx.clone();
         let f = facade.clone();
         tokio::spawn(async move {
@@ -314,9 +244,7 @@ impl UpnpFacade {
             }
         });
 
-        // Local GC: tear down expired granted leases (nft, datapath tasks,
-        // entry, persistence). The facade owns the full teardown, so main's
-        // table-only GC is disabled in facade mode.
+        // Local GC: tear down expired granted leases; main's table-only GC is disabled in facade mode.
         let f = facade.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(GC_TICK_S));
@@ -338,14 +266,7 @@ impl UpnpFacade {
         Ok(facade)
     }
 
-    /// Spawn the datapath tasks for respawn-restored granted leases and
-    /// register their JoinHandles, so facade teardown (delete_mapping /
-    /// gc_loop) can abort them. The boot add_pin loop re-creates the nft
-    /// elements for restored slots; only the socket runtime is missing, and
-    /// main skips granted leases in facade mode, so this is the granted
-    /// slot's single task owner. A slot whose bind fails degrades alone
-    /// (logged; the entry stays enumerable and the row is reclaimed by the
-    /// lease->GC path).
+    /// Spawn and register the datapath tasks for respawn-restored grants, so teardown can abort them.
     async fn spawn_restored_grants(&self) {
         let entries: Vec<FacadeEntry> = self.entries.lock().await.clone();
         for e in entries {
@@ -453,8 +374,7 @@ impl UpnpFacade {
                     self.send_discovery(t, src, mx, DOC_V1).await;
                 }
                 DiscoveryAction::ReplyV2(t) => {
-                    // an explicit IGD:2 search inside a pending burst flips
-                    // the deferred ssdp:all response to v2 (R6)
+                    // an explicit IGD:2 search inside a pending burst flips the deferred ssdp:all response to v2
                     if let Some(tx) = crate::publish::lock_or_recover(&self.bursts).get(&key) {
                         let _ = tx.send(true);
                     }
@@ -467,8 +387,7 @@ impl UpnpFacade {
         }
     }
 
-    /// Jitter within MX (capped 5 s by the grammar) then answer with the
-    /// given presentation's LOCATION.
+    /// Jitter within MX (capped at 5 s by the grammar) then answer with the given presentation's LOCATION.
     async fn send_discovery(&self, st: SearchTarget, src: SocketAddr, mx: u8, loc: &str) {
         let delay_ms = if mx == 0 {
             0u64
@@ -491,11 +410,7 @@ impl UpnpFacade {
         let _ = self.ssdp.send_to(&resp, src).await;
     }
 
-    /// plan/0008 R6: hold the ssdp:all response for the discovery
-    /// window, releasing early with the v2 presentation when an IGD:2
-    /// search flips the burst, or at the deadline with the v1
-    /// compatibility default. Duplicate :all retransmissions from the
-    /// same control point coalesce onto the existing burst.
+    /// Hold the ssdp:all response for the discovery window, releasing early on an IGD:2 search or at the deadline.
     async fn defer_all(&self, key: (Ipv4Addr, u16), src: SocketAddr) {
         {
             let m = crate::publish::lock_or_recover(&self.bursts);
@@ -518,8 +433,7 @@ impl UpnpFacade {
         tokio::spawn(async move {
             let v2 = burst_resolves_v2(rx, Duration::from_millis(DISCOVERY_DEBOUNCE_MS)).await;
             let loc = if v2 { DOC_V2 } else { DOC_V1 };
-            // the deferred answer goes out at the window deadline, which is
-            // at most the assumed MX floor (1 s); no extra jitter needed
+            // the deferred answer goes out at the window deadline (at most the 1 s MX floor), with no jitter
             let resp = upnp::msearch_response(
                 SearchTarget::All,
                 &udn,
@@ -558,10 +472,7 @@ impl UpnpFacade {
             .to_string()
     }
 
-    /// GetCommonLinkProperties on the WANCommonInterfaceConfig:1 service:
-    /// the physical link is Up whenever the tuple watch holds a value;
-    /// the symmetric ds-lite line offers no measurable Layer-1 bit rates,
-    /// so 0 is reported (the value is absent, not a measured zero).
+    /// GetCommonLinkProperties: Up while the tuple watch holds a value; both Layer-1 rates report 0.
     fn common_link_properties(&self) -> String {
         let status = if self.external_ip().is_some() { "Up" } else { "Down" };
         format!(
@@ -573,13 +484,7 @@ impl UpnpFacade {
         )
     }
 
-    /// allocate_exact (plan/0008's version-specific SOAP semantics): the
-    /// requested external port is the requester's own handle. A re-Add
-    /// pivots that requester's mapping to the requested port; another
-    /// requester on the same port gets its own entry beside it, because
-    /// the port is a per-client label rather than a resource this device
-    /// allocates (call/0022, which supersedes the specification's
-    /// one-mapping rule for this line).
+    /// allocate_exact: the port is the requester's own label, so another requester's entry stands beside it.
     async fn allocate_exact(
         &self,
         req: MappingReq,
@@ -589,9 +494,7 @@ impl UpnpFacade {
         self.grant_mapping(req, owner, view).await.map(|_| String::new())
     }
 
-    /// The grant itself, returning the admission outcome so a dialect that
-    /// reports result codes can answer precisely (PCP's quota and resource
-    /// errors are different messages to its clients).
+    /// The grant itself, returning the admission outcome so PCP can report its own result codes.
     async fn grant_mapping(
         &self,
         req: MappingReq,
@@ -616,13 +519,7 @@ impl UpnpFacade {
         }
         let lifetime = if lifetime == 0 { INFINITE_LEASE } else { lifetime };
         let now = Epoch::now();
-        // The punch collision rule (call/0027 R2/R3): a bind port whose inner
-        // tuple is already live belongs to whoever punched it, so the
-        // allocator's probe runs before a fresh allocation and steers around
-        // every live tuple the change-data-capture shows. A renewal allocates
-        // nothing, so it reads nothing. When the mirror is unavailable the
-        // probe cannot run, and that is said rather than passed over in
-        // silence (R5).
+        // The punch collision rule: the probe runs before a fresh allocation and steers around live tuples.
         let fresh = {
             let t = self.table.lock().await;
             t.by_pcp_key(proto, int_port, owner).is_none()
@@ -642,10 +539,7 @@ impl UpnpFacade {
         }
         let mut outcome = self.upsert_once(proto, int_port, client, lifetime, now).await;
         if outcome == UpsertOutcome::TableFull && self.evict_candidate(client).await.is_some() {
-            // Pool pressure: the first upsert found no slot. Reclaim the
-            // longest-idle UDP grant of ANOTHER client (idle past
-            // LEASE_GRACE_S) and retry once. Never evicts this client's
-            // own grants, and never a slot with recent activity.
+            // Pool pressure: reclaim the longest-idle UDP grant of another client and retry the upsert once.
             outcome = self.upsert_once(proto, int_port, client, lifetime, now).await;
         }
         let bind_port;
@@ -664,9 +558,7 @@ impl UpnpFacade {
         };
 
         if granted_new {
-            // Install the datapath: pin the client's flow to the slot tuple,
-            // accept inbound on eth1, spawn the slot task(s). Roll back the
-            // table entry on any failure (never leave a phantom lease).
+            // Install the datapath (pin, eth1 accept, slot tasks) and roll the table entry back on any failure.
             if let Err(e) = nft::grant_datapath(client, int_port, bind_port, proto == Proto::Tcp) {
             let _ = nft::revoke_datapath(client, int_port, bind_port, proto == Proto::Tcp);
         self.publisher.remove_slot(bind_port);
@@ -682,8 +574,7 @@ impl UpnpFacade {
             match handles {
                 Ok(h) => {
                     self.tasks.lock().await.insert(bind_port, h);
-                    // R5: name what the rule steered around, so the decision
-                    // is auditable without a packet capture.
+                    // name what the rule steered around, so the decision is auditable without a packet capture
                     let steered = {
                         let t = self.table.lock().await;
                         t.avoid_steering(bind_port)
@@ -699,9 +590,7 @@ impl UpnpFacade {
                     }
                 }
                 Err(e) => {
-                    // bind failed: roll back nft + table. No pin to remove:
-                    // the facade's grant installs none (the arm and the TCP
-                    // connection pin their own flows and clean them up themselves).
+                    // bind failed: roll back nft and the table; the facade's grant installs no pin to remove
                     let _ = nft::del_input_accept(bind_port, proto == Proto::Tcp);
                     let mut t = self.table.lock().await;
                     t.delete_by_bind_port(bind_port);
@@ -711,12 +600,7 @@ impl UpnpFacade {
             }
         }
 
-        // Record / refresh the control-plane entry (one entry per internal
-        // key — client, int, proto; the requested port survives the re-Add).
-        // A re-Add that moved the mapping to a new slot surrenders the
-        // same client's previous entry at that port, so delete/enumerate
-        // always resolve to the slot the control point actually owns.
-        // Another client's entry at the same port is untouched.
+        // Record the control-plane entry (one per internal key) and surrender the client's previous one.
         let stray = {
             let mut es = self.entries.lock().await;
             apply_entry(
@@ -737,28 +621,22 @@ impl UpnpFacade {
                 }
             }
         }
-        // A grant, and any stray it left behind, is a change to what a
-        // subscriber can see: say so before the index is persisted.
+        // A grant and any stray it left behind are visible changes: signal before the index is persisted.
         self.signal_change().await;
         self.persist().await;
         Ok(outcome)
     }
 
-    // ---- PCP and NAT-PMP admission (call/0025, plan/0009 #pcp) ----
+    // ---- PCP and NAT-PMP admission (call/0025) ----
 
-    /// The PCP epoch: seconds since this facade's state was created. A reboot
-    /// resets it near zero, which is what tells a PCP client its mappings are
-    /// gone (RFC 6887 section 8.5).
+    /// The PCP epoch: seconds since this facade's state began, so a reboot tells a client its mappings are gone.
     fn pcp_epoch(&self) -> u32 {
         Epoch::now().saturating_sub(self.started_unix).min(u32::MAX as u64) as u32
     }
 
-    /// The tuple a slot's discovery learned, from the per-slot file the
-    /// publisher writes. `None` means discovery has not completed, which is
-    /// the drop rule: the client's own retransmission brings it back.
+    /// The tuple a slot learned, from the per-slot file the publisher writes; None means discovery is unfinished.
     fn external_tuple(&self, bind_port: u16) -> Option<(Ipv4Addr, u16)> {
-        // memory first: a state directory that cannot be written must not
-        // turn every PCP MAP into a drop
+        // memory before the file, so an unwritable state directory cannot turn every PCP MAP into a drop
         self.publisher.slot_tuple(bind_port)
     }
 
@@ -770,9 +648,7 @@ impl UpnpFacade {
             .map(|e| e.bind_port)
     }
 
-    /// The answer for a mapping whose tuple is not known yet, with the wait
-    /// recorded against the slot so a request that never discovers stops
-    /// being answered with silence.
+    /// The answer for a mapping whose tuple is not known yet, recording the wait so silence does not last forever.
     fn discovery_answer(
         &self,
         bind_port: u16,
@@ -791,10 +667,7 @@ impl UpnpFacade {
         }
     }
 
-    /// One MAP admission, shared by PCP and NAT-PMP: the same slot engine and
-    /// the same per-client key as the other three paths, so a mapping made
-    /// here is indistinguishable in the datapath from an `AddPortMapping`
-    /// grant. `cap` is the dialect's longest grantable lifetime.
+    /// One MAP admission shared by PCP and NAT-PMP, on the same slot engine and per-client key as the other paths.
     #[allow(clippy::too_many_arguments)] // one flat admission over the request's fields
     async fn admit_map(
         &self,
@@ -812,10 +685,7 @@ impl UpnpFacade {
         let Some(proto) = proto_of(proto_u8) else {
             return pcp_error(crate::pcp::rc::UNSUPP_PROTOCOL, sug_ext, sug_ip);
         };
-        // The datapath this daemon installs is endpoint-independent by
-        // design, so a filter it cannot install is refused with the code the
-        // RFC names for exactly that case, rather than answered with a claim
-        // of filtering that does not happen.
+        // The datapath is endpoint-independent, so a filter it cannot install is refused, not claimed.
         if !filters.is_empty() {
             self.publisher.log_transition(
                 "pcp-filter",
@@ -889,9 +759,7 @@ impl UpnpFacade {
         }
     }
 
-    /// A PCP PEER: the filtering here is endpoint-independent, so a peer
-    /// request has nothing to install. It is answered with the mapping's own
-    /// tuple when the operator has enabled the opcode, and refused otherwise.
+    /// A PCP PEER: filtering is endpoint-independent, so nothing is installed and the mapping's own tuple answers.
     async fn admit_peer(
         &self,
         owner: Ipv4Addr,
@@ -931,9 +799,7 @@ impl UpnpFacade {
             Err(pcp::Refusal::Code { code, .. }) => Some(pcp::build_error(pkt, code, epoch)),
             Ok(pcp::Req::Announce) => Some(pcp::build_announce_response(epoch)),
             Ok(pcp::Req::Map(m)) => {
-                // THIRD_PARTY is gated on the lift the containment already
-                // defines: a caller that authenticated over DeviceProtection
-                // may map for another host, and one that did not may not.
+                // THIRD_PARTY is gated on the lift: only an authenticated caller may map for another host
                 let lifted = self.dp_holds_lift(client, Epoch::now());
                 let (target, view) = match (m.third_party, lifted) {
                     (Some(other), true) => (other, None),
@@ -957,10 +823,7 @@ impl UpnpFacade {
                     ),
                 };
                 if m.prefer_failure {
-                    // On this uplink the AFTR owns the external port, so a
-                    // suggested external port cannot be promised, and the
-                    // option says: do not substitute. RFC 6887 section 13.2
-                    // names this result for exactly this request.
+                    // The AFTR owns the external port, so PREFER_FAILURE refuses rather than substituting
                     return Some(pcp::build_map_response(
                         &m,
                         epoch,
@@ -1069,8 +932,7 @@ impl UpnpFacade {
                     )
                     .await;
                 match answer {
-                    // NAT-PMP has no answer for a mapping still being set up:
-                    // the client asks again, and this request is dropped
+                    // NAT-PMP has no answer for a mapping still being set up: the client asks again
                     pcp::MapAnswer::Drop => None,
                     pcp::MapAnswer::Answer {
                         code,
@@ -1086,10 +948,7 @@ impl UpnpFacade {
         }
     }
 
-    /// The PCP and NAT-PMP service (call/0025's fourth admission path): one
-    /// socket on the LAN address carrying both protocols on the shared port.
-    /// The caller owns the bind, so the service can be exercised without the
-    /// production port.
+    /// The PCP and NAT-PMP service: one socket on the LAN address carrying both protocols on the shared port.
     pub async fn pcp_serve(self: Arc<Self>, sock: UdpSocket, peer_enabled: bool) {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -1102,8 +961,7 @@ impl UpnpFacade {
             };
             let SocketAddr::V4(v4) = from else { continue };
             let client = *v4.ip();
-            // LAN only, by the bind and by this check: a request from another
-            // network is not a control point of ours (RFC 6887 section 8.2).
+            // LAN only, by the bind and by this check: another network's request is not a control point of ours
             if !in_lan(client, self.cfg.lan_ip) {
                 continue;
             }
@@ -1119,8 +977,7 @@ impl UpnpFacade {
         }
     }
 
-    /// One upsert attempt. A retry after pressure eviction is the caller's
-    /// responsibility (at most one eviction per Add).
+    /// One upsert attempt; a retry after pressure eviction is the caller's responsibility.
     async fn upsert_once(
         &self,
         proto: Proto,
@@ -1133,10 +990,7 @@ impl UpnpFacade {
         t.upsert_pcp(proto, int_port, client, lifetime, now, client, int_port)
     }
 
-    /// Under pool pressure, reclaim the longest-idle UDP grant of a
-    /// DIFFERENT client (idle past LEASE_GRACE_S) and tear it down so the
-    /// retry can allocate. Never evicts the requesting client's own
-    /// mappings. Returns the evicted slot's identity.
+    /// Under pool pressure reclaim the longest-idle UDP grant of a different client for the retry.
     async fn evict_candidate(&self, requester: Ipv4Addr) -> Option<(u16, Ipv4Addr, u16, Proto)> {
         let now = Epoch::now();
         let cand = {
@@ -1174,9 +1028,7 @@ impl UpnpFacade {
         let target = SocketAddrV4::new(client, int_port);
         let publisher = self.publisher.clone();
         let interval = self.cfg.interval;
-        // The keepalive is a sibling task so revocation can abort both
-        // (see run_slot): the recv loop alone would release its Arc, but
-        // the keepalive's clone would keep the slot socket bound.
+        // The keepalive is a sibling task so revocation can abort both; its clone would keep the socket bound.
         let ka_sock = sock.clone();
         let ka_state = state.clone();
         let table = self.table.clone();
@@ -1215,12 +1067,7 @@ impl UpnpFacade {
     ) -> Result<String, UpnpErr> {
         let (bind_port, client, int_port) = {
             let es = self.entries.lock().await;
-            // DeletePortMapping's own key carries no client, and the
-            // requested port is a label several clients may hold, so the
-            // lookup is the caller's own entry at that port: "mine", or
-            // 714. Another client's mapping at the same port is not
-            // reachable here; the bulk path for it is the range delete
-            // with NewManage (2.5.19).
+            // DeletePortMapping's key carries no client, so the lookup is the caller's own entry, or 714.
             let Some(e) = es
                 .iter()
                 .find(|e| e.req_ext == req_ext && e.proto == proto && e.owner == caller)
@@ -1246,11 +1093,7 @@ impl UpnpFacade {
             }
         }
         {
-            // Only the caller's own entry goes. This retained on
-            // (req_ext, proto) alone, which was the one-mapping rule: deleting
-            // one entry drained every client's entry at that port (the
-            // deployed bench found it, the router's delete taking the
-            // workstation's mapping with it).
+            // Only the caller's own entry goes; the port is a per-client label, so another client's stays.
             let mut es = self.entries.lock().await;
             es.retain(|e| !(e.req_ext == req_ext && e.proto == proto && e.owner == caller));
         }
@@ -1267,16 +1110,14 @@ impl UpnpFacade {
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
-        // as for the delete: "my mapping at that port", or 714, because the
-        // port is a label another client may hold just as legitimately
+        // as for the delete: the caller's own mapping at that port, or 714
         let Some(e) = es
             .iter()
             .find(|e| e.req_ext == req_ext && e.proto == proto && e.owner == caller)
         else {
             return Err(UpnpErr::NoSuchEntry);
         };
-        // 2.5.14.2: a contained caller may retrieve only its own entries,
-        // and an entry it may not see is not "not found" but forbidden
+        // a contained caller may retrieve only its own entries, and one it may not see is forbidden, not missing
         if let Some(c) = view {
             if !entry_within(c, e) {
                 return Err(UpnpErr::NotAuthorized);
@@ -1285,22 +1126,14 @@ impl UpnpFacade {
         Ok(entry_xml(e, false))
     }
 
-    /// GetGenericPortMappingEntry. A contained caller enumerates its own
-    /// visible subset, so the index space is what it may see: walking past
-    /// the end answers 714, which is the terminator a control point's
-    /// enumeration loop expects (2.5.14.2).
+    /// GetGenericPortMappingEntry: a contained caller enumerates its visible subset; past the end is 714.
     async fn get_generic(&self, index: u32, view: Option<Contain>) -> Result<String, UpnpErr> {
         let es = self.entries.lock().await;
         let visible: Vec<&FacadeEntry> = es
             .iter()
             .filter(|e| view.is_none_or(|c| entry_within(c, e)))
             .collect();
-        // The index addresses this list directly. It used to index a list of
-        // (req_ext, proto) keys and then look the entry up by those two
-        // fields, which is no longer unique now that several clients may hold
-        // one requested port: both indexes rendered the first entry, so a
-        // two-entry table enumerated as two copies of the earlier entry.
-        // The bench for the client matrix found it.
+        // The index addresses the visible list directly: a (req_ext, proto) key is not unique across clients.
         let e = visible
             .get(index as usize)
             .copied()
@@ -1308,19 +1141,15 @@ impl UpnpFacade {
         Ok(entry_xml(e, true))
     }
 
-    // ---- plan/0008 #v2-service-set: DP boundary + WIP2-only actions ----
+    // ---- the DeviceProtection boundary and the WIP2-only actions ----
 
-    /// The DeviceProtection authorization decision for a control point
-    /// (section 26.7: the boundary sits in front of the engine).
+    /// The DeviceProtection authorization decision for a control point, in front of the engine.
     fn dp_enforce(&self, key: Ipv4Addr, required: &dp::DpAuthz, now: u64) -> Result<(), UpnpErr> {
         let state = crate::publish::lock_or_recover(&self.dp);
         state.enforce(key, required, now).map_err(map_dp_err)
     }
 
-    /// Whether the caller holds the containment lift: a live session whose
-    /// roles satisfy Basic, which Admin also satisfies (the containment for
-    /// callers without the lift). The policy function is the same one the boundary uses, so
-    /// the lift cannot drift from the gate.
+    /// Whether the caller holds the containment lift: a live session whose roles satisfy Basic (or Admin).
     fn dp_holds_lift(&self, key: Ipv4Addr, now: u64) -> bool {
         let state = crate::publish::lock_or_recover(&self.dp);
         let roles = state.session_roles(key, now);
@@ -1333,18 +1162,7 @@ impl UpnpFacade {
         state.touch(key, now);
     }
 
-    /// allocate_preferred (plan/0008's version-specific SOAP semantics): WANIPConnection:2's
-    /// AddAnyPortMapping, where the requested port is a preference and the
-    /// answer is the port actually reserved. The engine underneath is the
-    /// same one allocate_exact drives, so a preferred request resolves to
-    /// the same mapping objects; only the port resolution differs. A
-    /// wildcard (0) asks for any free port, and a request for a port
-    /// another client holds is moved to a free one rather than evicting
-    /// that client, which is what 2.5.17 requires and what a control point
-    /// reads NewReservedPort for. The spec's other reading of 2.5.17.3, a
-    /// wildcard answered as 0 meaning "all unmapped external ports", is
-    /// not a mapping this NAT can install: the AFTR is the mapper and it
-    /// maps one tuple at a time.
+    /// AddAnyPortMapping: the requested port is a preference, the answer the port reserved.
     async fn allocate_preferred(
         &self,
         req: MappingReq,
@@ -1359,9 +1177,7 @@ impl UpnpFacade {
             lifetime,
             desc,
         } = req;
-        // the containment is judged on the request, before the port is
-        // resolved: a preference below the floor is a request the contained
-        // caller may not make, not one to be silently substituted
+        // the containment is judged on the request, before the port is resolved
         if let Some(c) = view {
             if !request_within(c, client, ext, int_port) {
                 return Err(UpnpErr::NotAuthorized);
@@ -1387,12 +1203,7 @@ impl UpnpFacade {
         Ok(format!("<NewReservedPort>{}</NewReservedPort>", req_ext))
     }
 
-    /// DeletePortMappingRange: delete every entry whose requested port
-    /// lies in [start, end] for the protocol. Bounded by the entries
-    /// table, never by the port span. An empty range is the 730
-    /// PortMappingNotFound the spec requires (2.5.19.2), and the delete
-    /// is atomic in the sense that matters here: the target list is
-    /// collected before any of it is removed.
+    /// DeletePortMappingRange: delete the caller's entries in [start, end]; an empty range is 730.
     async fn delete_mapping_range(
         &self,
         start: u16,
@@ -1400,8 +1211,7 @@ impl UpnpFacade {
         proto: Proto,
         view: Option<Contain>,
     ) -> Result<String, UpnpErr> {
-        // 2.5.19.2: an entry the caller may not touch is skipped and the
-        // rest of the range still goes. An empty selection is 730.
+        // an entry the caller may not touch is skipped and the rest of the range still goes; empty is 730
         let targets: Vec<(u16, Ipv4Addr)> = {
             let es = self.entries.lock().await;
             es.iter()
@@ -1419,15 +1229,7 @@ impl UpnpFacade {
         Ok(String::new())
     }
 
-    /// GetListOfPortMappings: the entries whose requested port lies in
-    /// [start, end] (protocol-filtered, capped at max when nonzero), as
-    /// the NewPortListing XML (the A_ARG_TYPE_PortListing OUT value).
-    /// The fragment shape is the sample of the spec's section 2.3.25.2: a
-    /// PortMappingList of PortMappingEntry elements in the
-    /// urn:schemas-upnp-org:gw:WANIPConnection namespace. NewLeaseTime is
-    /// the remaining lease, as section 2.4.6 requires of a query. An
-    /// empty selection is 730 PortMappingNotFound, as for the delete
-    /// (2.5.21.3).
+    /// GetListOfPortMappings: the entries in [start, end] as the NewPortListing fragment, leases remaining.
     async fn list_port_mappings(
         &self,
         start: u16,
@@ -1453,8 +1255,7 @@ impl UpnpFacade {
             if max != 0 && count >= max {
                 break;
             }
-            // 2.5.21.3: a contained caller's listing holds only its own
-            // entries at or above the floor
+            // a contained caller's listing holds only its own entries at or above the floor
             if let Some(c) = view {
                 if !entry_within(c, e) {
                     continue;
@@ -1528,11 +1329,7 @@ impl UpnpFacade {
             sent: None,
         });
         drop(g);
-        // initial NOTIFY carries eventKey 0 per GENA (E5) and every declared
-        // evented variable; a delivered initial notify advances the
-        // subscription's key so the first change event carries 1 — never a
-        // repeat of 0 (notify_view performs the same advance after every
-        // delivery).
+        // The initial NOTIFY carries eventKey 0 and every declared variable, then advances the key to 1.
         let ext = self.external_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
         let view = self.view_for(caller, v2, ext).await;
         self.notify_view(sid, view, true).await;
@@ -1570,9 +1367,7 @@ impl UpnpFacade {
         Ok(String::new())
     }
 
-    /// The evented view one subscriber may see: the daemon's external
-    /// address, the connection status, and its own count of mappings,
-    /// computed with the containment its reads apply (call/0025).
+    /// The evented view one subscriber may see: the address, the status and its own count under containment.
     async fn view_for(&self, caller: Ipv4Addr, v2: bool, ext: Ipv4Addr) -> EventView {
         let scope = if self.dp_holds_lift(caller, Epoch::now()) {
             None
@@ -1590,26 +1385,20 @@ impl UpnpFacade {
         EventView::new(ext, entries, update_id)
     }
 
-    /// SystemUpdateID moves when a mapping appears or goes. A re-key of the
-    /// datapath tuple deliberately does not move it: the reported port is the
-    /// requested label (call/0022), so no event may invent a port change
-    /// (call/0025). What a re-key can show is the address, and that is reported through
-    /// ExternalIPAddress on the tuple path.
+    /// SystemUpdateID moves when a mapping appears or goes; a re-key does not, so no event invents a port change.
     async fn bump_update_id(&self) {
         let mut g = self.gena.lock().await;
         g.update_id = g.update_id.wrapping_add(1);
     }
 
-    /// A mapping appeared or went: move the id and tell the subscribers now,
-    /// rather than waiting for the next tuple publication.
+    /// A mapping appeared or went: move the id and tell the subscribers now rather than at the next publication.
     async fn signal_change(&self) {
         self.bump_update_id().await;
         let ext = self.external_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
         self.notify_all(ext).await;
     }
 
-    /// Offer every subscriber the current view; each one is sent exactly the
-    /// declared variables that moved for it.
+    /// Offer every subscriber the current view; each is sent exactly the declared variables that moved for it.
     async fn notify_all(&self, ip: Ipv4Addr) {
         let subs: Vec<(Sid, Ipv4Addr, bool)> = {
             let g = self.gena.lock().await;
@@ -1621,9 +1410,7 @@ impl UpnpFacade {
         }
     }
 
-    /// Deliver one NOTIFY carrying what moved for this subscriber, and record
-    /// the view it was told. `force` is the subscription's initial event,
-    /// which carries every declared variable whether or not it moved.
+    /// Deliver one NOTIFY with what moved and record the view; `force` carries every variable.
     async fn notify_view(&self, sid: Sid, view: EventView, force: bool) {
         let sub = {
             let g = self.gena.lock().await;
@@ -1664,8 +1451,7 @@ impl UpnpFacade {
             deliver_notify(s.cb_ip, s.cb_port, req.as_bytes()),
         )
         .await;
-        // delivered: the key advances and the view is remembered, so the next
-        // event carries only what moved since this one
+        // delivered: the key advances and the view is remembered, so the next event carries only what moved since
         let mut g = self.gena.lock().await;
         if let Some(s) = g.subs.iter_mut().find(|s| s.sid == sid) {
             s.sent = Some(view);
@@ -1694,16 +1480,9 @@ impl UpnpFacade {
 
     // ---- local GC (facade-owned teardown) ----
 
-    // ---- R4: the late collision (call/0027, call/0028) ----
+    // ---- the late collision (call/0027, call/0028) ----
 
-    /// A lease whose bind port a device's flow has taken yields it. The probe
-    /// runs first, so the slot moves to a port nothing live holds; the label
-    /// the client asked for does not change (call/0022); and the substitution
-    /// is reported (R5).
-    /// Release the mappings whose client has left the LAN. The statics are
-    /// the operator's configuration and are never touched here; a client's
-    /// own request is a promise to a device, and a device that is gone has
-    /// nothing to be promised.
+    /// Release the mappings whose client has left the LAN; the statics are the operator's configuration and stay.
     async fn reap_absent_clients(&self) {
         let entries: Vec<(u16, Ipv4Addr, Proto, Ipv4Addr, u16)> = {
             let es = self.entries.lock().await;
@@ -1711,8 +1490,7 @@ impl UpnpFacade {
                 .map(|e| (e.bind_port, e.owner, e.proto, e.client, e.req_ext))
                 .collect()
         };
-        // Decide under the lock and release outside it: a guard must not be
-        // held across an await.
+        // Decide under the lock and release outside it: a guard must not be held across an await.
         let mut to_release: Vec<(Ipv4Addr, Proto, Ipv4Addr, u16)> = Vec::new();
         {
             let mut misses = self
@@ -1765,13 +1543,7 @@ impl UpnpFacade {
         }
     }
 
-    /// Move one lease off a port a device's flow holds. The new datapath goes
-    /// up first and the old one comes down only once it is up, so a move that
-    /// cannot be completed leaves the slot working where it was. Nothing is
-    /// signalled: the count does not change and the reported port is the
-    /// client's label, so an event would invent a change it cannot see
-    /// (call/0025). A PCP client learns the new assigned tuple on its next
-    /// renewal, which is what the protocol is for.
+    /// Move one lease off a port a device's flow holds: the new datapath is up before the old one comes down.
     async fn yield_port(&self, old: u16) {
         let entry = {
             let es = self.entries.lock().await;
@@ -1841,12 +1613,9 @@ impl UpnpFacade {
 
     async fn gc_loop(&self) {
         let grace = self.cfg.grace_secs;
-        // R4 before anything is reaped: a slot sharing a tuple with a
-        // device's flow moves, so the reap decisions below act on ports the
-        // table actually holds.
+        // A slot sharing a tuple with a device's flow moves first, so the reaps act on ports the table holds.
         self.yield_collided_slots().await;
-        // expiry-GC for finite leases (the appearing-infinite grants never
-        // trip this; their lifecycle belongs to the lease policy below)
+        // expiry-GC for finite leases; the appearing-infinite grants belong to the lease policy below
         let now = Epoch::now();
         let pre: Vec<Slot> = {
             let t = self.table.lock().await;
@@ -1860,15 +1629,9 @@ impl UpnpFacade {
             self.tear_down_ports(&pre, &freed).await;
             emiteln!("upnp: gc freed expired slots {:?}", freed);
         }
-        // A client-requested mapping ends when its client is no longer on
-        // the LAN (presence.rs) and never for the client being quiet: a
-        // lobby and a paused game are quiet, and the mapping is what must
-        // survive them. This supersedes the silence backstop that used to
-        // reap here, which reaped exactly the mappings a console needs when
-        // it sits still.
+        // A client-requested mapping ends when its client leaves the LAN, never because the client is quiet.
         self.reap_absent_clients().await;
-        // lease-policy backstop, kept for the pool-state case only: the
-        // pressure path handles the shorter grace under TableFull.
+        // lease-policy backstop, kept for the pool-state case: the pressure path handles the shorter grace
         let now = Epoch::now();
         let pre: Vec<Slot> = {
             let t = self.table.lock().await;
@@ -1884,8 +1647,7 @@ impl UpnpFacade {
         }
     }
 
-    /// Shared teardown for freed ports: revoke the datapath, abort the
-    /// slot tasks, drop the control-plane entry, persist.
+    /// Shared teardown for freed ports: revoke the datapath, abort the slot tasks, drop the entry, persist.
     async fn tear_down_ports(&self, pre: &[Slot], freed: &[u16]) {
         for port in freed {
             let info = pre.iter().find(|s| s.bind_port == *port).copied();
@@ -1906,9 +1668,7 @@ impl UpnpFacade {
         self.persist().await;
     }
 
-    /// Client-presence stamp from the control plane: any SOAP action from
-    /// this IP proves the client is alive; refresh its grants' last-seen
-    /// (the lease policy's second producer, beside the datapath stamp).
+    /// Any SOAP action from this IP refreshes its grants' last-seen (the lease policy's second producer).
     async fn stamp_client(&self, client: Ipv4Addr) {
         let now = Epoch::now();
         let ports: Vec<u16> = {
@@ -1954,25 +1714,20 @@ impl UpnpFacade {
 
 // ---- HTTP service ----
 
-/// Accept loop: bound the connection count (E8), one task per client.
+/// Accept loop: bound the connection count, one task per client.
 async fn http_loop(facade: Arc<UpnpFacade>) -> io::Result<()> {
     let listener = TcpListener::bind((facade.cfg.lan_ip, facade.cfg.upnp_port)).await?;
     http_serve(listener, facade).await
 }
 
-/// The accept/dispatch loop over an already-bound listener (split so the
-/// in-process test harness can drive it on an ephemeral port).
+/// The accept/dispatch loop over a bound listener, split so a test can drive it on an ephemeral port.
 async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Result<()> {
     let permits = Arc::new(Semaphore::new(HTTP_CONN_CAP));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
-                // A transient accept error (fd pressure, EMFILE/ENOBUFS)
-                // must not kill the control plane: the SSDP loops keep
-                // advertising, and a dead HTTP service would leave the
-                // facade a ghost IGD. Log and retry, like the sibling
-                // loops' Err(_) => continue.
+                // A transient accept error must not kill the control plane: log and retry, like the sibling loops.
                 emiteln!("upnp: accept: {}", e);
                 continue;
             }
@@ -1988,12 +1743,7 @@ async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Resul
         let f = facade.clone();
         tokio::spawn(async move {
             let _guard = permit;
-            // Bound the whole connection: a stalled handler (a client that
-            // never finishes its head/body, or a wedged write) would
-            // otherwise hold its semaphore permit forever; once enough
-            // stall, the pool exhausts and every later connection is
-            // accepted-and-dropped. 30 s is far beyond any real UPnP
-            // request but caps the damage.
+            // Bound the whole connection: a stalled handler would otherwise hold its semaphore permit forever.
             let _ = tokio::time::timeout(
                 Duration::from_secs(30),
                 handle_conn(f, stream, client_ip),
@@ -2003,16 +1753,13 @@ async fn http_serve(listener: TcpListener, facade: Arc<UpnpFacade>) -> io::Resul
     }
 }
 
-/// One client connection: read the head (capped), read a body when
-/// Content-Length says so, classify, dispatch.
+/// One client connection: read the capped head, a body when Content-Length says so, classify, dispatch.
 async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: Ipv4Addr) {
     let raw = match read_head(&mut stream).await {
         Ok(h) => h,
         Err(_) => return,
     };
-    // The body may already sit in the same read as the head (small SOAP
-    // and GENA requests send head+body in one segment): split it out so
-    // read_body below does not wait on bytes that already arrived.
+    // The body may already sit in the same read as the head, so split it out before reading more.
     let (head, excess) = split_head(&raw).unwrap_or((&raw[..], &raw[..]));
     let mut body: Vec<u8> = excess.to_vec();
     if let Some(cl) = content_length(head) {
@@ -2038,10 +1785,7 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 p if eq_ia(p, b"/WANIPC.xml") => Some(SCPD_WANIP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/WANPPP.xml") => Some(SCPD_WANPPP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/WANCfg.xml") => Some(SCPD_WANCMN.as_bytes().to_vec()),
-                // plan/0008's LOCATION design: the deterministic versioned URLs.
-                // The v1 prefixes are the canonical v1 presentation; the
-                // legacy paths above remain served for backward
-                // compatibility with existing descriptions/control points.
+                // The versioned URLs; the legacy paths above stay served for existing control points.
                 p if eq_ia(p, b"/igd/v1/rootDesc.xml") => Some(root_desc(
                     facade.cfg.lan_ip,
                     facade.cfg.upnp_port,
@@ -2051,9 +1795,7 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
                 p if eq_ia(p, b"/igd/v1/WANIPC.xml") => Some(SCPD_WANIP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/igd/v1/WANPPP.xml") => Some(SCPD_WANPPP.as_bytes().to_vec()),
                 p if eq_ia(p, b"/igd/v1/WANCfg.xml") => Some(SCPD_WANCMN.as_bytes().to_vec()),
-                // The v2 service mounts only with its complete service set
-                // (plan/0008 R5, R6 gate); until then the URLs are not
-                // offered and answer 404.
+                // The v2 service mounts only with its complete service set; until then these URLs answer 404.
                 p if IGD_V2_ENABLED && eq_ia(p, b"/igd/v2/rootDesc.xml") => {
                     Some(root_desc_v2(
                         facade.cfg.lan_ip,
@@ -2081,9 +1823,7 @@ async fn handle_conn(facade: Arc<UpnpFacade>, mut stream: TcpStream, client_ip: 
         }
         ReqClass::Soap { service, action, v2 } => {
             handle_soap(&facade, service, action, v2, client_ip, &body, &mut stream).await;
-            // Client-presence stamp for the lease policy: any SOAP action
-            // from this IP proves the client is alive. Stamp result
-            // regardless of the action's own outcome (the client talked).
+            // Client-presence stamp: any SOAP action from this IP proves the client is alive.
             facade.stamp_client(client_ip).await;
         }
         ReqClass::GenaSubscribe => {
@@ -2150,11 +1890,7 @@ async fn handle_soap(
     body: &[u8],
     stream: &mut TcpStream,
 ) {
-    // plan/0008's WANIPConnection integration: the DeviceProtection authorization boundary.
-    // A v2 WIP2 security-sensitive invocation flows through the session
-    // principal before the canonical mapping engine; there is no engine
-    // bypass for the v2 face. The v1 facade stays a legacy unauthenticated
-    // compatibility rules (section 26.12).
+    // The DeviceProtection authorization boundary: a v2 WIP2 security-sensitive invocation flows through it first.
     let gated: Result<(), UpnpErr> = if service == SoapService::WanIpConnection
         && v2
         && matches!(
@@ -2175,16 +1911,7 @@ async fn handle_soap(
     } else {
         Ok(())
     };
-    // plan/0008's containment for callers without the lift: the containment the spec recommends for
-    // unauthenticated control points (2.5.16.2, 2.5.18.2, 2.5.14.2,
-    // 2.5.21.3). One view serves reads and writes alike, because the
-    // address clause needs no remedy on either side of that line: a caller
-    // without the lift may name, see, enumerate and delete only its own
-    // host, and the port floor binds the v2 face, where the DP session that
-    // lifts it is established. A lift is a principal's roles rather than a
-    // face's, so a control point that authenticates over DeviceProtection
-    // reaches the whole table on either face; a caller that never
-    // authenticates sees only its own mappings.
+    // Containment for callers without the lift: their own host, and the 1024 floor on the v2 face.
     let lift = facade.dp_holds_lift(client_ip, Epoch::now());
     let view = if lift {
         None
@@ -2209,20 +1936,12 @@ async fn handle_soap(
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetConnectionTypeInfo,
             ) => Ok(facade.get_connection_type_info()),
-            // The line is auto-configured (the ISP owns the ds-lite WAN),
-            // so ConnectionType is read-only: 2.5.1's note that it may be,
-            // and the code 2.5.23 names for a SetConnectionType that
-            // cannot set it.
+            // The line is auto-configured (the ISP owns the ds-lite WAN), so ConnectionType is read-only: 731.
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::SetConnectionType,
             ) => Err(UpnpErr::ReadOnly),
-            // RequestConnection: its precondition (2.5.3.4) is a status of
-            // Disconnected, PendingDisconnect or Connected with an
-            // IP_Routed type, and its effect (2.5.3.5) is Connected. When
-            // the facade holds an external tuple both already hold, so the
-            // action succeeds; with no tuple the provider side is not up,
-            // which is the 704 ConnectionSetupFailed of 2.5.3.6.
+            // RequestConnection: succeeds while the external tuple is present, else 704 ConnectionSetupFailed.
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::RequestConnection,
@@ -2233,18 +1952,12 @@ async fn handle_soap(
                     Err(UpnpErr::ConnectionSetupFailed)
                 }
             }
-            // ForceTermination is refused, deliberately. The facade does
-            // not own the WAN lifetime (netifd and the ISP do), and the
-            // action is public on the v1 face, so honouring it would hand
-            // every LAN device a lever that drops the household line for
-            // every client. 501 is the UDA generic failure; the spec's own
-            // table offers no code for a device that may not terminate.
+            // ForceTermination is refused with 501: the facade does not own the WAN lifetime, and v1 is public.
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::ForceTermination,
             ) => Err(UpnpErr::ActionFailed),
-            // GetNATRSIPStatus: the facade performs NAT (1) and this line
-            // runs no RSIP server (0), per the variables of 2.3.11/2.3.12
+            // GetNATRSIPStatus: the facade performs NAT (1) and runs no RSIP server (0).
             (
                 SoapService::WanIpConnection | SoapService::WanPppConnection,
                 SoapAction::GetNatRsipStatus,
@@ -2257,8 +1970,7 @@ async fn handle_soap(
                 SoapAction::AddPortMapping,
             ) => match parse_add_args(body) {
                 Ok((ext, proto, int_port, client, lifetime)) => {
-                    // the URN's version decides the lease reading
-                    // (table 2-6 against the v1 static mapping)
+                    // the URN's version decides the lease reading: 0 means the v2 maximum, or a v1 static mapping
                     let lifetime = if v2 { wip2_lease(lifetime) } else { lifetime };
                     facade
                         .allocate_exact(
@@ -2298,15 +2010,11 @@ async fn handle_soap(
                 Ok(i) => facade.get_generic(i, view).await,
                 Err(e) => Err(e),
             },
-            // WIP2-only actions (plan/0008 #v2-service-set). The engine is
-            // report-requested: the granted bind port IS the external
-            // port, so AddAnyPortMapping answers NewReservedPort with the
-            // granted port and the entries key follows it.
+            // WIP2-only actions; the engine is report-requested, so the granted bind port is the external port
             (SoapService::WanIpConnection, SoapAction::AddAnyPortMapping) => {
                 match parse_add_args_any(body) {
                     Ok((ext, proto, int_port, client, lifetime)) => {
-                        // this arm is v2-only, so the version 2 lease
-                        // reading always applies here
+                        // this arm is v2-only, so the version 2 lease reading always applies here
                         let lifetime = wip2_lease(lifetime);
                         facade
                             .allocate_preferred(
@@ -2345,9 +2053,7 @@ async fn handle_soap(
             (SoapService::WanCommonIfaceCfg, SoapAction::GetCommonLinkProperties) => {
                 Ok(facade.common_link_properties())
             }
-            // DeviceProtection:1 (the authoritative 13 actions,
-            // docs/upnp-dp1/TRANSCRIPTION.md). The admin-gated actions
-            // enforce through dp::required_role inside each handler.
+            // DeviceProtection:1's thirteen actions; the admin-gated ones enforce dp::required_role.
             (SoapService::DeviceProtection, SoapAction::SendSetupMessage) => {
                 dp_send_setup(facade, body)
             }
@@ -2407,12 +2113,9 @@ async fn handle_soap(
     }
 }
 
-// ---- plan/0008 #v2-service-set: the DeviceProtection dispatch ----
+// ---- the DeviceProtection dispatch ----
 
-/// GetUserLoginChallenge (DP 2.6.5): ProtocolType MUST be PKCS5 (the one
-/// Login protocol this device speaks); Name MUST be a known user; the
-/// response carries the user's Salt and a fresh Challenge (Base64). The
-/// challenge replaces the session's previous one (2.6.5.9).
+/// GetUserLoginChallenge: ProtocolType MUST be PKCS5 and Name a known user; answers Salt and a fresh Challenge.
 fn dp_challenge(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
     if !eq_ia(proto, b"PKCS5") {
@@ -2430,8 +2133,7 @@ fn dp_challenge(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result
     ))
 }
 
-/// UserLogin (DP 2.6.6): verify the Authenticator for the session's
-/// pending Challenge (2.6.6.4). UserLogin has no OUT arguments.
+/// UserLogin: verify the Authenticator for the session's pending Challenge; it has no OUT arguments.
 fn dp_login(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
     if !eq_ia(proto, b"PKCS5") {
@@ -2449,15 +2151,14 @@ fn dp_login(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<Str
         .map_err(map_dp_err)
 }
 
-/// UserLogout (DP 2.6.7): drop the session principal. No arguments.
+/// UserLogout: drop the session principal. No arguments.
 fn dp_logout(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr> {
     let mut state = crate::publish::lock_or_recover(&facade.dp);
     state.logout(client_ip, Epoch::now());
     Ok(String::new())
 }
 
-/// GetAssignedRoles (DP 2.6.3): the session's role set, space-separated.
-/// Per 2.6.3.2, an unauthenticated session sees only "Public".
+/// GetAssignedRoles: the session's role set, space-separated; an unauthenticated session sees only "Public".
 fn dp_assigned_roles(facade: &UpnpFacade, client_ip: Ipv4Addr) -> String {
     let state = crate::publish::lock_or_recover(&facade.dp);
     let roles = state.session_roles(client_ip, Epoch::now());
@@ -2468,10 +2169,7 @@ fn dp_assigned_roles(facade: &UpnpFacade, client_ip: Ipv4Addr) -> String {
     }
 }
 
-/// GetRolesForAction (DP 2.6.4): answer the device's role policy for the
-/// named (DeviceUDN, ServiceId, ActionName): RoleList = the roles that
-/// grant access unconditionally, RestrictedRoleList empty (no role is
-/// conditional in this policy). The policy itself is dp::required_role.
+/// GetRolesForAction: RoleList carries the roles granting access, RestrictedRoleList is empty.
 fn dp_roles_for_action(body: &[u8]) -> Result<String, UpnpErr> {
     let service_id = dp_str_tag(body, b"ServiceId")?;
     let action = dp_str_tag(body, b"ActionName")?;
@@ -2492,27 +2190,19 @@ fn dp_roles_for_action(body: &[u8]) -> Result<String, UpnpErr> {
     ))
 }
 
-/// SendSetupMessage (DP 2.6.1): the generic transport for introduction
-/// protocols. This device speaks exactly one Introduction protocol
-/// (WPS, per the mandated SupportedProtocols) but runs no WPS registrar
-/// (it is an IGD on a wired line, not an enrolment point), so a WPS
-/// in-message cannot be processed: 600 for an unsupported ProtocolType
-/// (2.6.1.9), 704 Processing Error for a WPS message (2.6.1.9: "an error
-/// was encountered in processing InMessage").
+/// SendSetupMessage: this device runs no WPS registrar, so a WPS message answers 704 Processing Error.
 fn dp_send_setup(facade: &UpnpFacade, body: &[u8]) -> Result<String, UpnpErr> {
     let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
     if !eq_ia(proto, b"WPS") {
         return Err(UpnpErr::InvalidValue);
     }
-    // No setup operation is pending or possible: SetupReady stays
-    // unchanged (2.4.2 semantics; the evented variable never moves).
+    // No setup operation is pending or possible: SetupReady stays unchanged.
     let _state = crate::publish::lock_or_recover(&facade.dp);
     let _ = _state.setup_ready();
     Err(map_dp_err(dp::DpErr::Processing))
 }
 
-/// GetACLData (DP 2.6.8), Admin-gated: the ACL document as the OUT
-/// value (an XML document embedded per 2.6.8.2).
+/// GetACLData, Admin-gated: the ACL document as the OUT value, an embedded XML document.
 fn dp_get_acl(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpErr> {
     let now = Epoch::now();
     let required = dp::required_role(dp::DpTarget::DeviceProtection, "GetACLData");
@@ -2521,9 +2211,7 @@ fn dp_get_acl(facade: &UpnpFacade, client_ip: Ipv4Addr) -> Result<String, UpnpEr
     Ok(dp::acl_xml(state.acl()))
 }
 
-/// AddIdentityList (DP 2.6.9), Admin-gated: union-add the incoming User
-/// identities; IdentityListResult carries the identities actually added
-/// (2.6.9.3).
+/// AddIdentityList, Admin-gated: union-add the incoming User identities and return the ones actually added.
 fn dp_add_identities(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let now = Epoch::now();
     let required = dp::required_role(dp::DpTarget::DeviceProtection, "AddIdentityList");
@@ -2545,8 +2233,7 @@ fn dp_add_identities(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> R
     Ok(dp::identity_list_xml(&added))
 }
 
-/// RemoveIdentity (DP 2.6.10), Admin-gated: remove by Name
-/// (case-sensitive); an unknown Identity is 600 (2.6.10.7).
+/// RemoveIdentity, Admin-gated: remove by Name case-sensitively; an unknown Identity is 600.
 fn dp_remove_identity(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let now = Epoch::now();
     let required = dp::required_role(dp::DpTarget::DeviceProtection, "RemoveIdentity");
@@ -2563,8 +2250,7 @@ fn dp_remove_identity(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> 
     Ok(String::new())
 }
 
-/// SetUserLoginPassword (DP 2.6.11): Admin, or the session logged in AS
-/// the Name (2.6.11.6). Sets/creates the user's Stored + Salt.
+/// SetUserLoginPassword: Admin, or the session logged in as the Name; sets the user's Stored and Salt.
 fn dp_set_password(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Result<String, UpnpErr> {
     let proto = xml_tag(body, b"ProtocolType").ok_or(UpnpErr::InvalidValue)?;
     if !eq_ia(proto, b"PKCS5") {
@@ -2587,9 +2273,7 @@ fn dp_set_password(facade: &UpnpFacade, client_ip: Ipv4Addr, body: &[u8]) -> Res
     Ok(String::new())
 }
 
-/// AddRolesForIdentity / RemoveRolesForIdentity (DP 2.6.12 / 2.6.13),
-/// Admin-gated. Unknown role names are rejected with 600 (2.6.12.3); an
-/// unknown identity is 600.
+/// AddRolesForIdentity and RemoveRolesForIdentity, Admin-gated; an unknown role or identity is 600.
 fn dp_add_roles(
     facade: &UpnpFacade,
     client_ip: Ipv4Addr,
@@ -2642,8 +2326,7 @@ fn dp_b64_tag16(body: &[u8], tag: &[u8]) -> Result<[u8; 16], UpnpErr> {
     Ok(out)
 }
 
-/// A space-separated RoleList argument; every role must be one the
-/// device understands (2.6.12.3: unknown roles -> 600).
+/// A space-separated RoleList; every role must be one the device understands.
 fn dp_role_list(body: &[u8]) -> Result<Vec<String>, UpnpErr> {
     let s = dp_str_tag(body, b"RoleList")?;
     let roles: Vec<String> = s.split_whitespace().map(str::to_string).collect();
@@ -2653,9 +2336,7 @@ fn dp_role_list(body: &[u8]) -> Result<Vec<String>, UpnpErr> {
     Ok(roles)
 }
 
-/// Every `<Name>` inside the request's `<Identity>` elements (the minimal
-/// scanner; the upnp.rs scope note applies — a real XML parser is the
-/// escalation a CP actually needs it).
+/// Every `<Name>` inside the request's `<Identity>` elements, by the minimal scanner upnp.rs describes.
 fn dp_identity_names(body: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut search_from = 0usize;
@@ -2690,12 +2371,9 @@ fn substring(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-// ---- WIP2-only action argument parsing (plan/0008 #v2-service-set) ----
+// ---- WIP2-only action argument parsing ----
 
-/// DeletePortMappingRange: NewStartPort/NewEndPort/NewProtocol/NewManage.
-/// The range endpoints are honored as an entry filter, so no scan runs
-/// over the port span. A start above the end is the 733
-/// InconsistentParameters of 2.5.19.6, not a malformed request.
+/// DeletePortMappingRange's arguments; the endpoints filter entries, so no scan runs over the port span.
 fn parse_range_args(body: &[u8]) -> Result<(u16, u16, Proto), UpnpErr> {
     let start = tag_u16(body, b"NewStartPort").ok_or(UpnpErr::InvalidArgs)?;
     let end = tag_u16(body, b"NewEndPort").ok_or(UpnpErr::InvalidArgs)?;
@@ -2710,10 +2388,7 @@ fn parse_range_args(body: &[u8]) -> Result<(u16, u16, Proto), UpnpErr> {
     Ok((start, end, proto))
 }
 
-/// GetListOfPortMappings: NewStartPort/NewEndPort/NewProtocol
-/// (TCP|UDP|ALL)/NewNumberOfPorts, with NewManage accepted and ignored
-/// (managed entries are not a concept this facade exposes). A start above
-/// the end is 733 InconsistentParameters, as for the delete (2.5.21.7).
+/// GetListOfPortMappings' arguments: NewProtocol is TCP, UDP or ALL, and NewManage is accepted and ignored.
 fn parse_list_args(body: &[u8]) -> Result<(u16, u16, Option<Proto>, u16), UpnpErr> {
     let start = tag_u16(body, b"NewStartPort").ok_or(UpnpErr::InvalidArgs)?;
     let end = tag_u16(body, b"NewEndPort").ok_or(UpnpErr::InvalidArgs)?;
@@ -2741,23 +2416,18 @@ async fn deliver_notify(cb_ip: Ipv4Addr, cb_port: u16, req: &[u8]) {
     let _ = stream.read(&mut buf).await;
 }
 
-// ---- argument parsing (E3: fallible, never panics) ----
+// ---- argument parsing: fallible, never panics ----
 
 fn parse_add_args(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
     parse_add_args_impl(body, false)
 }
 
-/// AddAnyPortMapping: the AddPortMapping argument table plus NewReservedPort
-/// (table 2-41). Unlike AddPortMapping, a wildcard NewExternalPort is not a
-/// malformed request here: it is the action's any-free-port form, which a
-/// device may support (2.5.17.3), and this one does. The facade decides what
-/// port the wildcard reserves.
+/// AddAnyPortMapping's arguments: unlike AddPortMapping, a wildcard NewExternalPort is the any-free-port form.
 fn parse_add_args_any(body: &[u8]) -> Result<(u16, Proto, u16, Ipv4Addr, u32), UpnpErr> {
     parse_add_args_impl(body, true)
 }
 
-/// The shared parse of the AddPortMapping argument table (table 2-11). The
-/// wildcard external port is the only difference between the two callers.
+/// The shared AddPortMapping parse; the wildcard external port is the only difference between the two callers.
 fn parse_add_args_impl(
     body: &[u8],
     wildcard_ext: bool,
@@ -2776,8 +2446,7 @@ fn parse_add_args_impl(
     if (ext == 0 && !wildcard_ext) || int_port == 0 || client == Ipv4Addr::UNSPECIFIED {
         return Err(UpnpErr::InvalidArgs);
     }
-    // RemoteHost accepted and ignored (EIF); NewEnabled and the description
-    // are descriptive; a missing lease means the maximum.
+    // RemoteHost is accepted and ignored; a missing lease parses as 0, which the grant reads as the maximum
     let lifetime = tag_u32(body, b"NewLeaseDuration").unwrap_or(0);
     Ok((ext, proto, int_port, client, lifetime))
 }
@@ -2832,9 +2501,7 @@ fn parse_callback(cb: &[u8]) -> Option<(Ipv4Addr, u16, &[u8])> {
     if v.len() >= 2 && v.first() == Some(&b'<') && v.last() == Some(&b'>') {
         v = &v[1..v.len() - 1];
     }
-    // One delivery URL only: a residual bracket means additional or
-    // malformed delivery URLs (GENA's multi-URL CALLBACK form) — reject
-    // rather than mangle them into the path and lose every notification.
+    // One delivery URL only: a residual bracket means the multi-URL CALLBACK form, so reject rather than mangle.
     if find_byte(v, b'<').is_some() || find_byte(v, b'>').is_some() {
         return None;
     }
@@ -2861,13 +2528,7 @@ fn in_lan(ip: Ipv4Addr, lan: Ipv4Addr) -> bool {
     a == b
 }
 
-/// The AddAnyPortMapping wildcard's port choice (section 2.5.17): the
-/// lowest requested port at or above 1024 that no entry of this protocol
-/// claims. The 1024 floor is the recommended lower bound for a control
-/// point with limited permission (2.5.16.2), and reserving above it keeps
-/// the well-known range out of the automatic choice. The scan always
-/// terminates: the lease table caps at a configured few hundred slots
-/// while the port space holds 64512 of them.
+/// The AddAnyPortMapping wildcard's port: the lowest free port at or above 1024, and the scan always terminates.
 fn free_requested_port(entries: &[FacadeEntry], proto: Proto) -> u16 {
     let mut p = ANY_PORT_BASE;
     while p < u16::MAX && entries.iter().any(|e| e.proto == proto && e.req_ext == p) {
@@ -2876,9 +2537,7 @@ fn free_requested_port(entries: &[FacadeEntry], proto: Proto) -> u16 {
     p
 }
 
-/// An AddPortMapping or AddAnyPortMapping request (table 2-11): the
-/// argument set the two allocation entry points share, so the pair differs
-/// in port resolution alone.
+/// An AddPortMapping or AddAnyPortMapping request: the arguments the two allocation entry points share.
 #[derive(Clone, Debug)]
 struct MappingReq {
     ext: u16,
@@ -2889,52 +2548,28 @@ struct MappingReq {
     desc: String,
 }
 
-/// The containment a caller without the lift is held to (plan/0008
-/// section 26.22). `caller` is the only address the caller may name;
-/// `high_port` adds the floor the spec recommends beside it (2.5.16.2,
-/// 2.5.18.2, 2.5.14.2, 2.5.21.3). The floor is a field rather than a rule
-/// because it binds only where a control point can authenticate to lift
-/// it, which is the v2 face, while the address clause needs no remedy and
-/// binds both faces.
+/// The containment a caller without the lift is held to: only its own address, and a port floor on the v2 face.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Contain {
     caller: Ipv4Addr,
     high_port: bool,
 }
 
-/// Whether a mapping request is within the containment (2.5.16.2): the
-/// caller's own address, and, where the floor applies, an internal and
-/// external port at or above 1024. A wildcard external port is the
-/// any-free-port form, which resolves above the floor by construction, so
-/// it is admitted; AddPortMapping's parser refuses it anyway.
+/// Whether a mapping request is within the containment: the caller's address, and the floor where it applies.
 fn request_within(c: Contain, client: Ipv4Addr, ext: u16, int_port: u16) -> bool {
     client == c.caller
         && (!c.high_port || (int_port >= ANY_PORT_BASE && (ext == 0 || ext >= ANY_PORT_BASE)))
 }
 
-/// Whether an existing entry is within the containment (2.5.14.2,
-/// 2.5.18.2, 2.5.21.3): the caller's own mapping, both ports at or above
-/// 1024 where the floor applies.
+/// Whether an existing entry is within the containment: the caller's own mapping, both ports above the floor.
 fn entry_within(c: Contain, e: &FacadeEntry) -> bool {
     e.owner == c.caller
         && (!c.high_port || (e.int_port >= ANY_PORT_BASE && e.req_ext >= ANY_PORT_BASE))
 }
 
-/// The port an AddAnyPortMapping request reserves (section 2.5.17): the
-/// requested port when it is free or already this client's, and otherwise
-/// any free port of the protocol. The distinction is the whole of the
-/// preferred semantics: a port another client holds is not evicted, so the
-/// answer NewReservedPort carries differs from the request, which is the
-/// case the action exists for. A wildcard (0) is the same question with no
-/// preference expressed.
+/// The port an AddAnyPortMapping request reserves: the requested one when free, else any free port.
 fn preferred_port(entries: &[FacadeEntry], req_ext: u16, proto: Proto) -> u16 {
-    // A preferred port is honoured. It used to be moved aside when another
-    // client held it, which was the one-mapping rule; with a per-client label
-    // (call/0022) another client's entry is no obstacle, and the only request
-    // that has to be resolved is the wildcard, which states no preference.
-    // On an uplink where this device owns the real port, the datapath decides
-    // whether the preference can be bound; the label is the control point's
-    // either way.
+    // The requested port is honoured even when another client holds it: the label is per-client, not a resource.
     if req_ext == 0 {
         free_requested_port(entries, proto)
     } else {
@@ -2942,20 +2577,12 @@ fn preferred_port(entries: &[FacadeEntry], req_ext: u16, proto: Proto) -> u16 {
     }
 }
 
-/// The version 2 reading of NewLeaseDuration (sections 2.3.16, 2.5.16.2
-/// and 2.5.17.3): version 2 has no static mappings, so a lease of 0 means
-/// the maximum, 604800 seconds. The v1 face keeps 0 as the permanent
-/// mapping a legacy control point means by it.
+/// The version 2 reading of NewLeaseDuration: 0 means the maximum, 604800; v1 keeps 0 as a static mapping.
 fn wip2_lease(lifetime: u32) -> u32 {
     if lifetime == 0 { WIP2_MAX_LEASE } else { lifetime }
 }
 
-/// NewPortMappingDescription: the control point's label for the mapping
-/// (2.3.22). The description is control-point-controlled text that the
-/// device stores and later emits, so two things are done here rather than
-/// at the writers: control characters are dropped, because the persisted
-/// index is one tab-separated line per entry and a newline in the label
-/// would forge a second one, and the length is bounded.
+/// NewPortMappingDescription: control characters are dropped, so a label cannot forge a second index row.
 fn parse_desc(body: &[u8]) -> String {
     let raw = xml_tag(body, b"NewPortMappingDescription").unwrap_or(b"");
     let clean: String = String::from_utf8_lossy(raw)
@@ -2965,9 +2592,7 @@ fn parse_desc(body: &[u8]) -> String {
     clean.chars().take(DESC_MAX).collect()
 }
 
-/// The connection status the evented state variables report. This line is not
-/// dialled by anything of ours, so the only two states the daemon can
-/// honestly claim are "the external tuple is known" and "it is not".
+/// The connection status: the only two honest states are the external tuple being known or not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
     Connected,
@@ -2983,9 +2608,7 @@ impl Status {
     }
 }
 
-/// The declared evented variables of the WAN connection service, as one
-/// value: one subscriber's view of the daemon's own truth (call/0025). The
-/// reads answer from the same state, so an event cannot contradict a query.
+/// The declared evented variables as one value, so an event cannot contradict a read of the same state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EventView {
     ext_ip: Ipv4Addr,
@@ -3009,10 +2632,7 @@ impl EventView {
     }
 }
 
-/// Build a NOTIFY body carrying exactly the declared evented variables that
-/// moved, all of them for a subscription's initial event. An empty string
-/// means nothing moved, which is not an event: a subscriber is told about
-/// changes, and inventing one would make the next query contradict it.
+/// A NOTIFY body with the declared variables that moved (all of them initially); an empty string is no event.
 fn propertyset(prev: Option<&EventView>, now: &EventView) -> String {
     let mut props = String::new();
     if prev.map_or(true, |p| p.status != now.status) {
@@ -3048,9 +2668,7 @@ fn propertyset(prev: Option<&EventView>, now: &EventView) -> String {
     )
 }
 
-/// How many mappings a subscriber's view holds: the same containment the
-/// reads apply, so a contained control point cannot count another client's
-/// namespace.
+/// How many mappings a subscriber's view holds, under the same containment its reads apply.
 fn scoped_count(scope: Option<Contain>, entries: &[FacadeEntry]) -> u16 {
     let n = match scope {
         None => entries.len(),
@@ -3059,9 +2677,7 @@ fn scoped_count(scope: Option<Contain>, entries: &[FacadeEntry]) -> u16 {
     n.min(u16::MAX as usize) as u16
 }
 
-/// The transport a MAP names, as this daemon's slot engine spells it. The
-/// zero protocol ("all protocols") and anything but UDP and TCP are not
-/// mappings this datapath can hold.
+/// The transport a MAP names, as the slot engine spells it; anything but UDP and TCP is not a mapping here.
 fn proto_of(code: u8) -> Option<Proto> {
     match code {
         17 => Some(Proto::Udp),
@@ -3070,9 +2686,7 @@ fn proto_of(code: u8) -> Option<Proto> {
     }
 }
 
-/// An error answer: the suggested external port and address come back as the
-/// request gave them, which is what RFC 6887 section 11.1 asks an error
-/// response to carry.
+/// An error answer returning the suggested external port and address the request gave.
 fn pcp_error(code: u8, sug_ext: u16, sug_ip: Ipv4Addr) -> crate::pcp::MapAnswer {
     crate::pcp::MapAnswer::Answer {
         code,
@@ -3082,8 +2696,7 @@ fn pcp_error(code: u8, sug_ext: u16, sug_ip: Ipv4Addr) -> crate::pcp::MapAnswer 
     }
 }
 
-/// NAT-PMP's own result codes (RFC 6886 section 3.5) for the outcomes the
-/// admission shares with PCP.
+/// NAT-PMP's own result codes for the outcomes the admission shares with PCP.
 fn npmp_code(pcp_code: u8) -> u8 {
     use crate::pcp::np;
     use crate::pcp::rc;
@@ -3095,15 +2708,10 @@ fn npmp_code(pcp_code: u8) -> u8 {
     }
 }
 
-/// How long a mapping may wait for its discovery before the server says so.
-/// A request that cannot be answered yet is dropped, because the client's own
-/// retransmission is the only recovery the protocol provides; past this much
-/// waiting the drop is no longer honest, and the network error is.
+/// How long a mapping may wait for its discovery before the server stops answering with silence.
 const DISCOVERY_GRACE_S: u64 = 10;
 
-/// The verdict for a mapping whose tuple is not known yet: silence while the
-/// wait is young, NETWORK_FAILURE (RFC 6887 section 7.4, a short-lifetime
-/// error) once it is not.
+/// The verdict for a mapping whose tuple is unknown: silence while the wait is young, else NETWORK_FAILURE.
 fn discovery_verdict(waited_s: u64, tuple_known: bool) -> Option<u8> {
     if tuple_known || waited_s < DISCOVERY_GRACE_S {
         None
@@ -3112,9 +2720,7 @@ fn discovery_verdict(waited_s: u64, tuple_known: bool) -> Option<u8> {
     }
 }
 
-/// Escape the five XML metacharacters. Any field a control point chose needs
-/// it: a mapping description, and the DeviceProtection identity name, alias
-/// and role text.
+/// Escape the five XML metacharacters; any field a control point chose needs it.
 pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -3160,13 +2766,7 @@ fn insert_sorted(es: &mut Vec<FacadeEntry>, e: FacadeEntry) {
     es.insert(pos, e);
 }
 
-/// The control-plane entry for a grant: one entry per internal
-/// (proto, client, int_port) tuple, using the external port the control
-/// point last used ("the requested port survives the re-Add"). Returns the
-/// stray slot a same-client replace leaves behind — that client's previous
-/// entry at the requested port, whose datapath the caller must tear down —
-/// or None when no slot changed owner. Another client's entry at the same
-/// port is never a stray: the requested port is a per-client label.
+/// The control-plane entry for a grant: one per internal (proto, client, int_port) tuple, with the client's label.
 #[allow(clippy::too_many_arguments)] // one flat decision over the grant's fields
 fn apply_entry(
     es: &mut Vec<FacadeEntry>,
@@ -3181,9 +2781,7 @@ fn apply_entry(
     desc: String,
 ) -> Option<(u16, Ipv4Addr, u16)> {
     let expires = now_unix.saturating_add(u64::from(lifetime));
-    // Same internal tuple: the upsert refreshed the existing slot in place
-    // — the entry moves to the newly requested external port, bind
-    // untouched, nothing torn down.
+    // The same internal tuple: the upsert refreshed the slot in place, so the entry moves label only.
     if let Some(idx) = es
         .iter()
         .position(|e| e.proto == proto && e.owner == owner && e.int_port == int_port)
@@ -3196,29 +2794,7 @@ fn apply_entry(
         insert_sorted(es, e);
         return None;
     }
-    // The same client's own mapping at the same requested port, with a
-    // different internal tuple: the upsert granted a NEW slot, so that
-    // client's previous entry must surrender the port: one entry per
-    // client per port, because the port is that client's handle and a
-    // client cannot hold two mappings under one handle. An entry whose bind_port
-    // already IS the new slot is a stale index row — refresh it in place
-    // rather than tear it down.
-    //
-    // Another client's entry at the same requested port is NOT an
-    // occupant to evict. The requested port is a per-client label: the
-    // facade's datapath never binds it (the AFTR dictates the real tuple
-    // on the ds-lite uplink, and our own slot ranges do on an IPv4 NAT we
-    // control), so two clients may each hold 3074 with their own slots and
-    // their own real tuples. This is where the supersession takes effect: the
-    // specification's one-mapping rule assumes the device owns the external
-    // port, and here it does not.
-    // A request that names no port carries no handle, and it therefore cannot
-    // take another mapping away. Measured on the router on 2026-09-20: a PCP
-    // lease with a carrier-chosen port was torn down two seconds after it was
-    // granted, because the same client's NAT-PMP leg asked for the same
-    // no-preference key (`req_ext` 0) and its supersession named the PCP
-    // lease's slot. The loser was the client's own mapping, and any client
-    // whose library sends both protocols loses one mapping per request.
+    // A request that names no port carries no handle, so it cannot take another client's mapping away.
     if req_ext != 0 {
         if let Some(idx) = es
             .iter()
@@ -3259,8 +2835,7 @@ fn apply_entry(
 
 // ---- HTTP plumbing ----
 
-/// Split the request head from any bytes already read past its
-/// terminator (the body, when the client sends head+body in one packet).
+/// Split the request head from any bytes already read past its terminator (the body).
 fn split_head(buf: &[u8]) -> Option<(&[u8], &[u8])> {
     let n = buf.len();
     for i in 0..n {
@@ -3364,12 +2939,7 @@ async fn write_soap_fault(stream: &mut TcpStream, f: &UpnpFault) -> io::Result<(
 
 fn bind_ssdp(lan_ip: Ipv4Addr) -> io::Result<UdpSocket> {
     let sock = unsafe {
-        // O_NONBLOCK|O_CLOEXEC at creation: tokio's from_std only
-        // debug-asserts nonblocking (stripped in release — a blocking
-        // socket here wedged the whole night on the rig: one worker
-        // parked inside recvfrom and the io-driver handoff degraded until
-        // the HTTP accept loop never woke). SOCK_CLOEXEC keeps the fd out
-        // of children (lxc-attach, nft subprocesses).
+        // O_NONBLOCK|O_CLOEXEC at creation: tokio's from_std only debug-asserts nonblocking, which release strips.
         let fd = libc::socket(
             libc::AF_INET,
             libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
@@ -3410,13 +2980,7 @@ fn bind_ssdp(lan_ip: Ipv4Addr) -> io::Result<UdpSocket> {
     };
     sock.set_multicast_loop_v4(false)?;
     sock.set_multicast_ttl_v4(2)?;
-    // Join and send on the LAN interface BY INDEX, never by address: the
-    // LAN IP may be bound to more than one interface (this rig carries
-    // 192.168.21.1 on br-lan /24 AND on the wg_a92_t6d6 tunnel as a /32),
-    // and join_multicast_v4(addr) resolves the interface from the local
-    // table, which picked the point-to-point tunnel — SSDP then never
-    // heard br-lan's multicast. ip_mreqn with an explicit ifindex and
-    // imr_address = 0 is the robust form.
+    // Join and send on the LAN interface by index: an address-based join picks the tunnel instead.
     let Some(idx) = lan_ifindex(lan_ip) else {
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -3440,9 +3004,7 @@ fn bind_ssdp(lan_ip: Ipv4Addr) -> io::Result<UdpSocket> {
                 std::mem::size_of::<libc::ip_mreqn>() as libc::socklen_t,
             );
             if r != 0 {
-                // Fail closed: a group join that silently failed would be
-                // a discovery-deaf SSDP responder that still advertises
-                // itself (the E8 posture, same as the lan_ifindex check).
+                // Fail closed: a silently failed join would be a discovery-deaf responder that still advertises.
                 let msg = match opt {
                     libc::IP_ADD_MEMBERSHIP => "join multicast group",
                     _ => "set multicast interface",
@@ -3455,10 +3017,7 @@ fn bind_ssdp(lan_ip: Ipv4Addr) -> io::Result<UdpSocket> {
     tokio::net::UdpSocket::from_std(sock)
 }
 
-/// The LAN interface index for `lan_ip`: the broadcast-scope (Ethernet or
-/// bridge) interface owning the address, preferring it over any
-/// point-to-point (tunnel) interface that also carries the address,
-/// falling back to any owner if only a tunnel has it.
+/// The LAN interface index for `lan_ip`, preferring a broadcast-scope interface over a point-to-point one.
 fn lan_ifindex(lan_ip: Ipv4Addr) -> Option<i32> {
     let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
@@ -3494,8 +3053,7 @@ fn lan_ifindex(lan_ip: Ipv4Addr) -> Option<i32> {
     }
     unsafe { libc::freeifaddrs(addrs) };
     let name = best.or(fallback)?;
-    // `name` is zero-padded; CString rejects interior NULs, so use the
-    // used portion only.
+    // `name` is zero-padded; CString rejects interior NULs, so use the used portion only.
     let used = name.iter().position(|&b| b == 0).unwrap_or(16);
     let cname = std::ffi::CString::new(&name[..used]).ok()?;
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
@@ -3517,13 +3075,9 @@ const NOTIFY_STS: [SearchTarget; 6] = [
 
 // ---- identity (stable UDN from the br-lan MAC; bootid persists) ----
 
-// ---- plan/0008 #v2-service-set: DeviceProtection helpers ----
+// ---- DeviceProtection helpers ----
 
-/// The device's 16-octet identity (the DeviceID in the PKCS5
-/// authenticator computation, spec 2.6.6.4). Derived from the stable
-/// root UDN: the dashed-hex UUID's bytes when the UDN is dashed hex,
-/// else a stable fnv projection. Both the device and a control point
-/// derive the same value from the same UDN, so the ceremony binds.
+/// The device's 16-octet identity, derived from the stable root UDN so device and control point agree.
 fn dp_device_id(udn: &str) -> [u8; 16] {
     let core = udn.strip_prefix("uuid:").unwrap_or(udn);
     let mut hex = String::with_capacity(32);
@@ -3544,10 +3098,7 @@ fn dp_device_id(udn: &str) -> [u8; 16] {
     raw
 }
 
-/// Load the persistent DP security configuration (users + ACL, plan/0008
-/// section 26.15) from `dp.tsv`; absent or unreadable config yields the
-/// restrictive default: an empty ACL, so every protected action is denied
-/// until the operator provisions `dp.tsv` out-of-band.
+/// Load the persistent DP configuration from `dp.tsv`; absent or unreadable yields an empty, denying ACL.
 fn dp_load(dir: &str, device_id: [u8; 16]) -> dp::DpState {
     let path = format!("{}/dp.tsv", dir);
     let (users, acl) = match std::fs::read_to_string(&path) {
@@ -3557,8 +3108,7 @@ fn dp_load(dir: &str, device_id: [u8; 16]) -> dp::DpState {
     dp::DpState::new(device_id, users, acl)
 }
 
-/// Atomically persist the DP security configuration (tmpfile + rename,
-/// the same discipline as leases.tsv).
+/// Atomically persist the DP configuration (tmpfile + rename, as the other state files are written).
 fn dp_save(dir: &str, state: &dp::DpState) {
     let _ = std::fs::create_dir_all(dir);
     let text = dp::config_tsv(&state.users, &state.acl);
@@ -3569,9 +3119,7 @@ fn dp_save(dir: &str, state: &dp::DpState) {
     }
 }
 
-/// A fresh 16-octet random nonce (challenge/Salt source). Bounded read:
-/// exactly 16 bytes from /dev/urandom (the facade's earlier unbounded
-/// urandom read is the recorded OOM root cause; never read unbounded).
+/// A fresh 16-octet random nonce: exactly 16 bytes from /dev/urandom, never an unbounded read.
 fn dp_random_16() -> [u8; 16] {
     let mut out = [0u8; 16];
     if let Ok(f) = std::fs::File::open("/dev/urandom") {
@@ -3582,8 +3130,7 @@ fn dp_random_16() -> [u8; 16] {
     out
 }
 
-/// Map a DeviceProtection error onto the facade's error set (the SOAP
-/// fault codes of spec 2.6.15).
+/// Map a DeviceProtection error onto the facade's error set.
 fn map_dp_err(e: dp::DpErr) -> UpnpErr {
     match e {
         dp::DpErr::InvalidValue => UpnpErr::InvalidValue,
@@ -3653,10 +3200,7 @@ fn fnv1a(data: &[u8], seed: u64) -> u64 {
 }
 
 fn random_sid() -> Sid {
-    // READ EXACTLY 16 BYTES. std::fs::read(/dev/urandom) is read_to_end —
-    // it loops until EOF, and /dev/urandom never returns EOF, so the buffer
-    // doubles without bound (2^29 locally, 2^34 = 16 GiB on the router:
-    // every GENA SUBSCRIBE OOM-killed the daemon before this fix).
+    // Read exactly 16 bytes: std::fs::read loops to EOF, and /dev/urandom never ends, so the buffer grows.
     let mut raw = [0u8; 16];
     let seeded = std::fs::File::open("/dev/urandom")
         .and_then(|mut f| {
@@ -3682,8 +3226,7 @@ fn random_sid() -> Sid {
 
 // ---- persisted entry index (respawn continuity of the req-ext key) ----
 
-/// One persisted index row: the seven fixed fields, then the control
-/// point's description.
+/// One persisted index row: the fixed fields, then the control point's description.
 fn entry_line(e: &FacadeEntry) -> String {
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -3699,12 +3242,7 @@ fn entry_line(e: &FacadeEntry) -> String {
     )
 }
 
-/// A persisted index row back to an entry. The row grew twice: the
-/// description was added, then the requester. A seven-field row restores with
-/// an empty description, and a row without the requester takes the target as
-/// the requester, which is what those rows meant (they were written before a
-/// lifted control point could map on another host's behalf). A row that
-/// parses to nothing is skipped.
+/// A persisted index row back to an entry; a row that parses to nothing is skipped.
 fn entry_from_line(line: &str) -> Option<FacadeEntry> {
     let parts: Vec<&str> = line.split('\t').collect();
     if !(7..=9).contains(&parts.len()) {
@@ -3721,8 +3259,7 @@ fn entry_from_line(line: &str) -> Option<FacadeEntry> {
     let granted_lifetime: u32 = parts[5].parse().ok()?;
     let expires_at_unix: u64 = parts[6].parse().ok()?;
     let desc = parts.get(7).copied().unwrap_or("").to_string();
-    // a row written before the requester existed means the target, since a
-    // control point then could only map for itself
+    // a row written before the requester field means the target, since a control point then mapped for itself
     let owner = match parts.get(8).and_then(|o| o.parse::<Ipv4Addr>().ok()) {
         Some(o) => o,
         None => client,
@@ -3740,8 +3277,7 @@ fn entry_from_line(line: &str) -> Option<FacadeEntry> {
     })
 }
 
-/// The persisted entry index: seven fixed fields, then the control
-/// point's description, which was added later.
+/// Read the persisted entry index back from `upnp.tsv`.
 fn restore_entries() -> Vec<FacadeEntry> {
     let path = format!("{}/upnp.tsv", DEFAULT_DIR);
     let mut out = Vec::new();
@@ -3751,7 +3287,7 @@ fn restore_entries() -> Vec<FacadeEntry> {
     out
 }
 
-// ---- description docs (E2) ----
+// ---- description docs ----
 
 fn root_desc(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
     format!(
@@ -3804,11 +3340,7 @@ fn root_desc(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// plan/0008's LOCATION design: the IGD:2 root description (gated route data).
-/// DeviceProtection:1 sits directly under InternetGatewayDevice:2 per
-/// section 26.4; WANIPConnection:2 under WANConnectionDevice:2. This is
-/// the v2 service description; it is not served until the
-/// #v2-service-set task flips IGD_V2_ENABLED (R6 mount gate).
+/// The IGD:2 root description: DeviceProtection:1 under the root device, WANIPConnection:2 under the WAN device.
 fn root_desc_v2(lan_ip: Ipv4Addr, port: u16, name: &str, udn: &str) -> Vec<u8> {
     format!(
         "<?xml version=\"1.0\"?>\n<root xmlns=\"urn:schemas-upnp-org:device-1-0\">\
@@ -3869,29 +3401,14 @@ fn derived_udn(base: &str, tag: &[u8]) -> String {
     String::from_utf8_lossy(&upnp::uuid_hex(&raw)).into_owned()
 }
 
-/// The NewPortListing fragment prefix: the PortMappingList root of the
-/// WANIPConnection:2 PortListing datastructure, exactly as the sample of
-/// the spec's section 2.3.25.2 renders it (namespace and schema location
-/// included; the named schema URL no longer answers, so the sample is the
-/// shape authority).
+/// The PortMappingList root the Listing uses, as the spec's own sample renders it (the named schema URL is dead).
 const PORT_LISTING_OPEN: &str = r#"<p:PortMappingList xmlns:p="urn:schemas-upnp-org:gw:WANIPConnection" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:schemas-upnp-org:gw:WANIPConnection http://www.upnp.org/schemas/gw/WANIPConnection-v2.xsd">"#;
 
-/// The wrapper that carries the fragment as the value of
-/// GetListOfPortMappings' NewPortListing OUT argument: A_ARG_TYPE_PortListing
-/// is a string holding an XML document, so the fragment is carried in a CDATA section
-/// section inside the argument element rather than as the response's own
-/// children, where no control point would find it under that name. The
-/// reference server emits the same wrapper, and the reference client
-/// collects the listing only from the character data of this element.
-/// A description cannot break the section: `xml_escape` renders `>` as
-/// `&gt;`, so `]]>` cannot occur inside a fragment.
+/// The wrapper that carries the fragment as NewPortListing, in a CDATA section, as the reference client reads it.
 const PORT_LISTING_WRAP_OPEN: &str = "<NewPortListing><![CDATA[";
 const PORT_LISTING_WRAP_CLOSE: &str = "]]></NewPortListing>";
 
-/// WANIPConnection:1 service description. Cribbed from miniupnpd (BSD
-/// license, `netfilter/upnp_desc.c`); the action/argument/state-variable
-/// shapes follow the UPnP IGDv1 spec. The PPP alias serves the same SCPD
-/// (its action set is identical for the actions we honour).
+/// WANIPConnection:1 service description, cribbed from miniupnpd (`netfilter/upnp_desc.c`, BSD).
 const SCPD_WANIP: &str = r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
@@ -3965,15 +3482,10 @@ const SCPD_WANIP: &str = r#"<?xml version="1.0"?>
 </scpd>
 "#;
 
-/// The PPP alias serves the identical SCPD (the WANPPPConnection:1 action
-/// set matches WANIPConnection's for the actions we honour).
+/// The PPP alias serves the identical SCPD: its action set matches for the actions honoured.
 const SCPD_WANPPP: &str = SCPD_WANIP;
 
-/// WANCommonInterfaceConfig:1 service description. Cribbed from miniupnpd
-/// (BSD license, `netfilter/upnp_desc.c`); the single action honoured is
-/// GetCommonLinkProperties. miniupnpc's GetValidIGD gates device
-/// validation on the *presence* of this service in the root description,
-/// so it must be advertised even though only the one action is answered.
+/// WANCommonInterfaceConfig:1 description; miniupnpc's GetValidIGD requires the service in the root description.
 const SCPD_WANCMN: &str = r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
@@ -3994,15 +3506,7 @@ const SCPD_WANCMN: &str = r#"<?xml version="1.0"?>
 </scpd>
 "#;
 
-/// plan/0008: the WANIPConnection:2 SCPD (gated route data). The action
-/// actions, every argument table, and the state table are transcribed from
-/// the normative spec (docs/upnp-wip2/UPnP-gw-WANIPConnection-v2-Service.md,
-/// sections 2.3, 2.4, 2.5 and the section 4 XML Service Description
-/// reassembled in docs/upnp-wip2/TRANSCRIPTION.md): twenty-one actions,
-/// twenty-three state variables of which five are evented. The placeholder
-/// this replaces carried a bogus action (GetLinkLayerMaxBitRates, which
-/// belongs to WANCommonInterfaceConfig), argument-less action entries, five
-/// invented A_ARG_TYPE variables, and a state table that evented nothing.
+/// The WANIPConnection:2 SCPD: twenty-one actions, twenty-three state variables of which five are evented.
 const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
@@ -4118,13 +3622,7 @@ const SCPD_WIP2: &str = r#"<?xml version="1.0"?>
 </scpd>
 "#;
 
-/// DeviceProtection:1 service description (urn:schemas-upnp-org:service:DeviceProtection:1).
-/// The action set is transcribed from the normative spec
-/// (docs/upnp-dp1/UPnP-gw-DeviceProtection-V1-Service.md, sections 2.6.1-2.6.13):
-/// thirteen actions, every argument table per the spec. Earlier
-/// miniupnpd-derived names (RequestUserLogin, ValidateIdentity, AddACLEntry,
-/// LoginWithPIN, ...) were wrong and are superseded. The Kani gate verifies
-/// this document carries exactly the authoritative action names.
+/// The DeviceProtection:1 SCPD: thirteen actions, every argument table per the spec.
 const SCPD_DP: &str = r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
 <specVersion><major>1</major><minor>0</minor></specVersion>
@@ -4226,12 +3724,7 @@ mod tests {
 
     #[test]
     fn random_sid_is_bounded_and_v4() {
-        // Regression (2026-09-14): random_sid used std::fs::read on
-        // /dev/urandom — read_to_end loops forever on a device with no
-        // EOF, doubling its buffer until the host OOMs (2^34 bytes on the
-        // router: every GENA SUBSCRIBE killed the daemon). A bounded
-        // read_exact keeps SID generation cheap regardless of how many
-        // times it is called.
+        // SID generation must read a bounded 16 bytes; an unbounded /dev/urandom read grows until the host OOMs.
         for _ in 0..64 {
             let sid = random_sid();
             let b = sid.0;
@@ -4318,9 +3811,7 @@ mod tests {
         assert!(doc.contains("WANPPPConnection:1"));
         assert!(doc.contains("/ctl/IPConn"));
         assert!(doc.contains("/WANIPC.xml"));
-        // the WANCommonInterfaceConfig service gates miniupnpc's IGD
-        // validation (GetValidIGD marks the device only when the rootDesc
-        // advertises it), so its presence is load-bearing, not cosmetic
+        // the WANCommonInterfaceConfig service gates miniupnpc's IGD validation, so its presence is load-bearing
         assert!(doc.contains("WANCommonInterfaceConfig:1"));
         assert!(doc.contains("/WANCfg.xml"));
         assert!(doc.contains("/ctl/CmnIfCfg"));
@@ -4330,10 +3821,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn http_hammer_stability() {
-        // Off-production harness for the facade's HTTP accept/dispatch
-        // loop: concurrent GETs and a held-open stall on an ephemeral
-        // port must all be served (200, non-empty body), and closing a
-        // stalled peer must free its permit so the pool recovers.
+        // Harness for the accept/dispatch loop: concurrent GETs and held-open stalls must all be served.
         fn is_ok(buf: &[u8]) -> bool {
             buf.starts_with(b"HTTP/1.1 200 OK")
         }
@@ -4391,8 +3879,7 @@ mod tests {
             }
         };
 
-        // round 1: 12 concurrent GETs (under the 16-permit cap), all must
-        // be served whole
+        // round 1: 12 concurrent GETs (under the 16-permit cap), all served whole
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..12 {
             set.spawn(client(b"GET /rootDesc.xml HTTP/1.0\r\n\r\n"));
@@ -4406,8 +3893,7 @@ mod tests {
         }
         assert_eq!(served, 12, "all round-1 GETs must be served whole");
 
-        // round 2: 12 peers stall mid-head, then close; a fresh GET after
-        // each close must still be served (permit recovered on EOF)
+        // round 2: 12 peers stall mid-head then close; a fresh GET after each close must still be served
         for i in 0..12 {
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
             s.write_all(b"GET /rootDes").await.unwrap();
@@ -4421,10 +3907,7 @@ mod tests {
             );
         }
 
-        // round 3: a body-stall (head declares a body that never arrives)
-        // must not wedge the pool: cap 16, so 6 such stalls must leave the
-        // 7th request dropped (documented cap behavior) but a later EOF+… 
-        // -- sanity only: the 30s timeout bounds these.
+        // round 3: a body-stall must not wedge the pool; the 30 s timeout bounds it
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         s.write_all(
             b"POST /ctl/IPConn HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n",
@@ -4455,12 +3938,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn udp_slot_revoke_releases_socket() {
-        // Regression (2026-09-14, found live on the rig): spawn_udp_slot
-        // used to return an empty handle vector, so delete_mapping/GC
-        // aborted nothing and the slot socket stayed bound forever after a
-        // Delete. The keepalive is a sibling task holding its own Arc of
-        // the socket, so BOTH handles must be surfaced and aborted for the
-        // socket to drop.
+        // Both handles must be aborted: the keepalive holds its own Arc, so only that frees the socket.
         use tokio::net::UdpSocket as TokioUdp;
 
         let cfg = UpnpConfig {
@@ -4519,8 +3997,7 @@ mod tests {
         for h in &handles {
             h.abort();
         }
-        // Let the abort propagate; then a fresh bind on the same port must
-        // succeed — the socket is gone, not just orphaned.
+        // Let the abort propagate; a fresh bind on the same port must then succeed
         tokio::time::sleep(Duration::from_millis(100)).await;
         let rebind = TokioUdp::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, bind_port)).await;
         assert!(
@@ -4532,10 +4009,7 @@ mod tests {
 
     #[test]
     fn a_request_with_no_port_preference_does_not_supersede_another() {
-        // Measured on the router on 2026-09-20: a PCP lease was torn down two
-        // seconds after it was granted, by the same client's NAT-PMP request,
-        // which asks for "any port". A request that names no port carries no
-        // handle, so it cannot take another mapping away.
+        // A request that names no port carries no handle, so it cannot take another mapping away
         let a = Ipv4Addr::new(192, 168, 21, 11);
         let mut es = Vec::new();
         assert_eq!(
@@ -4558,14 +4032,7 @@ mod tests {
 
     #[test]
     fn apply_entry_keyed_per_client_lets_two_holders_share_a_port() {
-        // Regression (review C2): the entry index used to refresh on
-        // (req_ext, proto) and never updated bind_port, so a re-Add that
-        // moved the mapping to a NEW slot left the entry naming the old
-        // slot — delete tore down the wrong datapath and the live mapping
-        // became unenumerable. One entry per internal tuple, and, since the
-        // requested port is a per-client label, one entry per client per
-        // requested port: another client's entry is not an occupant to
-        // evict, which is the multiple-console case.
+        // One entry per internal tuple and one per client per port; another client's entry is no occupant.
         let now = 1_700_000_000u64;
         let a = Ipv4Addr::new(192, 168, 21, 50);
         let b = Ipv4Addr::new(192, 168, 21, 60);
@@ -4574,23 +4041,19 @@ mod tests {
         // A maps 3074/UDP -> slot 30000.
         assert_eq!(apply_entry(&mut es, 3074, Proto::Udp, a, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
-        // A re-adds the SAME internal tuple at a new requested port: the
-        // the entry keeps the port, the same slot, nothing torn down.
+        // A re-adds the same internal tuple at a new label: the entry keeps its slot and nothing is torn down.
         assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, a, a, 4000, 30000, 3600, now, d("client-a")), None);
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].req_ext, 3075);
         assert_eq!(es[0].bind_port, 30000);
-        // A claims 3075/UDP with a different internal tuple: A's own entry
-        // at that port surrenders it: one entry per client per port,
-        // because the port is that client's handle.
+        // A claims that port with a different internal tuple: its own entry surrenders it.
         assert_eq!(
             apply_entry(&mut es, 3075, Proto::Udp, a, a, 6000, 30005, 3600, now, d("client-a")),
             Some((30000, a, 4000))
         );
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].bind_port, 30005);
-        // B also claims 3075/UDP: its own entry, and A's survives. The
-        // datapath resolves each to its own slot and its own real tuple.
+        // B also claims the same port: its own entry, and A's survives, each datapath resolved to its own slot.
         assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, b, 5000, 30001, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 2, "two clients, one requested port");
         assert_eq!(
@@ -4601,18 +4064,14 @@ mod tests {
         // B re-adds its own tuple at the same port: plain refresh.
         assert_eq!(apply_entry(&mut es, 3075, Proto::Udp, b, b, 5000, 30001, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 2);
-        // A fresh mapping on a free port: plain insert, and B may hold the
-        // same port on another protocol without touching A.
+        // A fresh mapping on a free port is a plain insert; the same port on another protocol is a separate entry.
         assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, a, a, 9000, 30002, 3600, now, d("client-a")), None);
         assert_eq!(apply_entry(&mut es, 9000, Proto::Tcp, b, b, 6000, 30003, 3600, now, d("client-b")), None);
         assert_eq!(es.len(), 4);
         assert_eq!(es.iter().filter(|e| e.req_ext == 9000 && e.proto == Proto::Tcp).count(), 2);
     }
 
-    /// The v2 readings the transcription fixes, each a property a name-only
-    /// implementation fails by construction: the wildcard's port choice
-    /// (2.5.17), the version 2 lease reading (table 2-6), and the Listing
-    /// fragment with the spec's own 7xx refusals (2.5.19, 2.5.21).
+    /// The v2 readings the transcription fixes: the wildcard's port, the lease reading, the Listing fragment.
     #[test]
     fn wip2_wildcard_and_lease_readings() {
         assert_eq!(wip2_lease(0), WIP2_MAX_LEASE, "version 2: 0 is the maximum");
@@ -4655,11 +4114,7 @@ mod tests {
         );
     }
 
-    /// plan/0008's containment for callers without the lift: the containment the spec recommends for
-    /// unauthenticated control points. The address clause needs no remedy
-    /// and binds both faces; the port floor is a field, so one predicate
-    /// serves the v2 face, where a control point can authenticate to lift
-    /// it, and the v1 face, where it cannot.
+    /// The containment for callers without the lift: the address clause binds both faces, the port floor v2.
     #[test]
     fn containment_predicates() {
         let a = Ipv4Addr::new(192, 168, 21, 50);
@@ -4667,8 +4122,7 @@ mod tests {
         let own_host = Contain { caller: a, high_port: false };
         let own_host_high = Contain { caller: a, high_port: true };
 
-        // 2.5.16.2: another host is refused; the caller's own address is
-        // admitted, with a low port admitted where no floor applies
+        // another host is refused; the caller's own address is admitted, and a low port where no floor applies
         assert!(!request_within(own_host, b, 5000, 5000));
         assert!(request_within(own_host, a, 5000, 5000));
         assert!(request_within(own_host, a, 80, 80));
@@ -4676,13 +4130,12 @@ mod tests {
         assert!(!request_within(own_host_high, a, 80, 5000));
         assert!(!request_within(own_host_high, a, 5000, 80));
         assert!(request_within(own_host_high, a, 1024, 1024));
-        // the wildcard external port is the any-free-port form and resolves
-        // above the floor by construction, so it is admitted
+        // the wildcard external port resolves above the floor by construction, so it is admitted
         assert!(request_within(own_host_high, a, 0, 5000));
         // ... and the floor never licenses another host
         assert!(!request_within(own_host_high, b, 5000, 5000));
 
-        // 2.5.14.2, 2.5.18.2, 2.5.21.3: the same clause over an entry
+        // the same containment clause over an entry
         let e = |req_ext: u16, client: Ipv4Addr, int_port: u16| FacadeEntry {
             req_ext,
             proto: Proto::Udp,
@@ -4701,12 +4154,7 @@ mod tests {
         assert!(entry_within(own_host_high, &e(5000, a, 5000)));
     }
 
-    /// The containment over a real table: a contained caller sees, indexes
-    /// and deletes only its own entries at or above the floor, while an
-    /// uncontained one (the lifted session, or a v1 read) sees the whole
-    /// table. This is the property the plan's open policy item asked for,
-    /// and it is asserted against seeded entries because the engine's grant
-    /// path needs nft.
+    /// The containment over a real table: a contained caller sees, indexes and deletes only its own entries.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn containment_view_over_the_table() {
         let a = Ipv4Addr::new(192, 168, 21, 50);
@@ -4762,8 +4210,7 @@ mod tests {
         });
         let view = Some(Contain { caller: a, high_port: true });
 
-        // the listing: one entry visible to A (its own, both ports high);
-        // the whole table to an uncontained caller
+        // the listing: one entry for A (its own, both ports high); the whole table to an uncontained caller
         let contained = facade
             .list_port_mappings(1, 65535, None, 0, view)
             .await
@@ -4776,8 +4223,7 @@ mod tests {
             .expect("the uncontained view lists");
         assert_eq!(whole.matches("<p:PortMappingEntry>").count(), 4);
 
-        // the specific read: another client's entry is forbidden, not
-        // missing, and A's own below the floor is forbidden too
+        // the specific read: another client's entry is forbidden, not missing, and A's own below the floor too
         assert_eq!(
             facade.get_specific(5001, Proto::Udp, a, view).await,
             Err(UpnpErr::NoSuchEntry),
@@ -4789,9 +4235,7 @@ mod tests {
             Err(UpnpErr::NotAuthorized)
         );
 
-        // the enumeration: the index space is what the caller may see, so
-        // A's walk ends after its one entry and an uncontained walk runs
-        // the whole table
+        // the index space is what the caller may see, so A's walk ends after its own entry
         assert!(facade.get_generic(0, view).await.is_ok());
         assert_eq!(
             facade.get_generic(1, view).await,
@@ -4803,11 +4247,7 @@ mod tests {
         }
         assert_eq!(facade.get_generic(4, None).await, Err(UpnpErr::NoSuchEntry));
 
-        // A lifted control point may map on another host's behalf, and the
-        // entry is keyed by the *requester* (call/0022), not by the host it
-        // names. Before the requester was recorded, such an entry was keyed
-        // by its target, so its owner could not read or delete it: the
-        // deployed bench found exactly that (714 on its own delete).
+        // The entry is keyed by the requester, not the host it names, so a lifted caller can delete its own.
         {
             let mut es = facade.entries.lock().await;
             es.push(FacadeEntry {
@@ -4841,10 +4281,7 @@ mod tests {
             "the requester deletes its own mapping"
         );
 
-        // the enumeration renders each entry as itself: two clients hold
-        // 1024/UDP here, so index 1 must not render index 0's entry (the
-        // defect the deployed bench caught; the index addresses the visible
-        // list rather than a (port, protocol) key)
+        // The enumeration renders each entry as itself: the index addresses the visible list, not a port key.
         {
             let mut es = facade.entries.lock().await;
             es.push(FacadeEntry {
@@ -4914,9 +4351,7 @@ mod tests {
             "the other client's mapping survives"
         );
 
-        // a range covering everything deletes A's visible entry and skips
-        // the two it may not touch (2.5.19.2), so the action succeeds; a
-        // range holding only another client's entry is 730
+        // a range covering everything deletes A's visible entries; a range holding only another's is 730
         assert_eq!(
             facade.delete_mapping_range(1, 65535, Proto::Udp, view).await,
             Ok(String::new())
@@ -4933,12 +4368,7 @@ mod tests {
         );
     }
 
-    /// plan/0008's version-specific SOAP semantics: allocate_exact and allocate_preferred resolve
-    /// the same request differently over one engine. Exact honours the
-    /// requested port and takes it over from whoever holds it; preferred
-    /// moves to a free port and leaves the other client's mapping standing.
-    /// The difference is the port resolution, and it is asserted here on
-    /// one shared table state.
+    /// allocate_exact and allocate_preferred differ in port resolution: exact takes the port, preferred moves.
     #[test]
     fn allocate_exact_and_preferred_differ() {
         let a = Ipv4Addr::new(192, 168, 21, 50);
@@ -4956,8 +4386,7 @@ mod tests {
         };
         let owned = vec![e(5000, Proto::Udp, a), e(5001, Proto::Udp, b)];
 
-        // preferred: the port is a per-client label (call/0022), so another
-        // client's entry is no obstacle and the preference is honoured
+        // preferred: the port is a per-client label, so another client's entry is no obstacle
         assert_eq!(preferred_port(&owned, 5000, Proto::Udp), 5000);
         // a wildcard states no preference, so it allocates
         assert_eq!(preferred_port(&owned, 0, Proto::Udp), ANY_PORT_BASE);
@@ -4966,9 +4395,7 @@ mod tests {
         // a free port is honoured
         assert_eq!(preferred_port(&owned, 8100, Proto::Udp), 8100);
 
-        // exact: the same request on the same state adds beside the other
-        // client's entry, which is the supersession call/0022 records; the
-        // earlier entry keeps its mapping.
+        // exact: the same request adds beside the other client's entry, and the earlier entry keeps its mapping
         let mut es = owned.clone();
         assert_eq!(
             apply_entry(&mut es, 5000, Proto::Udp, b, b, 7000, 30010, 3600, 1_700_000_000, "b".into()),
@@ -4983,10 +4410,7 @@ mod tests {
         assert!(es.iter().any(|x| x.req_ext == 5000 && x.client == b));
     }
 
-    /// NewPortMappingDescription is stored, not replaced by a device
-    /// string (2.3.22): the enumeration and the Listing answer with what
-    /// the control point sent, and the stored text cannot forge a line in
-    /// the persisted index or an element in the SOAP response.
+    /// NewPortMappingDescription is stored and cannot forge a line or an element.
     #[test]
     fn mapping_description_is_stored_and_safe() {
         // the parse drops control characters and bounds the length
@@ -5026,14 +4450,13 @@ mod tests {
             "the stored label is emitted escaped: {}",
             xml
         );
-        // the enumeration no longer invents a device string
+        // the enumeration answers with the stored label, not a device string
         assert!(
             !xml.contains("ds-lite-punch grant"),
             "the placeholder's device-authored description is gone"
         );
 
-        // the index round-trips the label, and a row from the earlier
-        // build (seven fields, no label) still restores its mapping
+        // the index round-trips the label, and a row from the earlier seven-field build still restores its mapping
         let line = entry_line(&e);
         assert!(
             line.ends_with('\n') && line.matches('\t').count() == 8,
@@ -5103,11 +4526,7 @@ mod tests {
             presence_misses: StdMutex::new(HashMap::new()),
         });
 
-        // the fragment is the spec's sample shape (2.3.25.2): a namespaced
-        // PortMappingList of PortMappingEntry elements, the invented
-        // element tree of the placeholder gone. It is the value of the
-        // NewPortListing OUT argument, so the argument element and its
-        // CDATA section wrap it (the shape the reference client reads).
+        // the fragment is the spec's sample shape: a namespaced PortMappingList, wrapped as NewPortListing
         let listing = facade
             .list_port_mappings(5000, 6000, Some(Proto::Udp), 0, None)
             .await
@@ -5136,8 +4555,7 @@ mod tests {
             listing.contains("<p:NewDescription></p:NewDescription>"),
             "an unlabelled mapping reports an empty description"
         );
-        // a query reports the lease remaining, not the granted one (2.4.6);
-        // the entry was seeded with roughly 3000 seconds left
+        // a query reports the lease remaining, not the granted one
         let open = "<p:NewLeaseTime>";
         let at = listing.find(open).expect("a lease tag") + open.len();
         let close = listing[at..].find("</p:NewLeaseTime>").expect("a lease close");
@@ -5161,8 +4579,7 @@ mod tests {
         assert_eq!(capped.matches("<p:PortMappingEntry>").count(), 1);
         assert!(capped.contains("<p:NewProtocol>UDP</p:NewProtocol>"));
 
-        // the range refusals the spec requires: 730 on an empty range for
-        // both range actions (2.5.19.2, 2.5.21.3)
+        // 730 on an empty range, for both range actions
         assert_eq!(
             facade.list_port_mappings(6001, 7000, None, 0, None).await,
             Err(UpnpErr::PortMappingNotFound)
@@ -5180,11 +4597,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn restored_grant_revoke_frees_socket() {
-        // Regression (review C1): main's slot loop skips granted leases in
-        // facade mode, so the facade must re-spawn respawn-restored grants
-        // AND register them, or delete_mapping/gc_loop abort nothing and
-        // the socket stays bound (the 2026-09-14 leak class, reachable
-        // through the documented respawn path).
+        // main's slot loop skips granted leases in facade mode, so the facade re-spawns and registers them.
         use crate::slot::GrantedRecord;
         use tokio::net::UdpSocket as TokioUdp;
 
@@ -5253,8 +4666,7 @@ mod tests {
             "restored-grant datapath tasks must be registered with the facade"
         );
 
-        // The control point deletes the restored mapping: the slot row, nft
-        // element and tasks must all go — the socket must be released.
+        // The control point deletes the restored mapping: the slot row, nft element and tasks must all go.
         facade
             .delete_mapping(8666, Proto::Udp, Ipv4Addr::LOCALHOST, None)
             .await
@@ -5274,10 +4686,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gena_initial_notify_advances_seq() {
-        // Regression (review S1): the initial NOTIFY carries eventKey 0 but
-        // the subscription's stored seq stayed 0, so the first change event
-        // re-sent 0 — a subscriber enforcing event-key monotonicity drops
-        // the first change. The initial delivery must advance the key.
+        // The initial delivery must advance the eventKey: a subscriber enforcing monotonicity drops a repeated 0.
         let l = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -5347,7 +4756,7 @@ mod tests {
         let (mut s2, _) = l.accept().await.unwrap();
         assert_eq!(seq_of_head(&mut s2).await, 2, "keys must be strictly increasing");
     }
-// ---- lease policy (2026-09-15): last-seen reaping ----
+// ---- lease policy: last-seen reaping ----
 
     fn policy_seed(client: Ipv4Addr, int_port: u16, silent_secs: u64) -> (LeaseTable, u16) {
         let now = Epoch::now();
@@ -5376,8 +4785,7 @@ mod tests {
             name: "lease-policy".into(),
             grace_secs: 60,
         };
-        // the seed's int port is unknown here; rebuild the entry from the
-        // slot so the reaped entry assertion has an index to check
+        // the seed's int port is unknown here; rebuild the entry from the slot so the assertion has an index
         let int_port = t.by_bind_port(port).unwrap().target_port;
         let entry = FacadeEntry {
             req_ext: int_port,
@@ -5413,9 +4821,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn backstop_reaps_silent_udp_grant() {
-        // a UDP grant whose client went silent past the 7-day backstop
-        // reaps on the sweep, whatever the pool state (the residue case:
-        // a vanished console's leftover mapping).
+        // a UDP grant silent past the 7-day backstop reaps on the sweep, whatever the pool state
         let client = Ipv4Addr::new(192, 168, 21, 50);
         let (t, port) = policy_seed(client, 3478, 700_000);
         let facade = policy_facade_table_and_entry(t, port, client).await;
@@ -5432,8 +4838,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stamp_client_prevents_backstop_reap() {
-        // any SOAP action from the client refreshes its grants' last-seen,
-        // so a client that keeps talking is never reaped.
+        // any SOAP action from the client refreshes its grants' last-seen, so a talking client is never reaped
         let client = Ipv4Addr::new(192, 168, 21, 50);
         let (t, port) = policy_seed(client, 3478, 700_000);
         let facade = policy_facade_table_and_entry(t, port, client).await;
@@ -5458,8 +4863,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn evict_candidate_reclaims_other_client_slot() {
-        // under pool pressure the facade reclaims the longest-idle grant
-        // of a DIFFERENT client (idle past the grace) and tears it down.
+        // under pool pressure the facade reclaims the longest-idle grant of a different client and tears it down
         let owner = Ipv4Addr::new(192, 168, 21, 50);
         let requester = Ipv4Addr::new(192, 168, 21, 51);
         let (t, port) = policy_seed(owner, 3478, 100_000); // idle past 24 h
@@ -5488,13 +4892,12 @@ mod tests {
         );
     }
 
-    // ---- plan/0008 discovery layer (R6 burst + versioned structure) ----
+    // ---- the discovery layer: burst debounce and versioned structure ----
 
     #[test]
     fn discovery_action_matrix() {
         use SearchTarget::*;
-        // gate off: the device presents the v1 facade only; v2 targets
-        // are not offered (an honest v1-only device)
+        // gate off: the device presents the v1 facade only, so v2 targets are not offered
         assert_eq!(discovery_action(All, false), DiscoveryAction::ReplyV1(All));
         assert_eq!(
             discovery_action(InternetGatewayDevice, false),
@@ -5506,8 +4909,7 @@ mod tests {
         );
         assert_eq!(discovery_action(InternetGatewayDevice2, false), DiscoveryAction::Ignore);
         assert_eq!(discovery_action(WanIpConnection2, false), DiscoveryAction::Ignore);
-        // gate on: ssdp:all defers into the burst (R6); v2 targets answer
-        // v2; v1 targets still answer v1 (R4)
+        // gate on: ssdp:all defers into the burst, v2 targets answer v2, v1 targets still answer v1
         assert_eq!(discovery_action(All, true), DiscoveryAction::DeferAll);
         assert_eq!(
             discovery_action(InternetGatewayDevice2, true),
@@ -5529,10 +4931,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn burst_resolves_v2_deadline_and_flip() {
-        // no :2 in the window: the v1 compatibility default answers at
-        // the deadline (seen_v2 ? v2 : v1, section 12). Short windows
-        // stand in for DISCOVERY_DEBOUNCE_MS to keep the test fast; the
-        // resolver is duration-parametric by design.
+        // no :2 in the window: the v1 default answers at the deadline; short windows keep the test fast
         let (_tx, rx) = watch::channel(false);
         let h = tokio::spawn(burst_resolves_v2(rx, Duration::from_millis(40)));
         assert!(!h.await.unwrap(), "no :2 -> v1 at the deadline");
@@ -5546,9 +4945,7 @@ mod tests {
 
     #[test]
     fn v2_builders_carry_the_surface() {
-        // the v2 service is real data (section 26.4 places DP under the
-        // root device; WIP2 under WANConnectionDevice:2), served only
-        // when the gate flips at #v2-service-set
+        // the v2 service is real data, served only when the mount gate is on
         let doc = root_desc_v2(Ipv4Addr::new(192, 168, 21, 1), 49152, "t", "udn-x");
         let s = String::from_utf8_lossy(&doc);
         assert!(s.contains("InternetGatewayDevice:2"));
@@ -5560,14 +4957,9 @@ mod tests {
         assert!(wip2.contains("AddAnyPortMapping"));
         assert!(wip2.contains("DeletePortMappingRange"));
         assert!(wip2.contains("GetListOfPortMappings"));
-        // the service assertions compare against the line-wrapped document
-        // with its layout removed, so they test the XML structure rather
-        // than the literal's formatting
+        // the assertions compare against the document with its layout removed, so they test the XML structure
         let wip2_flat: String = wip2.chars().filter(|c| !c.is_whitespace()).collect();
-        // the WIP2 transcription (docs/upnp-wip2/TRANSCRIPTION.md): the
-        // the fourteen actions the spec's table 2-10 marks REQUIRED of a
-        // device, each with its argument table, so a published
-        // description that names an action without describing it fails
+        // the fourteen actions the spec marks REQUIRED of a device, each with its argument table
         for (action, args) in [
             ("SetConnectionType", vec![("NewConnectionType", "in", "ConnectionType")]),
             (
@@ -5715,8 +5107,7 @@ mod tests {
         ] {
             assert!(!wip2.contains(bogus), "WIP2 SCPD must not carry {}", bogus);
         }
-        // table 2-9: exactly five variables are evented, and the evented
-        // pair of 2.4.4/2.4.5 is among them
+        // exactly five state variables are evented, and the evented mapping pair is among them
         for v in [
             "PossibleConnectionTypes",
             "ConnectionStatus",
@@ -5746,11 +5137,7 @@ mod tests {
             14,
             "the spec's table 2-10 marks fourteen actions REQUIRED of a device"
         );
-        // the seven OPTIONAL actions of table 2-10 are not implemented, so
-        // they must not be advertised: a device that published them would
-        // be promising a disconnect the ISP-managed line cannot make. A CP
-        // that invokes one gets 401 Invalid Action, which is the UDA
-        // answer for an action outside the published service.
+        // the seven OPTIONAL actions are not implemented, so they must not be advertised; invoking one is 401.
         for optional in [
             "RequestTermination",
             "SetAutoDisconnectTime",
@@ -5802,9 +5189,7 @@ mod tests {
             assert!(!dp.contains(a), "DP SCPD must not carry {}", a);
         }
         assert!(dp.contains("SetupReady"), "DP SetupReady state var");
-        // the state table transcription (TRANSCRIPTION.md, section 4
-        // reassembly): exactly SetupReady is evented; A_ARG_TYPE_Base64
-        // is bin.base64; the other six variables are non-evented strings
+        // exactly SetupReady is evented, A_ARG_TYPE_Base64 is bin.base64, the other six are non-evented strings
         assert!(
             dp.contains(
                 "<stateVariable sendEvents=\"yes\"><name>SetupReady</name><dataType>boolean</dataType></stateVariable>"
@@ -5827,9 +5212,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn versioned_doc_routing() {
-        // section 21: /igd/v1/* serves the v1 presentation, the legacy
-        // paths stay served, and /igd/v2/* serves the v2 presentation
-        // now that the mount gate is on (plan/0008 #v2-service-set).
+        // /igd/v1/* serves the v1 presentation, the legacy paths stay served, and /igd/v2/* serves the v2 one
         let cfg = UpnpConfig {
             lan_ip: Ipv4Addr::LOCALHOST,
             upnp_port: 0,
@@ -5894,10 +5277,7 @@ mod tests {
             ok,
             &body[..body.len().min(220)]
         );
-        // the mounted v2 root description: IGD:2, and (sections 26.4 and
-        // 26.11) DeviceProtection:1 beside WANIPConnection:2, since an
-        // IGD:2 facade without an enforced DeviceProtection service is the shortcut the
-        // plan forbids
+        // the mounted v2 root description: DeviceProtection:1 beside WANIPConnection:2 under IGD:2
         let (ok, body) = get("/igd/v2/rootDesc.xml").await;
         assert!(
             ok && body.contains("InternetGatewayDevice:2"),
@@ -5913,8 +5293,7 @@ mod tests {
         ] {
             assert!(body.contains(want), "the v2 root description carries {}", want);
         }
-        // the v2 service descriptions: the transcribed WIP2 actions (21
-        // actions) and the DeviceProtection actions (13)
+        // the v2 service descriptions: the transcribed WIP2 and DeviceProtection action sets
         let (ok, body) = get("/igd/v2/WANIPCn.xml").await;
         assert!(
             ok && body.contains("AddAnyPortMapping") && body.contains("DeletePortMappingRange"),
@@ -5939,11 +5318,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ssdp_loop_answers_the_mounted_surface() {
-        // section 24's discovery rows at the packet level: an explicit
-        // IGD:2 or WIP:2 search is answered from the v2 presentation, a
-        // v1 search from the v1 presentation, and a bare ssdp:all is
-        // deferred to the debounce deadline and answered from v1 unless a
-        // :2 search arrives inside the window (section 12)
+        // the discovery rows at the packet level: explicit :2 searches answer v2, a bare ssdp:all defers
         let cfg = UpnpConfig {
             lan_ip: Ipv4Addr::LOCALHOST,
             upnp_port: 0,
@@ -6036,10 +5411,7 @@ mod tests {
             resp
         );
 
-        // a bare ssdp:all is deferred, then answered from v1 because no
-        // :2 arrived inside the window. The deadline is the implementation
-        // parameter: the deferred answer goes out at receive + the debounce,
-        // with no further jitter (section 12 constraint 3).
+        // a bare ssdp:all is deferred and answered from v1 because no :2 arrived inside the window
         let t0 = std::time::Instant::now();
         probe.send_to(msearch("ssdp:all", "1").as_bytes(), addr).await.unwrap();
         let (n, _) = tokio::time::timeout(Duration::from_secs(5), probe.recv_from(&mut buf))
@@ -6048,9 +5420,7 @@ mod tests {
             .expect("recv ok");
         let waited = t0.elapsed();
         let resp = String::from_utf8_lossy(&buf[..n]);
-        // the deferred :all answer carries the root-device target, which
-        // is the UDA-appropriate response target for ssdp:all (section 24
-        // reads "ssdp:all/appropriate response targets")
+        // the deferred :all answer carries the root-device target, the UDA-appropriate one for ssdp:all
         assert!(resp.contains("ST: upnp:rootdevice\r\n"), "st: {}", resp);
         assert!(
             resp.contains("/igd/v1/rootDesc.xml"),
@@ -6063,9 +5433,7 @@ mod tests {
             waited
         );
 
-        // the same burst with an explicit :2 inside the window: both
-        // answers are the v2 presentation, and the deferred :all is
-        // released early
+        // the same burst with an explicit :2 inside the window: both answers are v2, and :all is released early
         probe.send_to(msearch("ssdp:all", "1").as_bytes(), addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         probe
@@ -6107,8 +5475,7 @@ mod ifindex_probe {
 
     #[test]
     fn lan_ifindex_localhost() {
-        // Regression: the zero-padded name handling once made every
-        // lookup return None under musl/getifaddrs.
+        // the zero-padded name must be cut at the first NUL or every lookup returns None under musl/getifaddrs
         assert!(
             lan_ifindex(Ipv4Addr::LOCALHOST).is_some(),
             "127.0.0.1 must resolve to lo's index via if_nametoindex"
@@ -6117,12 +5484,7 @@ mod ifindex_probe {
 
     #[test]
     fn ssdp_socket_is_nonblocking_cloexec() {
-        // Regression (2026-09-14, live wedge): bind_ssdp used to create a
-        // plain blocking UDP fd and hand it to tokio from_std, which only
-        // debug_asserts nonblocking (stripped in release). On the rig one
-        // worker parked inside the blocking recvfrom and the io-driver
-        // handoff degraded until the HTTP accept loop never woke. Guard
-        // the raw-fd flags that prevented that: SOCK_NONBLOCK|SOCK_CLOEXEC.
+        // The fd must be created SOCK_NONBLOCK|SOCK_CLOEXEC: tokio's from_std only debug-asserts nonblocking.
         let fd = unsafe {
             libc::socket(
                 libc::AF_INET,
@@ -6146,24 +5508,7 @@ mod ifindex_probe {
         );
     }
 
-    /// Local interop probe (ignored; needs the miniupnpc source at
-    /// `/tmp/localupnpc/miniupnpc` with `build/upnpc-static` and
-    /// `build/testigddescparse` built from it): serves the facade HTTP
-    /// layer on 127.0.0.1:19152 without any router, dumps both rootDesc
-    /// presentations for the reference IGD description parser, and drives
-    /// the real client's walks (v1 `-l`, v2 `-L`, and the v2 `-n` the
-    /// DeviceProtection boundary refuses) plus a GetCommonLinkProperties
-    /// SOAP against the live server.
-    ///
-    /// Build the fixture with:
-    ///   git clone --depth 1 https://github.com/miniupnp/miniupnp.git /tmp/localupnpc/miniupnp
-    ///   cp -r /tmp/localupnpc/miniupnp/miniupnpc /tmp/localupnpc/miniupnpc
-    ///   make -C /tmp/localupnpc/miniupnpc -j4 BUILD=build
-    ///   cmake -S /tmp/localupnpc/miniupnpc -B /tmp/localupnpc/cmt -DUPNPC_BUILD_TESTS=ON
-    ///   cmake --build /tmp/localupnpc/cmt --target testigddescparse -j4
-    ///   cp /tmp/localupnpc/cmt/testigddescparse /tmp/localupnpc/miniupnpc/build/
-    ///
-    /// Run with: cargo test -- --ignored miniupnpc_interop --nocapture
+    /// Local interop probe (ignored; needs miniupnpc at /tmp/localupnpc): the real client against a local facade.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs miniupnpc built at /tmp/localupnpc (off-router probe)"]
     async fn miniupnpc_interop() {
@@ -6190,10 +5535,7 @@ mod ifindex_probe {
             cfg,
             table,
             publisher,
-            // One entry for this loopback caller, so the reference client's
-            // IGD:2 listing walk parses a real mapping back rather than an
-            // empty PortMappingList. 3074 is at or above the containment
-            // floor, so a contained view still shows it.
+            // One entry for this loopback caller, so the client's IGD:2 listing walk parses a real mapping back
             entries: Mutex::new(vec![FacadeEntry {
                 req_ext: 3074,
                 proto: Proto::Udp,
@@ -6271,8 +5613,7 @@ mod ifindex_probe {
             text
         );
 
-        // The v2 presentation, driven by the same reference client. The
-        // description parser first, over both presentations.
+        // The v2 presentation, driven by the same reference client, the description parser first
         let doc_v2 = root_desc_v2(Ipv4Addr::LOCALHOST, 19152, "interop-facade", "interop-udn");
         std::fs::write("/tmp/rootdesc-v2.xml", &doc_v2).unwrap();
         for (label, path) in [
@@ -6296,8 +5637,7 @@ mod ifindex_probe {
             );
         }
 
-        // A direct SOAP probe of the same action, so the raw answer is
-        // visible whatever the reference client's walk reports.
+        // A direct SOAP probe of the same action, so the raw answer is visible whatever the client reports.
         let list_body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:GetListOfPortMappings xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:2\"><NewStartPort>1</NewStartPort><NewEndPort>65535</NewEndPort><NewProtocol>UDP</NewProtocol><NewManage>1</NewManage><NewNumberOfPorts>1000</NewNumberOfPorts></u:GetListOfPortMappings></s:Body></s:Envelope>";
         let listed = soap_post(
             "127.0.0.1:19152",
@@ -6307,8 +5647,7 @@ mod ifindex_probe {
         )
         .await;
         emitln!("=== direct GetListOfPortMappings (UDP) ===\n{}", listed);
-        // The wire shape: the fragment as the NewPortListing argument
-        // value, which is what a control point reads it from.
+        // The wire shape: the fragment as the NewPortListing argument value.
         assert!(
             listed.contains("<NewPortListing><![CDATA[<p:PortMappingList"),
             "the listing is carried as the NewPortListing argument value: {}",
@@ -6320,9 +5659,7 @@ mod ifindex_probe {
             listed
         );
 
-        // The v2 read path is not session-gated, so the reference client's
-        // IGD:2 listing walk must parse our PortMappingList, entry fields
-        // included.
+        // The v2 read path is not session-gated, so the client's listing walk must parse our PortMappingList.
         let out = std::process::Command::new("/tmp/localupnpc/miniupnpc/build/upnpc-static")
             .args(["-u", "http://127.0.0.1:19152/igd/v2/rootDesc.xml", "-L"])
             .output()
@@ -6330,10 +5667,7 @@ mod ifindex_probe {
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         emitln!("=== upnpc -L (v2) output ===\n{}", text);
-        // The walk asks for TCP first, which holds nothing and is 730 by
-        // the spec's rule (2.5.21), so the reference client reports that
-        // fault and then asks for UDP. The UDP pass is the one that must
-        // show our listing parsed, fields and all.
+        // The walk asks TCP first, which holds nothing and is 730, then UDP, whose pass must parse our listing.
         assert!(
             text.contains("730 (PortMappingNotFound)"),
             "the empty TCP range is the spec's fault, which the reference client \
@@ -6351,9 +5685,7 @@ mod ifindex_probe {
             text
         );
 
-        // The v2 write path is gated, and an empty DeviceProtection store
-        // holds no session, so the reference client's AddAnyPortMapping is
-        // refused with the boundary's own fault.
+        // The v2 write path is gated, and an empty store holds no session, so AddAnyPortMapping is refused.
         let out = std::process::Command::new("/tmp/localupnpc/miniupnpc/build/upnpc-static")
             .args([
                 "-u",
@@ -6376,8 +5708,7 @@ mod ifindex_probe {
         );
     }
 
-    /// A seeded DeviceProtection state for the wire tests: device id, one
-    /// Admin user, one Admin CP identity in the ACL.
+    /// A seeded DeviceProtection state: device id, one Admin user and one Admin CP identity in the ACL.
     fn dp_seeded() -> std::sync::Mutex<crate::dp::DpState> {
         let device_id: [u8; 16] = [0xdd; 16];
         let salt = [11u8; 16];
@@ -6415,8 +5746,7 @@ mod ifindex_probe {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// The DeviceProtection 26.19 boundary at the wire: the v2 WIP2 face
-    /// is gated behind the PKCS5 session; the v1 face is not.
+    /// The DeviceProtection boundary at the wire: the v2 WIP2 face is gated behind the PKCS5 session, v1 is not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dp_boundary_wire() {
         let cfg = UpnpConfig {
@@ -6440,9 +5770,7 @@ mod ifindex_probe {
             cfg,
             table,
             publisher,
-            // one entry belonging to another host, so the read containment
-            // has something to hide. It sits outside every port range this
-            // test drives, which keeps the empty-range refusals empty.
+            // one entry belonging to another host, so the read containment has something to hide
             entries: Mutex::new(vec![FacadeEntry {
                 req_ext: 20500,
                 proto: Proto::Udp,
@@ -6475,10 +5803,7 @@ mod ifindex_probe {
 
         let env = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:";
 
-        // the v2 SCPD carries the authoritative 13, not the superseded names
-        // (the R5 mount gate keeps /igd/v2/* unserved until the complete
-        // service set is complete, so the document itself is asserted here; the
-        // wired GET check lives with the gate-off integration harness)
+        // the v2 SCPD carries the authoritative thirteen, not the superseded miniupnpd-derived names
         let scpd = String::from_utf8_lossy(SCPD_DP.as_bytes());
         for name in [
             "SendSetupMessage",
@@ -6525,8 +5850,7 @@ mod ifindex_probe {
         .await;
         assert!(r.contains("<errorCode>606</errorCode>"), "unauth 606: {}", &r[..r.len().min(300)]);
 
-        // the v2 WIP2 boundary: AddPortMapping with the :2 URN is denied
-        // without a session ...
+        // the v2 WIP2 boundary: AddPortMapping with the :2 URN is denied without a session
         let mut r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -6538,10 +5862,7 @@ mod ifindex_probe {
             "v2 boundary denies unauth: {}",
             &r[..r.len().min(300)]
         );
-        // ... while the :1 face is not gated by DeviceProtection, its
-        // containment still refuses a request that names another host
-        // (2.5.16.2, section 26.22): this is the door the plan's policy
-        // item closes on the compatibility face.
+        // while the :1 face is not gated, its containment still refuses a request naming another host
         r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -6553,9 +5874,7 @@ mod ifindex_probe {
             "v1 refuses a door for another host: {}",
             &r[..r.len().min(300)]
         );
-        // ... and the same request naming the caller itself reaches the
-        // engine (which fails on nft here, 501), so the containment is the
-        // caller's address and not a blanket refusal of the v1 face
+        // and the same request naming the caller itself reaches the engine, so the refusal is the address clause
         r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -6568,10 +5887,7 @@ mod ifindex_probe {
             &r[..r.len().min(400)]
         );
 
-        // the containment covers reads as well as writes, on both faces
-        // (2.5.14.2, 2.5.21.3): another host's entry is forbidden rather
-        // than invisible-by-accident, and the enumeration's index space is
-        // what the caller may see, so its walk ends at index 0
+        // the containment covers reads as well as writes: another host's entry is forbidden, not invisible
         for face in ["1", "2"] {
             r = soap_post(
                 &addr,
@@ -6605,8 +5921,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // the full PKCS5 ceremony over the wire: challenge -> authenticator
-        // -> UserLogin; then the protected actions open
+        // the full PKCS5 ceremony: challenge, authenticator, UserLogin; then the protected actions open
         let r = soap_post(
             &addr,
             "/ctl/DP",
@@ -6674,8 +5989,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // the v2 mapping boundary now passes: the gate yields to the
-        // engine (which fails on nft here — but NOT with 606)
+        // the v2 mapping boundary now passes: the gate yields to the engine, which fails on nft here
         let mut r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -6688,8 +6002,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // the lift is the principal's roles, not the face's: walking the
-        // enumeration now reaches the other host's entry, on either face
+        // the lift is the principal's, not the face's: the enumeration reaches the other host's entry either way
         for face in ["1", "2"] {
             let mut reached = Vec::new();
             for i in 0..4 {
@@ -6732,9 +6045,7 @@ mod ifindex_probe {
                 ),
             )
             .await;
-            // The specific read is "mine" whether or not the session holds
-            // a lift (call/0022), so what a lifted caller gains is the
-            // enumeration: walking it must now reach the other host's entry.
+            // the specific read is "mine" with or without a lift, so what a lift gains is the enumeration
             assert!(
                 r.contains("<errorCode>714</errorCode>"),
                 "the :{} specific read stays the caller's own namespace: {}",
@@ -6743,10 +6054,7 @@ mod ifindex_probe {
             );
         }
 
-        // the v2 range actions answer the spec's own 7xx codes rather than
-        // a generic failure: an empty range is 730 PortMappingNotFound
-        // (2.5.19.2, 2.5.21.3) and a crossed range is 733
-        // InconsistentParameters (2.5.19.6, 2.5.21.7)
+        // the v2 range actions answer the spec's own 7xx codes: 730 on an empty range and 733 on a crossed one
         let r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -6780,12 +6088,7 @@ mod ifindex_probe {
             "a crossed range is 733: {}",
             &r[..r.len().min(300)]
         );
-        // the AddAnyPortMapping wildcard asks for any free port rather than
-        // being a malformed request: it reaches the engine (which allocates
-        // 1024 from the wildcard and then fails on nft here, 501) where the
-        // placeholder answered 402 without consulting anything. The in-LAN
-        // client is this test's loopback LAN, so the engine's own
-        // containment check is not what refuses it.
+        // the AddAnyPortMapping wildcard reaches the engine rather than being malformed, and allocates 1024
         let r = soap_post(
             &addr,
             "/ctl/IPConn",
@@ -6860,8 +6163,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // SendSetupMessage: unsupported ProtocolType 600; WPS 704 (no
-        // registrar on a wired IGD)
+        // SendSetupMessage: an unsupported ProtocolType is 600, a WPS message 704, since no registrar runs here
         let r = soap_post(
             &addr,
             "/ctl/DP",
@@ -6890,7 +6192,7 @@ mod ifindex_probe {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dp_config_persistence_wire() {
-        // 26.15: users + ACL persist across a restart; sessions do not.
+        // users and ACL persist across a restart; sessions do not
         let dir = "/tmp/dp-wire-state";
         let _ = std::fs::remove_dir_all(dir);
         let device_id: [u8; 16] = [0xee; 16];
@@ -6920,13 +6222,7 @@ mod ifindex_probe {
         assert_eq!(reloaded.session_roles("192.168.21.5".parse().unwrap(), 2000).len(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
-    /// The connection-control actions of the required WANIPConnection:2
-    /// service at the wire: the auto-configured line answers
-    /// SetConnectionType with 731 ReadOnly, reports NAT on and RSIP off,
-    /// refuses ForceTermination instead of handing every LAN client a
-    /// lever on the household line, and treats RequestConnection as the
-    /// success it is while the external tuple is present, with 704
-    /// ConnectionSetupFailed when it is not.
+    /// The connection-control actions at the wire: SetConnectionType 731, NAT 1, RSIP 0, ForceTermination 501.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn wip2_connection_actions_wire() {
         let cfg = UpnpConfig {
@@ -6972,8 +6268,7 @@ mod ifindex_probe {
         let addr_s = format!("127.0.0.1:{}", addr.port());
         let env = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:";
         let urn = "urn:schemas-upnp-org:service:WANIPConnection:2";
-        // SetConnectionType: the connection type is auto-configured and
-        // therefore read-only (2.5.1), so the answer is the spec's 731
+        // SetConnectionType: the connection type is auto-configured and therefore read-only, so 731
         let r = soap_post(
             &addr_s,
             "/ctl/IPConn",
@@ -7008,8 +6303,7 @@ mod ifindex_probe {
             &r[..r.len().min(500)]
         );
 
-        // RequestConnection while the tuple is present: the precondition
-        // and the effect of 2.5.3 both already hold, so it succeeds
+        // RequestConnection while the tuple is present: precondition and effect already hold, so it succeeds
         let r = soap_post(
             &addr_s,
             "/ctl/IPConn",
@@ -7023,8 +6317,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // ForceTermination is refused: the facade does not own the WAN
-        // lifetime, and the v1 face would let any LAN device drop it
+        // ForceTermination is refused: the facade does not own the WAN lifetime, so no LAN device may drop it
         let r = soap_post(
             &addr_s,
             "/ctl/IPConn",
@@ -7038,8 +6331,7 @@ mod ifindex_probe {
             &r[..r.len().min(300)]
         );
 
-        // the same service with no external tuple: RequestConnection now
-        // reports the provider-side failure the spec names for it
+        // the same service with no external tuple: RequestConnection reports the provider-side failure it names
         let mut f3 = UpnpFacade {
             cfg: UpnpConfig {
                 lan_ip: Ipv4Addr::LOCALHOST,
@@ -7095,7 +6387,7 @@ mod ifindex_probe {
         );
     }
 
-    // ---- the evented state variables (call/0025, plan/0009 #signal) ----
+    // ---- the evented state variables (call/0025) ----
 
     fn ev(ip: &str, entries: u16, update_id: u32) -> EventView {
         EventView::new(ip.parse().unwrap(), entries, update_id)
@@ -7207,8 +6499,7 @@ mod ifindex_probe {
         assert_eq!(discovery_verdict(600, true), None, "a known tuple is never an error");
     }
 
-    /// plan/0009 #signal, end to end: a real subscription over a real socket,
-    /// told exactly what changed and scoped to its own namespace alone.
+    /// A subscription over a real socket, told exactly what changed and scoped to its own namespace alone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_subscriber_is_told_about_its_own_mappings_only() {
         let l = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -7257,9 +6548,7 @@ mod ifindex_probe {
             .await
             .expect("subscribe with a reachable callback");
 
-        // read_head returns everything its own read took, head *and* body
-        // when the NOTIFY arrived in one segment, so the body is taken from
-        // that buffer first and only the remainder from the socket.
+        // read_head takes head and body together, so take the body from its buffer first, then the socket
         async fn body_of(stream: &mut TcpStream) -> String {
             let raw = read_head(stream).await.expect("notify head");
             let (head, rest) = split_head(&raw).expect("head terminator");
@@ -7275,8 +6564,7 @@ mod ifindex_probe {
             String::from_utf8_lossy(&body[..want.min(body.len())]).into_owned()
         }
 
-        // the initial event carries every declared variable, and the count is
-        // the subscriber's own namespace alone
+        // the initial event carries every declared variable, and the count is the subscriber's own namespace
         let (mut s0, _) = l.accept().await.unwrap();
         let first = body_of(&mut s0).await;
         assert!(first.contains("ConnectionStatus"), "{}", first);
@@ -7309,8 +6597,7 @@ mod ifindex_probe {
         assert!(third.contains("<ExternalIPAddress>87.116.31.223</ExternalIPAddress>"), "{}", third);
     }
 
-    /// plan/0009 #pcp, end to end over a real socket: the announcements, the
-    /// refusals the RFC names, and the NAT-PMP subset that shares the port.
+    /// The shared port end to end over a real socket: the announcements, the RFC refusals and the NAT-PMP subset.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_shared_port_answers_announce_and_names_its_refusals() {
         let a = Ipv4Addr::new(127, 0, 0, 1);
@@ -7469,11 +6756,7 @@ mod ifindex_probe {
         );
     }
 
-    /// A revoked mapping takes its tuple file with it (found on the box,
-    /// 2026-09-17: slots 40003-40005 carried dead tuples from mappings long
-    /// gone, and a fresh grant that took one of those ports was answered
-    /// with the dead tuple). The file is the *learned* tuple, so a file that
-    /// outlives its mapping is a lie a client can act on.
+    /// A revoked mapping takes its tuple file with it: the file is the learned tuple, so outliving it is a lie.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_revoked_mapping_takes_its_tuple_file_with_it() {
         let a = Ipv4Addr::new(127, 0, 0, 1);

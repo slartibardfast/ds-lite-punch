@@ -1,45 +1,28 @@
-//! UPnP IGDv1 facade core (plan/0007 phase E, E1/E3/E5/E7): the pure,
-//! Kani-provable layer — the SSDP M-SEARCH grammar, SOAP request
-//! classification with POST/M-POST parity, the UPnP grant-enumeration
-//! index math, and the GENA subscription machine (SID discipline,
-//! eventKey). The runtime service (sockets, nft grants, datapaths,
-//! description docs) lives in `upnpsvc.rs`.
-//!
-//! Kani scope (E7): the SSDP grammar, SOAP dispatch and fault paths,
-//! enumeration index bounds, SID/SEQ. The heap-formatting helpers
-//! (response builders, `http_date`) are unit-tested only — the crate's
-//! documented Kani non-goal class (String/`format!` stalls the solver),
-//! the same call persist.rs makes for tsv ordering.
-//!
-//! All scanners below are single-pass over `&[u8]` with explicit index
-//! loops — no allocation, no iterator closures — so CBMC unrolls them
-//! cheaply on the bounded proof buffers.
+//! UPnP IGDv1 facade core: the pure, alloc-free layer the Kani proofs run over (`upnpsvc.rs` is the runtime).
 
 use std::net::Ipv4Addr;
 
 use crate::slot::Proto;
 
-// ---- constants (E2/E1/E5) ----
+// ---- constants ----
 
 pub const SSDP_MCAST: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 pub const SSDP_PORT: u16 = 1900;
 pub const UPNP_DEFAULT_PORT: u16 = 49152;
-/// The br-lan address the HTTP service and SSDP membership bind
-/// (default; `--lan-ip` overrides).
+/// The br-lan address the HTTP service and SSDP membership bind (`--lan-ip` overrides).
 pub const DEFAULT_LAN_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 21, 1);
 /// SSDP CACHE-CONTROL max-age (s); the alive NOTIFY interval is max-age/2.
 pub const SSDP_MAX_AGE: u32 = 1800;
 pub const SSDP_ALIVE_PERIOD_S: u64 = 900;
 /// The SOAP envelope namespace every M-POST MAN header must name.
 pub const SOAP_NS: &[u8] = b"http://schemas.xmlsoap.org/soap/envelope/";
-/// Request head/body cap (E8 hardening; UPnP request bodies are small).
+/// Request head/body cap; UPnP request bodies are small.
 pub const HTTP_CAP: usize = 8192;
-/// GENA bounds (E5/E8): subscriptions, callback URL length, timeout cap.
+/// GENA bounds: subscriptions, callback URL length, timeout cap.
 pub const MAX_GENA_SUBS: usize = 8;
 pub const GENA_CB_MAX: usize = 256;
 pub const GENA_TIMEOUT_CAP: u32 = 1800;
-/// A lease of 0 is "infinite" (E3): modeled as the max lifetime; the
-/// engine keeps the slot alive (self-refresh) so it never expires.
+/// A lease of 0 is "infinite": the max lifetime, kept from expiring by the engine's self-refresh.
 pub const INFINITE_LEASE: u32 = u32::MAX;
 
 /// The SERVER header product line (SSDP + HTTP responses).
@@ -92,9 +75,7 @@ fn strip_quotes(s: &[u8]) -> &[u8] {
     }
 }
 
-/// Single-pass header lookup: the value of the first header whose key
-/// equals `key` (case-insensitive), skipping the request line. Lines end
-/// at `\n`; a trailing `\r` is stripped; keys are matched on `KEY: value`.
+/// The value of the first header whose key matches `key` case-insensitively, skipping the request line.
 pub fn find_header<'a>(head: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     let n = head.len();
     let mut i = 0usize;
@@ -121,8 +102,7 @@ pub fn find_header<'a>(head: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// True when any header line has key `key` and its (trimmed) value
-/// contains `needle` (case-insensitive).
+/// True when any header's value for `key` contains `needle`, case-insensitively.
 pub fn header_contains(head: &[u8], key: &[u8], needle: &[u8]) -> bool {
     match find_header(head, key) {
         Some(v) => contains_ia(v, needle),
@@ -145,10 +125,9 @@ fn contains_ia(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-// ---- SSDP (E1) ----
+// ---- SSDP ----
 
-/// The v1 search targets plus `ssdp:all`. `All` is answered with the
-/// root-device advertisement (the entry that links the full description).
+/// The v1 search targets plus `ssdp:all`, which is answered with the root-device advertisement.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SearchTarget {
     RootDevice,
@@ -210,8 +189,7 @@ pub fn parse_st(bytes: &[u8]) -> Option<SearchTarget> {
     None
 }
 
-/// The ST token to echo in a response (the request's target, with `All`
-/// answering as the root device).
+/// The ST token to echo for a request's target; `ssdp:all` echoes `upnp:rootdevice`.
 pub fn st_name(st: SearchTarget) -> &'static [u8] {
     match st {
         SearchTarget::RootDevice | SearchTarget::All => b"upnp:rootdevice",
@@ -243,9 +221,7 @@ pub enum MSearchParse {
     Malformed,
 }
 
-/// Parse an M-SEARCH datagram body: the request line plus MAN/MX/ST
-/// headers. Tolerates CRLF and bare LF; keys are case-insensitive; MX
-/// capped at 5 per the SSDP recommended max response delay.
+/// Parse an M-SEARCH datagram: MAN/MX/ST headers, CRLF or bare LF, MX capped at 5.
 pub fn parse_msearch(buf: &[u8]) -> MSearchParse {
     let n = buf.len();
     let mut i = 0usize;
@@ -316,9 +292,7 @@ fn parse_u8(s: &[u8]) -> u8 {
 /// The UDN suffix of a location path: "uuid:" + 36 hex-with-dash bytes.
 pub const UDN_LEN: usize = 41; // "uuid:" (5) + 36
 
-/// Build a 36-byte UUID hex form ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-/// from 16 bytes, with the version/variant nibbles already set by the
-/// caller's PRNG.
+/// Render 16 bytes as the 36-byte dashed UUID hex form, version/variant nibbles as given.
 pub(crate) fn uuid_hex(b: &[u8; 16]) -> [u8; 36] {
     let hex = b"0123456789abcdef";
     let mut out = [0u8; 36];
@@ -340,8 +314,7 @@ pub(crate) fn uuid_hex(b: &[u8; 16]) -> [u8; 36] {
     out
 }
 
-/// Parse a SID/uuid in its wire form with the "uuid:" prefix (36 hex
-/// bytes with dashes, or 32 raw hex bytes without).
+/// Parse a SID in wire form: an optional `uuid:` prefix, then 36 dashed or 32 raw hex bytes.
 pub fn sid_from_bytes(b: &[u8]) -> Option<Sid> {
     let core = strip_quotes(trim(b));
     let core = match core.strip_prefix(b"uuid:") {
@@ -391,15 +364,14 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-// ---- GENA (E5) ----
+// ---- GENA ----
 
 /// A subscription ID: 16 random-byte UUID. Copy; equality is bytewise.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Sid(pub [u8; 16]);
 
 impl Sid {
-    /// UUIDv4-style from a caller-provided 16-byte source (the service
-    /// seeds from the clock); sets the version/variant nibbles.
+    /// UUIDv4 from 16 caller bytes: the version nibble 4 and the variant bits 0b10.
     pub fn v4(b: &[u8; 16]) -> Sid {
         let mut o = *b;
         o[6] = (o[6] & 0x0f) | 0x40;
@@ -420,16 +392,12 @@ impl Sid {
     }
 }
 
-/// The GENA eventKey advance: per subscription, starts at 0 with the
-/// initial NOTIFY and wraps at 2^32 (documented; UPnP eventKey is a
-/// 32-bit counter).
+/// The eventKey advance: starts at 0 with the initial NOTIFY and wraps at 2^32.
 pub fn advance_seq(seq: u32) -> u32 {
     seq.wrapping_add(1)
 }
 
-/// Bounded set of live subscription SIDs — the Kani object for the E5 SID
-/// discipline: capacity, uniqueness, add/remove. The runtime GenaState in
-/// `upnpsvc.rs` stores the full subscriptions and mirrors membership here.
+/// The bounded set of live subscription SIDs the SID-discipline proofs run over.
 #[derive(Clone, Copy, Debug)]
 pub struct SidSet {
     sids: [Option<Sid>; MAX_GENA_SUBS],
@@ -491,15 +459,9 @@ impl Default for SidSet {
     }
 }
 
-// ---- SOAP (E3) ----
+// ---- SOAP ----
 
-/// The services the facade answers: the two WAN connection services
-/// (the PPP alias answers identically to IP), the
-/// WANCommonInterfaceConfig service every IGD control point requires the
-/// root device to advertise before it validates the device (miniupnpc's
-/// GetValidIGD marks a device as an IGD only when its rootDesc carries
-/// `urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1`), and
-/// DeviceProtection:1 (plan/0008 #v2-service-set).
+/// The four services answered: the two WAN connection services, WANCommonInterfaceConfig:1 and DeviceProtection:1.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoapService {
     WanIpConnection,
@@ -508,19 +470,13 @@ pub enum SoapService {
     DeviceProtection,
 }
 
-/// The service URN for SOAP responses and SCPD references. For the
-/// connection service the URN's version follows the invocation's own
-/// version attribution (a `:2` SOAPACTION gets a `:2` envelope): use
-/// [`service_urn_v`].
+/// The v1 service URN; `service_urn_v` follows the invocation's own version attribution.
 #[allow(dead_code)] // the v1 envelope builder, exercised by the test suite
 pub fn service_urn(s: SoapService) -> &'static [u8] {
     service_urn_v(s, false)
 }
 
-/// The response-envelope service URN for an invocation, honouring the
-/// version attribution carried in the SOAPACTION (`v2` picks the
-/// WANIPConnection:2 URN; plan/0008's version-specific SOAP semantics version-specific SOAP
-/// semantics).
+/// The response envelope's service URN: a `:2` SOAPACTION is answered in the WANIPConnection:2 URN.
 pub fn service_urn_v(s: SoapService, v2: bool) -> &'static [u8] {
     match s {
         SoapService::WanIpConnection if v2 => b"urn:schemas-upnp-org:service:WANIPConnection:2",
@@ -554,18 +510,13 @@ pub fn service_of_path(path: &[u8]) -> Option<SoapService> {
     None
 }
 
-/// The IGDv1 actions the facade honours (E3): the WANIPConnection:1 set,
-/// plus GetCommonLinkProperties on the WANCommonInterfaceConfig:1 service.
-/// DeviceProtection:1's thirteen actions (the authoritative set,
-/// docs/upnp-dp1/TRANSCRIPTION.md) and the WANIPConnection:2-only actions
-/// use the same table (plan/0008 #v2-service-set).
+/// The actions honoured: the WANIPConnection set, the v2-only range actions and DeviceProtection's thirteen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SoapAction {
     GetExternalIpAddress,
     GetStatusInfo,
     GetConnectionTypeInfo,
-    // the rest of the WANIPConnection:2 required actions (table 2-10's
-    // R column): the connection control actions and the RSIP/NAT report
+    // the connection control actions and the RSIP/NAT report, before the v2-only and DP variants
     SetConnectionType,
     RequestConnection,
     ForceTermination,
@@ -579,7 +530,7 @@ pub enum SoapAction {
     AddAnyPortMapping,
     DeletePortMappingRange,
     GetListOfPortMappings,
-    // DeviceProtection:1 (the authoritative 13; 2.6.1-2.6.13)
+    // DeviceProtection:1's thirteen actions (the authoritative set)
     SendSetupMessage,
     GetSupportedProtocols,
     GetAssignedRoles,
@@ -628,8 +579,7 @@ pub fn soap_action_name(a: SoapAction) -> &'static [u8] {
     }
 }
 
-/// Parse an action out of a SOAPACTION header value: everything after the
-/// final `#`, unquoted. Action names are case-sensitive per UPnP.
+/// The action name after the final `#` of a SOAPACTION value, unquoted; names are case-sensitive.
 pub fn parse_soap_action(hdr: &[u8]) -> Option<SoapAction> {
     let v = strip_quotes(trim(hdr));
     let mut hash: Option<usize> = None;
@@ -680,10 +630,7 @@ pub fn parse_soap_action(hdr: &[u8]) -> Option<SoapAction> {
     None
 }
 
-/// The version attribution of a SOAPACTION value: true when the service
-/// URN before the `#` names WANIPConnection:2 (plan/0008's version-specific SOAP semantics: the
-/// version lives in the invocation's service type, since the v1 and v2
-/// control URLs are shared).
+/// True when the SOAPACTION's service URN is WANIPConnection:2 (the control URLs are shared, the URN decides).
 pub fn soapaction_is_v2(v: &[u8]) -> bool {
     let v = strip_quotes(trim(v));
     let mut hash: Option<usize> = None;
@@ -700,11 +647,7 @@ pub fn soapaction_is_v2(v: &[u8]) -> bool {
     eq_ia(urn, b"urn:schemas-upnp-org:service:WANIPConnection:2")
 }
 
-/// The envelope-namespace prefix (the `ns=NN` token) of an M-POST MAN
-/// header, or None when the MAN header is absent or names a foreign
-/// namespace. The action then uses the `<NN>SOAPACTION` header. The MAN
-/// value is `"<envelope-ns>";ns=NN`: only the URL is quoted, so a leading
-/// quote is dropped before the prefix match.
+/// The `ns=NN` token of an M-POST MAN header naming our envelope namespace; only the URL is quoted.
 pub fn mpost_ns(head: &[u8]) -> Option<&[u8]> {
     let raw = find_header(head, b"MAN")?;
     let mut v = trim(raw);
@@ -756,22 +699,18 @@ pub fn find_ns_soapaction<'a>(head: &'a [u8], ns: &[u8]) -> Option<&'a [u8]> {
     find_header(head, &key[..start + suf.len()])
 }
 
-/// Request-head classification: the pure dispatch decision (E3 dispatch,
-/// E7 "SOAP dispatch and fault paths"). `head` = request line + headers.
+/// Request-head classification: the pure dispatch decision over the request line and headers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReqClass {
     /// A description-document GET.
     Get,
-    /// A SOAP invocation; the action table is shared between the two
-    /// services (the alias answers identically). `v2` is the service
-    /// version attribution from the SOAPACTION URN (the version-specific
-    /// SOAP semantics: the v1/v2 control URLs are shared, so the URN decides).
+    /// A SOAP invocation; `v2` is the version attribution read from the SOAPACTION URN.
     Soap {
         service: SoapService,
         action: SoapAction,
         v2: bool,
     },
-    /// GENA control messages (E5).
+    /// GENA control messages.
     GenaSubscribe,
     GenaRenew,
     GenaUnsubscribe,
@@ -781,8 +720,7 @@ pub enum ReqClass {
     NotFound,
 }
 
-/// Classify a request head. POST/M-POST with equivalent SOAPACTION values
-/// classify identically (the parity property proven in Kani).
+/// Classify a request head; equivalent POST and M-POST requests classify identically.
 pub fn classify(head: &[u8]) -> ReqClass {
     let n = head.len();
     let mut i = 0usize;
@@ -808,10 +746,7 @@ pub fn classify(head: &[u8]) -> ReqClass {
         if eq_ia(path, b"/") || eq_ia(path, b"/rootDesc.xml")
             || eq_ia(path, b"/WANIPC.xml") || eq_ia(path, b"/WANPPP.xml")
             || eq_ia(path, b"/WANCfg.xml")
-            // plan/0008's LOCATION design: the deterministic versioned URLs
-            // (the v2 prefix is recognized even while the mount gate is
-            // off; the per-route 404 then comes from the router's None
-            // arm, so a gated path is a clean not-offered response)
+            // the versioned v1/v2 prefixes are recognized even while the mount gate is off; a gated path 404s
             || starts_with_ia(path, b"/igd/v1/")
             || starts_with_ia(path, b"/igd/v2/")
         {
@@ -842,13 +777,7 @@ pub fn classify(head: &[u8]) -> ReqClass {
     if !is_post && !is_mpost {
         return ReqClass::NotFound;
     }
-    // GENA first: NT/CALLBACK marks a subscribe; a SID marks renewal.
-    // Applied to BOTH transports: an M-POST carrying these markers must
-    // dispatch exactly as POST does (E3 same-dispatch parity). A marker
-    // consulted only by the POST branch made the transports diverge on a
-    // request whose head fabricates a marker line (a quoted value spanning
-    // several lines) — see the mpost_post_parity harness and
-    // soap_classify_mpost_parity's multi-line corners.
+    // the GENA markers run on POST and M-POST alike, so both transports dispatch the same way
     if header_contains(head, b"NT", b"upnp:event") && find_header(head, b"CALLBACK").is_some() {
         return ReqClass::GenaSubscribe;
     }
@@ -858,8 +787,7 @@ pub fn classify(head: &[u8]) -> ReqClass {
     let soapaction = if is_post {
         find_header(head, b"SOAPACTION")
     } else {
-        // M-POST parity: the MAN namespace selects the service; the action
-        // uses the <ns>SOAPACTION header — same action table as POST.
+        // M-POST: the MAN namespace selects the service and the action comes from <ns>SOAPACTION
         let Some(ns) = mpost_ns(head) else {
             return ReqClass::SoapInvalidAction;
         };
@@ -871,9 +799,7 @@ pub fn classify(head: &[u8]) -> ReqClass {
     let Some(action) = parse_soap_action(soapaction) else {
         return ReqClass::SoapInvalidAction;
     };
-    // The version attribution is read from the SAME soapaction value in
-    // both transports, so the POST/M-POST parity property holds for the
-    // new field exactly as for the action.
+    // the version attribution comes from the same SOAPACTION value in both transports, keeping parity
     let v2 = soapaction_is_v2(soapaction);
     match service_of_path(path) {
         Some(service) => ReqClass::Soap { service, action, v2 },
@@ -881,10 +807,9 @@ pub fn classify(head: &[u8]) -> ReqClass {
     }
 }
 
-// ---- faults (E3/E7) ----
+// ---- faults ----
 
-/// The error outcomes an action handler can return; `fault_of` maps them
-/// to the IGDv1 SOAP fault table (proven total in Kani).
+/// The error outcomes a handler returns; `fault_of` maps them to the SOAP fault table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UpnpErr {
     /// 401 Invalid Action (action not honoured on the addressed service).
@@ -895,30 +820,21 @@ pub enum UpnpErr {
     NoSuchEntry,
     /// 501 Action Failed (quota, table full, datapath failure).
     ActionFailed,
-    /// 730 PortMappingNotFound (DeviceProtection is not the only service
-    /// with a 7xx table; this is WANIPConnection:2's own code for a range
-    /// action that found nothing, sections 2.5.19.6 and 2.5.21.7).
+    /// 730 PortMappingNotFound: WANIPConnection:2's code for a range action that found nothing.
     PortMappingNotFound,
-    /// 733 InconsistentParameters (the range endpoints disagree, the same
-    /// sections 2.5.19.6 and 2.5.21.7).
+    /// 733 InconsistentParameters: the range endpoints disagree (a start above the end).
     InconsistentParameters,
-    /// 731 ReadOnly (the connection type is auto-configured, so
-    /// SetConnectionType cannot set it: 2.5.1's read-only note, and the
-    /// code the error summary of 2.5.23 names for that action).
+    /// 731 ReadOnly: the connection type is auto-configured, so SetConnectionType cannot set it.
     ReadOnly,
-    /// 704 ConnectionSetupFailed (WANIPConnection's own reading of 704,
-    /// 2.5.3.6; the code is shared with DeviceProtection's Processing
-    /// Error, and the description is the service's).
+    /// 704 ConnectionSetupFailed; the code is shared with DeviceProtection's Processing Error.
     ConnectionSetupFailed,
-    /// 600 Argument Value Invalid (DeviceProtection: 2.6.15).
+    /// 600 Argument Value Invalid (DeviceProtection).
     InvalidValue,
-    /// 606 Action not authorized (DeviceProtection: 2.6.5.10 and the
-    /// admin-action error tables; the DP-defined authorization fault per
-    /// plan/0008's error handling).
+    /// 606 Action not authorized: DeviceProtection's own code for an action the roles refuse.
     NotAuthorized,
-    /// 701 Authentication Failure (DeviceProtection: 2.6.6.9).
+    /// 701 Authentication Failure (DeviceProtection).
     AuthFailure,
-    /// 704 Processing Error (DeviceProtection: 2.6.1.9).
+    /// 704 Processing Error (DeviceProtection).
     Processing,
 }
 
@@ -993,12 +909,9 @@ pub fn fault_of(e: UpnpErr) -> UpnpFault {
     }
 }
 
-// ---- enumeration (E3/E7) ----
+// ---- enumeration ----
 
-/// The control-point view of one granted mapping, keyed by the requested
-/// external port (the "report-requested" premise: the AFTR dictates the
-/// real external tuple, discovered via STUN; the request is the key so
-/// delete/enumerate are symmetric with add).
+/// One granted mapping as a control point sees it, keyed by the requested port (the AFTR dictates the real tuple).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct UpnpKey {
     pub req_ext: u16,
@@ -1007,9 +920,7 @@ pub struct UpnpKey {
     pub int_port: u16,
 }
 
-/// Index into a stable (sorted) enumeration: in range iff the index is
-/// below the length; out-of-range returns None without arithmetic edge
-/// cases. Kani: never indexes out of bounds; Some implies index < len.
+/// Index into a stable sorted enumeration: Some exactly when the index is below the length.
 pub fn entry_at(entries: &[UpnpKey], index: u32) -> Option<UpnpKey> {
     let i = index as usize;
     if i < entries.len() {
@@ -1021,8 +932,7 @@ pub fn entry_at(entries: &[UpnpKey], index: u32) -> Option<UpnpKey> {
 
 // ---- XML arg extraction (runtime; unit-tested, Kani non-goal) ----
 
-/// First index of `needle` in `hay`, or None — the scanner's marker
-/// search for `-->` / `]]>` (allocation-free).
+/// First index of `needle` in `hay`, or None; the marker search for `-->` / `]]>`.
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -1030,16 +940,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Extract the text of the first element named exactly `tag` (a minimal
-/// XML scanner: `<tag>value</tag>`; tolerant of leading/trailing
-/// whitespace in the value, and of comments / CDATA around it). Borrowed,
-/// allocation-free.
-///
-/// Scope boundary: comments and CDATA LITERALLY inside the value (``3<!--
-/// x -->074``) and nested same-name elements still fail closed at the
-/// caller's parse (402) — the scanner does not implement the full XML
-/// text model; a real parser (quick-xml) is the escalation if a control
-/// point ever needs it.
+/// The text of the first element named exactly `tag`; comments, CDATA or nesting inside the value fail closed.
 pub fn xml_tag<'a>(body: &'a [u8], tag: &[u8]) -> Option<&'a [u8]> {
     let n = body.len();
     let mut i = 0usize;
@@ -1064,8 +965,7 @@ pub fn xml_tag<'a>(body: &'a [u8], tag: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// Find the `</tag>` closer — skipping comment and CDATA spans, whose
-/// contents are not element text — and return the value text before it.
+/// The value text before the `</tag>` closer, skipping comment and CDATA spans.
 fn find_close<'a>(rest: &'a [u8], tag: &[u8]) -> Option<&'a [u8]> {
     let n = rest.len();
     let cl = 2 + tag.len() + 1; // `</tag>`
@@ -1107,10 +1007,7 @@ fn rfind_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).rposition(|w| w == needle)
 }
 
-/// Trim surrounding whitespace and a leading CDATA wrapper / trailing
-/// comment from a scanned value. A CDATA span is unwrapped ONLY when it
-/// is the whole value: a span with text outside it (``<![CDATA[30]]>74``)
-/// stays whole so the caller's parse rejects it — never a partial accept.
+/// Trim whitespace and a whole-value CDATA wrapper; a partial CDATA span stays whole so the parse rejects it.
 fn unwrap_value(mut v: &[u8]) -> &[u8] {
     loop {
         v = trim(v);
@@ -1178,9 +1075,7 @@ pub fn http_date(unix: u64) -> String {
     )
 }
 
-/// One SSDP M-SEARCH response (unicast to the requester). `loc_path`
-/// is the versioned description URL path (plan/0008's LOCATION design), e.g.
-/// `/igd/v1/rootDesc.xml` for the v1 presentation.
+/// One SSDP M-SEARCH response, unicast to the requester, with the given description path.
 pub fn msearch_response(
     st: SearchTarget,
     udn: &str,
@@ -1204,8 +1099,7 @@ pub fn msearch_response(
     out.into_bytes()
 }
 
-/// One SSDP NOTIFY advertisement (alive or byebye), multicast. `loc_path`
-/// is the versioned description URL path (plan/0008's LOCATION design).
+/// One SSDP NOTIFY advertisement (alive or byebye), multicast.
 pub fn notify_payload(
     st: SearchTarget,
     nts: &[u8],
@@ -1232,17 +1126,13 @@ pub fn notify_payload(
     out.into_bytes()
 }
 
-/// A 200 OK SOAP envelope carrying `inner` (the action-specific response
-/// element text, without the envelope). The response namespace matches the
-/// service the request addressed (IP or PPP alias).
+/// A 200 OK SOAP envelope carrying the action's response element, in the service's own namespace.
 #[allow(dead_code)] // the v1 envelope builder, exercised by the test suite
 pub fn soap_success(service: SoapService, action: &str, inner: &str) -> Vec<u8> {
     soap_success_v(service, false, action, inner)
 }
 
-/// [`soap_success`] honouring the invocation's version attribution: a v2
-/// WANIPConnection invocation is answered from the `:2` namespace
-/// (plan/0008's version-specific SOAP semantics).
+/// [`soap_success`] honouring the invocation's version: a v2 invocation is answered from the `:2` namespace.
 pub fn soap_success_v(service: SoapService, v2: bool, action: &str, inner: &str) -> Vec<u8> {
     let urn = String::from_utf8_lossy(service_urn_v(service, v2));
     format!(
@@ -1287,8 +1177,7 @@ mod tests {
 
     #[test]
     fn st_v2_targets_parse_and_roundtrip() {
-        // plan/0008 R3: explicit IGD:2/WIP2 searches must parse and echo
-        // their version (the kani round-trip invariant holds for these)
+        // explicit IGD:2/WIP2 searches must parse and echo their version
         assert_eq!(
             parse_st(b"urn:schemas-upnp-org:device:InternetGatewayDevice:2"),
             Some(SearchTarget::InternetGatewayDevice2)
@@ -1415,13 +1304,7 @@ mod tests {
 
     #[test]
     fn mpost_post_parity_multiline_corners() {
-        // A quoted action value spanning lines fabricates a header line
-        // after the SOAPACTION value. The GENA markers now run on both
-        // transports, so a fabricated SID/NT/CALLBACK line must classify
-        // as the marker on POST and M-POST alike (E3 same-dispatch), and
-        // any other fabricated line must fall in the same class both ways.
-        // This is the corner the mpost_post_parity Kani harness covers
-        // symbolically; its concrete witnesses are pinned here.
+        // a quoted action value spanning lines must classify the same on both transports
         let cases: [&[u8]; 4] = [
             b"\nSID: xA",
             b"\nNT: upnp:event\nCALLBACK: c",
@@ -1500,9 +1383,7 @@ mod tests {
         assert_eq!(fault_of(UpnpErr::InvalidArgs), FAULT_INVALID_ARGS);
         assert_eq!(fault_of(UpnpErr::NoSuchEntry), FAULT_NO_SUCH_ENTRY);
         assert_eq!(fault_of(UpnpErr::ActionFailed), FAULT_ACTION_FAILED);
-        // the WANIPConnection:2 range codes keep their own numbers: the
-        // 7xx table is shared across services, and these two are this
-        // service's (sections 2.5.19.6 and 2.5.21.7)
+        // these two 7xx codes are WANIPConnection:2's own
         assert_eq!(fault_of(UpnpErr::PortMappingNotFound).code, 730);
         assert_eq!(fault_of(UpnpErr::InconsistentParameters).code, 733);
         assert_eq!(fault_of(UpnpErr::ReadOnly).code, 731);
@@ -1546,11 +1427,7 @@ mod tests {
 
     #[test]
     fn xml_tag_skips_comments_and_cdata() {
-        // Regression (review S4): the raw-byte closer hunt used to treat a
-        // `</tag>` INSIDE a comment as the real closer, so a well-formed
-        // request whose value mentioned the closer was mis-segmented and
-        // 402'd; a CDATA-wrapped value failed to parse at all.
-        // comment mentioning the closer must not truncate the value
+        // a comment or CDATA span mentioning the closer must not truncate the value
         assert_eq!(
             xml_tag(b"<a>3<!-- </a> remembered -->074</a>", b"a"),
             Some(&b"3<!-- </a> remembered -->074"[..]),
@@ -1571,8 +1448,7 @@ mod tests {
             xml_tag(b"<a>3074<!-- tail --></a>", b"a"),
             Some(&b"3074"[..])
         );
-        // a CDATA span with text outside it stays whole, so the caller's
-        // parse rejects it — never a partial accept
+        // a CDATA span with text outside it stays whole, so the caller's parse rejects it
         assert_eq!(
             xml_tag(b"<a><![CDATA[30]]>74</a>", b"a"),
             Some(&b"<![CDATA[30]]>74"[..])
@@ -1583,8 +1459,6 @@ mod tests {
     fn http_date_known_values() {
         // 0 = epoch = Thursday, 01 Jan 1970
         assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-        // 2026-09-13T00:00:00Z = 20709 days after the epoch (verified by
-        // independent civil-date arithmetic; `date -u -d @1789257600`)
         assert_eq!(http_date(1_789_257_600), "Sun, 13 Sep 2026 00:00:00 GMT");
     }
 
@@ -1636,15 +1510,12 @@ mod tests {
     }
 }
 
-/// Kani proofs: E7 — SSDP grammar, SOAP dispatch/faults, enumeration
-/// index math, SID/SEQ.
+/// Kani proofs: the SSDP grammar, SOAP dispatch, enumeration index math and SID/SEQ.
 #[cfg(kani)]
 mod verify {
     use super::*;
 
-    /// Fixed-size head buffers for the parity builder: the longest prefix
-    /// (the M-POST one) plus the longest real action name (27 bytes) plus
-    /// the suffix. ACT_CAP is also the symbolic-action bound.
+    /// The parity builder's head buffer: the longest prefix plus the longest action name plus the suffix.
     const HDR_CAP: usize = 160;
     const ACT_CAP: usize = 28;
 
@@ -1658,11 +1529,7 @@ mod verify {
         *offset += src.len();
     }
 
-    /// Build the POST and M-POST request heads for the same action text —
-    /// one builder for the unit test and the parity proof, so the proven
-    /// property is the real grammar on the real wires. An action that does
-    /// not fit yields two identical fixed buffers (equal classes, which
-    /// preserves the equality claim for all inputs).
+    /// The POST and M-POST heads for one action text, so the unit test and the proof share one builder.
     fn parity_heads(action: &[u8]) -> ([u8; HDR_CAP], usize, [u8; HDR_CAP], usize) {
         let pre_p: &[u8] = b"POST /ctl/IPConn HTTP/1.1\r\nSOAPACTION: \"";
         let pre_m: &[u8] = b"M-POST /ctl/IPConn HTTP/1.1\r\nMAN: \
@@ -1674,8 +1541,7 @@ mod verify {
         let fits = action.len() <= ACT_CAP && pre_p.len() + action.len() + suf.len() <= HDR_CAP
             && pre_m.len() + action.len() + suf.len() <= HDR_CAP;
         if !fits {
-            // identical overflow marker in both: equal classes by
-            // construction of the deterministic classifier
+            // identical overflow marker in both buffers: equal classes by construction
             let m = b"over";
             let mut i = 0usize;
             while i < m.len() && i < HDR_CAP {
@@ -1701,9 +1567,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(96)]
     fn msearch_never_panics_and_answers_only_known() {
-        // Grammar totality over a bounded buffer: any 32-byte datagram
-        // classifies without panic; an Answer names only a known ST and an
-        // MX capped at 5.
+        // Totality: any 32-byte datagram classifies without panic; an Answer names a known ST with MX <= 5.
         let buf: [u8; 32] = kani::any();
         match parse_msearch(&buf) {
             MSearchParse::Answer { st, mx } => {
@@ -1733,9 +1597,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(200)]
     fn soap_classify_never_panics() {
-        // Totality: any 64-byte request head classifies without panic and
-        // never fabricates a Soap without a resolvable action (the action
-        // inside a Soap class round-trips through the parse).
+        // Totality: any 64-byte head classifies without panic and a Soap class round-trips its own action.
         let buf: [u8; 64] = kani::any();
         match classify(&buf) {
             ReqClass::Soap { action, .. } => {
@@ -1753,15 +1615,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(96)]
     fn mpost_post_parity() {
-        // The parity property (E3/verification), structural half: for any
-        // CLEAN short action text — printable bytes, no embedded CR/LF —
-        // the M-POST head (MAN + <ns>SOAPACTION) classifies to exactly the
-        // same class as the equivalent POST head (SOAPACTION). The action
-        // is spliced into a header VALUE, so bytes that fabricate new
-        // header lines are HTTP-malformed input: those corners are pinned
-        // by the unit test `mpost_post_parity_multiline_corners` (the
-        // GENA markers dispatch symmetrically there too), not by this
-        // proof — the proven claim is what E3 actually requires.
+        // Parity for any clean short action text; the multi-line corners are the unit test's.
         let action: [u8; 8] = kani::any();
         kani::assume(action.iter().all(|&b| b >= b' '));
         let (pb, pl, mb, ml) = parity_heads(&action);
@@ -1771,10 +1625,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(96)]
     fn mpost_post_parity_real_actions() {
-        // The parity property, concrete half: every real WANIPConnection:1
-        // action name dispatches identically through the two transports at
-        // full wire size (the PS3-era M-POST stack gets the same dispatch
-        // as a modern POST stack), and junk resolves to the same class too.
+        // Parity at full wire size for every real action name, and for junk.
         let names: [&[u8]; 8] = [
             b"GetExternalIPAddress",
             b"GetStatusInfo",
@@ -1794,8 +1645,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(16)]
     fn entry_at_bounds_proof() {
-        // Enumeration index math: entry_at never indexes out of bounds and
-        // Some exactly when the index is below the length.
+        // entry_at never indexes out of bounds, and Some exactly when the index is below the length.
         let arr: [UpnpKey; 4] = [UpnpKey {
             req_ext: kani::any(),
             proto: if kani::any() {
@@ -1818,9 +1668,7 @@ mod verify {
 
     #[kani::proof]
     fn advance_seq_injective() {
-        // SEQ: the eventKey advance never repeats an event key immediately
-        // (wrapping add is injective over u32) — the initial NOTIFY (0) is
-        // never re-issued before a full 2^32 cycle.
+        // the eventKey advance is injective, so a key never repeats before a full 2^32 cycle
         let a: u32 = kani::any();
         let b: u32 = kani::any();
         kani::assume(advance_seq(a) == advance_seq(b));
@@ -1830,9 +1678,7 @@ mod verify {
     #[kani::proof]
     #[kani::unwind(40)]
     fn sid_set_invariants() {
-        // SID discipline: add succeeds only when the sid was absent (and
-        // under capacity) and leaves it present; remove succeeds exactly
-        // when the sid was present and leaves it absent; capacity holds.
+        // add succeeds only when the sid was absent and under capacity; remove succeeds iff present
         let mut set = SidSet::new();
         let a: Sid = Sid(kani::any());
         let b: Sid = Sid(kani::any());
