@@ -70,8 +70,7 @@ jobs:
             exit 1
           fi
       - name: Every comment run is one line
-        # Non-blocking while the corpus converges; call/0037 carries the rule, and this becomes blocking at zero.
-        continue-on-error: true
+        # call/0037 carries the rule; the corpus is at zero, so a new run of two lines fails here.
         run: python3 tools/comment-lint.py
       - name: Every relative link in the authored docs resolves
         run: sh tools/link-check.sh
@@ -82,3 +81,6 @@ jobs:
             https://github.com/connollydavid/host-lint /tmp/host-lint
           (cd /tmp && cargo build --quiet --release --manifest-path /tmp/host-lint/Cargo.toml)
           /tmp/host-lint/target/release/host-lint --docs .
+      - name: Every name and number reads as a name
+        # The lane reads a clause number, an item code or a version label as a tell; it is the same binary the prose step built.
+        run: /tmp/host-lint/target/release/host-lint --all
