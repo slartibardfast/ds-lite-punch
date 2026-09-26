@@ -12,13 +12,13 @@ Run from the repository root:
 import pathlib
 import sys
 
-# Every authored file in this repository that carries comments.
+# Every authored file in this repository that carries comments: deploy is walked recursively, and the tools patterns stay at one level because those submodules are referenced rather than vendored.
 ROOTS = (
     "src/*.rs",
     "tools/argdoc/src/*.rs",
-    "deploy/*.py",
-    "deploy/*.sh",
-    "deploy/*.init",
+    "deploy/**/*.py",
+    "deploy/**/*.sh",
+    "deploy/**/*.init",
     "tools/*.sh",
     "Cargo.toml",
     "tools/argdoc/Cargo.toml",
