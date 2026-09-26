@@ -84,3 +84,9 @@ jobs:
       - name: Every name and number reads as a name
         # The lane reads a clause number, an item code or a version label as a tell; it is the same binary the prose step built.
         run: /tmp/host-lint/target/release/host-lint --all
+      - name: The front door's split by name holds
+        # A pass-through name must reach the service's own certificate and a protected name must demand a client certificate; the harness renders the shipped configuration, and Debian ships the stream module as its own package.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx libnginx-mod-stream
+          bash deploy/front-door/test-local.sh
