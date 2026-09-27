@@ -21,7 +21,7 @@ Legacy single\-map form: the relay socket on the CGNAT\-facing address, which is
 Legacy single\-map form: the local endpoint inbound datagrams are forwarded to, with the peer\*(Aqs source address preserved. Requires \-\-bind.
 .TP
 \fB\-\-stun\fR \fI<HOST:PORT,...>\fR
-STUN servers, comma\-separated as host:port, tried in order and rotated when one falls silent. Default: stun.l.google.com:19302,stun.cloudflare.com:3478.
+STUN servers, comma\-separated as host:port, tried in order and rotated when one falls silent. A TCP slot can learn its tuple only from a server that answers STUN over TCP, so the default carries one. Default: stun.l.google.com:19302,stun.cloudflare.com:3478,stun.nextcloud.com:443.
 .TP
 \fB\-\-interval\fR \fI<SECS>\fR
 Seconds between the STUN writes that keep the mapping alive. The writes are what the carrier sees, so this is the interval the mapping\*(Aqs lifetime depends on. Default 2, minimum 1.

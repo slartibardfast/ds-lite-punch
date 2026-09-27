@@ -349,6 +349,8 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         stun = vec![
             "stun.l.google.com:19302".to_string(),
             "stun.cloudflare.com:3478".to_string(),
+            // A TCP slot learns its tuple from a server that answers STUN over TCP, and neither of the two above does.
+            "stun.nextcloud.com:443".to_string(),
         ];
     }
     Ok(Config {
@@ -1005,6 +1007,16 @@ fn seed_external_ip(state_dir: &str, primary: u16) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_stun_list_can_learn_a_tcp_mapping() {
+        let argv: Vec<String> = Vec::new();
+        let c = parse_args_from(&argv).expect("the defaults parse");
+        assert!(
+            c.stun.iter().any(|s| s == "stun.nextcloud.com:443"),
+            "a TCP slot needs a server that answers STUN over TCP"
+        );
+    }
 
     #[test]
     fn the_poke_leaves_from_the_slots_own_socket() {

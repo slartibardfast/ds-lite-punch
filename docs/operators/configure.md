@@ -18,7 +18,7 @@ line needs.
 |---|---|---|
 | `BIND` | none, required | The address and port the daemon binds on the CGNAT-facing interface, as `ip:port`. The carrier maps this tuple. |
 | `TARGET` | none, required | The local host and port that receives inbound traffic, as `ip:port`. The peer's source address is preserved. |
-| `STUN` | `stun.l.google.com:19302,stun.cloudflare.com:3478` | The servers that read and refresh the mapping, comma-separated. One that falls silent is rotated out. |
+| `STUN` | `stun.l.google.com:19302,stun.cloudflare.com:3478,stun.nextcloud.com:443` | The servers that read and refresh the mapping, comma-separated. One that falls silent is rotated out. A TCP slot learns its tuple only from a server that answers STUN over TCP, which is why the default carries one; a list without such a server leaves TCP slots with no external tuple. |
 | `INTERVAL` | `2` | Seconds between the STUN writes that keep the mapping alive. The carrier drops an idle UDP mapping in a few seconds, so treat this value as the lifetime of the mapping. Minimum 1. |
 | `GATEWAY` | `192.168.0.1` | The next hop used to route the STUN writes out the line the mapping is on. Without it the default route wins and STUN reports the wrong address. |
 

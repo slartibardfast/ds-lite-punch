@@ -84,8 +84,9 @@ fn cli(version: &str) -> Command {
                 .help("STUN servers to read and refresh the mapping, comma-separated.")
                 .long_help(
                     "STUN servers, comma-separated as host:port, tried in order and rotated \
-                     when one falls silent. Default: \
-                     stun.l.google.com:19302,stun.cloudflare.com:3478.",
+                     when one falls silent. A TCP slot can learn its tuple only from a server \
+                     that answers STUN over TCP, so the default carries one. Default: \
+                     stun.l.google.com:19302,stun.cloudflare.com:3478,stun.nextcloud.com:443.",
                 ),
         )
         .arg(
