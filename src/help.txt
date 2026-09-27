@@ -34,6 +34,9 @@ Options:
       --max-maps-per-client <N>
           Maximum mappings per client. Default 16.
 
+      --poke <ADDR>
+          A peer each keepalive also sends to, from the slot's own socket, so the carrier admits that peer's replies to the slot. The carrier refuses a source the line has never sent to, and this is how a port that has to be reached from outside becomes reachable. Address and port.
+
       --gc-grace-factor <N>
           Grace multiple applied to a slot's lifetime before it is collected. Default 3.
 

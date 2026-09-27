@@ -147,6 +147,18 @@ fn cli(version: &str) -> Command {
                 .long_help("Maximum mappings per client. Default 16."),
         )
         .arg(
+            Arg::new("poke")
+                .long("poke")
+                .value_name("ADDR")
+                .help("A peer each keepalive also sends to, from the slot's own socket.")
+                .long_help(
+                    "A peer each keepalive also sends to, from the slot's own socket, so the \
+                     carrier admits that peer's replies to the slot. The carrier refuses a \
+                     source the line has never sent to, and this is how a port that has to be \
+                     reached from outside becomes reachable. Address and port.",
+                ),
+        )
+        .arg(
             Arg::new("gc-grace-factor")
                 .long("gc-grace-factor")
                 .value_name("N")
