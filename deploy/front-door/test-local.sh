@@ -109,27 +109,43 @@ case "$code" in
                       fail=1 ;;
 esac
 
-# The front learns the line's tuple from the poke it receives, per protocol.
+# The front learns the line's tuple from the poke it receives, and the UDP leg follows it.
 python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams.map" \
-    --name "$PASS" --udp-port 8447 >/dev/null 2>&1 &
+    --name "$PASS" --udp-port 8447 \
+    --reload "$NGINX_BIN -c $W/nginx.conf -s reload" >/dev/null 2>&1 &
 PIDS+=($!)
-sleep 1
+python3 - <<'PY' > "$W/udp-leg.txt" 2>&1 &
+import socket, time
+time.sleep(1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 8455))
+s.sendto(b"dslp-poke", ("127.0.0.1", 41001))
+s.settimeout(10)
+try:
+    data, peer = s.recvfrom(2048)
+    print("the front forwarded:", data.decode())
+except socket.timeout:
+    print("the front forwarded nothing")
+PY
+PIDS+=($!)
+sleep 3
 python3 - <<'PY'
 import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.sendto(b"dslp-poke", ("127.0.0.1", 41001))
-s.close()
-c = socket.create_connection(("127.0.0.1", 41001), timeout=3)
-c.sendall(b"dslp-poke")
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+c.sendto(b"the client spoke", ("127.0.0.1", 8447))
 c.close()
+t = socket.create_connection(("127.0.0.1", 41001), timeout=3)
+t.sendall(b"dslp-poke")
+t.close()
 PY
-sleep 1
+sleep 3
 learnt_name=$(grep -c "^$PASS 127.0.0.1:" "$W/upstreams.map" || true)
-learnt_port=$(grep -c "^8447 127.0.0.1:" "$W/upstreams.map" || true)
-if [ "$learnt_name" = 1 ] && [ "$learnt_port" = 1 ]; then
-    note "poke listener: a name-keyed line for TCP, a port-keyed line for UDP"
+learnt_port=$(grep -c "^8447 127.0.0.1:8455;" "$W/upstreams.map" || true)
+if [ "$learnt_name" = 1 ] && [ "$learnt_port" = 1 ] \
+    && grep -q 'the front forwarded: the client spoke' "$W/udp-leg.txt"; then
+    note "the front follows the poke: the UDP forward went to the tuple it learned"
 else
-    note "FAIL poke listener: the include has $learnt_name name-keyed and $learnt_port port-keyed"
+    note "FAIL front learning: $learnt_name name-keyed, $learnt_port port-keyed, and $(tr -d '\n' <"$W/udp-leg.txt")"
     fail=1
 fi
 
