@@ -17,6 +17,7 @@ megabyte, and procd manages it as one service.
 | [Install](operators/install.md) | the release, the hash check, the files, the first start, the DeviceProtection seed |
 | [Configure](operators/configure.md) | every key of `/etc/ds-lite-punch.env`, the facade, the hold, the carrier watch |
 | [Operate](operators/operate.md) | the state files, the log events, the rules, and how to check a mapping from outside the line |
+| [Front door](operators/front-door.md) | serving a port from outside the line with no tunnel: the nginx split, holding the port, the poke, and the return path |
 | [Upgrade](operators/upgrade.md) | how a release is made, the upgrade, the rollback, and the removal |
 | [Troubleshoot](operators/troubleshoot.md) | the failure cases measured on a working line |
 
