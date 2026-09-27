@@ -41,6 +41,23 @@ and asserts that a pass-through name reaches the service's own certificate, that
 protected name is refused without a client certificate and served with one, and
 that a name nobody published reaches nothing. The component's lane runs it.
 
+## The front learns the tuple
+
+`deploy/front-door/poke-listener.py` is the other half of the exchange. It listens
+on the port the daemon pokes, on UDP and TCP, and writes the include the front
+routes with, one entry per protocol, taken from the source of each arrival. Run it
+beside nginx, with the name this front serves and a reload command:
+
+```
+poke-listener.py --listen 0.0.0.0:41001 --name passthru.example \
+    --out /etc/front-door/upstreams.map --reload "nginx -s reload"
+```
+
+The file it writes is what a `map` includes, so the front follows the carrier's
+assignment with no operator in the loop. The listener creates the file empty at
+startup, which is what lets the configuration name it before the first poke has
+arrived.
+
 ## Hold the port
 
 A slot is one mapping. Ask for one from a LAN client over the PCP or UPnP facade,
