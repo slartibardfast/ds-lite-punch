@@ -65,6 +65,10 @@ start_service() {
     [ "${PCP:-0}" = "1" ] && PCPF="--pcp"
     [ "${PCP_PEER:-0}" = "1" ] && PCPF="$PCPF --pcp-peer"
 
+    # The poke: a peer every keepalive also sends to, so the carrier admits its replies to the slot.
+    POKEF=
+    [ -n "$POKE" ] && POKEF="--poke $POKE"
+
     # The carrier watch: the counter that records the helper's marked probe, and the alarm when it stops rising.
     WATCHF=
     [ "${CARRIER_PROBE:-0}" = "1" ] && WATCHF="--carrier-probe"
@@ -84,7 +88,7 @@ start_service() {
         --upnp-port "${UPNP_PORT:-49152}" \
         --lan-ip "${LAN_IP:-192.168.21.1}" \
         $NO_UPNP \
-        $ALLOW $PCPF $WATCHF \
+        $ALLOW $PCPF $WATCHF $POKEF \
         ${OBSERVATION:+--observation}
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
