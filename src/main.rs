@@ -1031,6 +1031,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_bad_identity_file_is_refused_at_parse_time() {
+        let e = parse_args_from(argv(&[
+            "--bind",
+            "192.168.0.21:40000",
+            "--target",
+            "192.168.21.12:40002",
+            "--client-identity",
+            "/nonexistent/cert.pem:/nonexistent/key.pem",
+        ]))
+        .unwrap_err();
+        assert!(e.starts_with("--client-identity:"), "the refusal names the flag: {e}");
+    }
+
+    #[test]
+    fn a_bad_anchor_file_is_refused_at_parse_time() {
+        let e = parse_args_from(argv(&[
+            "--bind",
+            "192.168.0.21:40000",
+            "--target",
+            "192.168.21.12:40002",
+            "--front-anchor",
+            "/nonexistent/ca.pem",
+        ]))
+        .unwrap_err();
+        assert!(e.starts_with("--front-anchor:"), "the refusal names the flag: {e}");
+    }
+
+    #[test]
     fn the_default_stun_list_can_learn_a_tcp_mapping() {
         let c = parse_args_from(argv(&["--bind", "192.168.0.21:40000", "--target", "192.168.21.12:40002"]))
             .expect("the defaults parse");
