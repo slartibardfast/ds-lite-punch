@@ -189,9 +189,15 @@ printf 'U\talice\t%s\t%s\tBasic|Admin\n' "$salt" "$(stored_for alice "$salt" cor
 if printf 'correct-horse\n' | python3 "$HERE/mint-client.py" --store "$STORE" --name alice --allow "$PASS" \
         --ca-dir "$W/ca" --out-dir "$W/clients" >/dev/null 2>&1; then
     subject=$(openssl x509 -in "$W/clients/alice.crt" -noout -subject 2>/dev/null)
+    purposes=$(openssl x509 -in "$W/clients/alice.crt" -noout -ext extendedKeyUsage 2>/dev/null)
     case "$subject" in
         *"CN = alice"*"OU = $PASS"*|*"CN=alice"*"OU=$PASS"*)
-            note "mint: the certificate carries the identity and what it may reach" ;;
+            case "$purposes" in
+                *"TLS Web Client Authentication"*)
+                    note "mint: the certificate carries the identity, the permission and the client purpose" ;;
+                *)  note "FAIL mint: the purpose reads '${purposes:-nothing}'"
+                    fail=1 ;;
+            esac ;;
         *)  note "FAIL mint: the subject reads '${subject:-nothing}'"
             fail=1 ;;
     esac

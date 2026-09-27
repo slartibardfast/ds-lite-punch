@@ -27,6 +27,43 @@ pub fn load_identity(cert: &str, key: &str) -> Result<(Vec<u8>, Vec<u8>), String
     Ok((chain, key))
 }
 
+/// Builds the TLS client configuration the daemon calls the front with: the identity it presents, and the authority it accepts.
+pub fn client_config(cert: &str, key: &str, anchor: &str) -> Result<rustls::ClientConfig, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let anchor_der = der_from_file(anchor)?;
+    roots
+        .add(rustls::pki_types::CertificateDer::from(anchor_der))
+        .map_err(|e| format!("{}: {e}", anchor))?;
+    let chain = read_chain(cert)?;
+    let key = read_key(key)?;
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("the TLS versions: {e}"))?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(chain, key)
+        .map_err(|e| format!("the identity: {e}"))
+}
+
+fn read_chain(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let chain: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{}: {e}", path))?;
+    if chain.is_empty() {
+        return Err(format!("{}: no certificate between the PEM markers", path));
+    }
+    Ok(chain)
+}
+
+fn read_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let key = rustls_pemfile::private_key(&mut reader).map_err(|e| format!("{}: {e}", path))?;
+    key.ok_or_else(|| format!("{}: no private key between the PEM markers", path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +91,76 @@ mod tests {
     fn a_missing_file_names_itself_in_the_reason() {
         let e = der_from_file("/nonexistent/front-door/identity.pem").unwrap_err();
         assert!(e.contains("identity.pem"), "the reason names the path: {e}");
+    }
+
+    fn fixtures() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dslp-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("openssl")
+                .args(args)
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("openssl runs")
+                .success();
+            assert!(ok, "openssl {args:?}");
+        };
+        run(&["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+              "-subj", "/CN=the front", "-keyout", "front.key", "-out", "front.crt"]);
+        run(&["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+              "-subj", "/CN=another authority", "-keyout", "other.key", "-out", "other.crt"]);
+        run(&["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=the daemon",
+              "-keyout", "daemon.key", "-out", "daemon.csr"]);
+        std::fs::write(
+            dir.join("daemon.ext"),
+            "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n",
+        )
+        .expect("the extension file");
+        run(&["x509", "-req", "-in", "daemon.csr", "-CA", "front.crt", "-CAkey", "front.key",
+              "-CAcreateserial", "-days", "1", "-extfile", "daemon.ext", "-out", "daemon.crt"]);
+        dir
+    }
+
+    fn path_in(dir: &std::path::Path, name: &str) -> String {
+        dir.join(name).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_client_carries_the_identity_and_accepts_the_anchor() {
+        let dir = fixtures();
+        let built = client_config(
+            &path_in(&dir, "daemon.crt"),
+            &path_in(&dir, "daemon.key"),
+            &path_in(&dir, "front.crt"),
+        );
+        assert!(built.is_ok(), "an identity and its anchor build: {:?}", built.err());
+    }
+
+    #[test]
+    fn a_key_that_does_not_match_its_certificate_is_refused() {
+        let dir = fixtures();
+        let built = client_config(
+            &path_in(&dir, "daemon.crt"),
+            &path_in(&dir, "other.key"),
+            &path_in(&dir, "front.crt"),
+        );
+        let e = built.err().expect("a mismatched key is refused");
+        assert!(e.starts_with("the identity:"), "the refusal names the pairing: {e}");
+    }
+
+    #[test]
+    fn an_anchor_that_is_not_a_certificate_is_refused() {
+        let dir = fixtures();
+        let not_a_cert = dir.join("not-a-cert.pem");
+        std::fs::write(&not_a_cert, "-----BEGIN CERTIFICATE-----\nAAECAwQ=\n-----END CERTIFICATE-----\n")
+            .expect("the scratch file");
+        let built = client_config(
+            &path_in(&dir, "daemon.crt"),
+            &path_in(&dir, "daemon.key"),
+            &not_a_cert.to_string_lossy(),
+        );
+        assert!(built.is_err(), "an anchor that is not a certificate is refused");
     }
 }

@@ -67,12 +67,18 @@ def mint(ca_key, ca_crt, out_dir, name, allow, days):
          "-keyout", key, "-out", csr],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    # A certificate without these extensions is X.509 version one, and a TLS client refuses it.
+    ext = os.path.join(out_dir, name + ".ext")
+    with open(ext, "w", encoding="utf-8") as fh:
+        fh.write("basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\n")
+        fh.write("extendedKeyUsage=clientAuth\n")
     subprocess.run(
         ["openssl", "x509", "-req", "-in", csr, "-CA", ca_crt, "-CAkey", ca_key,
-         "-CAcreateserial", "-days", str(days), "-out", crt],
+         "-CAcreateserial", "-days", str(days), "-extfile", ext, "-out", crt],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     os.unlink(csr)
+    os.unlink(ext)
     return crt, key
 
 
