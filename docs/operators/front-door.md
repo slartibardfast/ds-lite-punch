@@ -66,6 +66,31 @@ address the front forwards to, and a TCP port can serve as a listening socket or
 the source of a connection, one or the other, so that half is learned where the
 daemon's own listener sits at the mapping's port.
 
+## Mint a client
+
+The front demands a client certificate on a protected name, and the authority for
+that certificate lives on the line. `deploy/front-door/mint-client.py` holds the
+authority, checks a password against the store the daemon keeps, and signs a
+certificate that carries what its identity may reach:
+
+```
+printf '%s\n' "$password" | python3 mint-client.py \
+    --store /tmp/dslp/dp.tsv --name alice --allow passthru.example \
+    --ca-dir /etc/front-door/ca --out-dir /etc/front-door/clients
+```
+
+The password arrives on standard input, so it stays out of a process list and out
+of a shell history. The identity must hold the role named by `--require-role`,
+which defaults to `Admin`, and the store's roles decide that. The certificate's
+subject carries the identity in its common name and the name it may reach in its
+organisational unit, which is the part the front reads.
+
+The front needs the public half of the authority, and nothing else about it:
+
+```
+ssl_client_certificate /etc/front-door/ca/ca.crt;
+```
+
 ## Hold the port
 
 A slot is one mapping. Ask for one from a LAN client over the PCP or UPnP facade,
