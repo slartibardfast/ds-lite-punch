@@ -10,6 +10,8 @@ pub struct State {
     pub silent_ticks: u32,
     /// rotate STUN server after this many consecutive silent keepalives
     pub rotate_after: u32,
+    /// every keepalive also sends here, so the carrier admits this peer's replies
+    pub poke: Option<SocketAddrV4>,
 }
 
 impl State {
@@ -21,6 +23,7 @@ impl State {
             last_response: None,
             silent_ticks: 0,
             rotate_after: 3,
+            poke: None,
         }
     }
 

@@ -448,6 +448,8 @@ async fn resolve_stun(hosts: &[String]) -> Vec<SocketAddrV4> {
     out
 }
 
+const POKE_MARK: &[u8] = b"dslp-poke";
+
 /// The slot keepalive loop; the caller owns the JoinHandle so a teardown can abort it.
 pub(crate) async fn keepalive_loop(
     sock: Arc<UdpSocket>,
@@ -468,6 +470,12 @@ pub(crate) async fn keepalive_loop(
         let req = stun::binding_request(&txn);
         if let Err(e) = sock.send_to(&req, server).await {
             emiteln!("warn: keepalive send to {} failed: {}", server, e);
+        }
+        let poke = state.lock().await.poke;
+        if let Some(dest) = poke {
+            if let Err(e) = sock.send_to(POKE_MARK, dest).await {
+                emiteln!("warn: poke to {} failed: {}", dest, e);
+            }
         }
         let rotated = state.lock().await.note_silence();
         if rotated {
