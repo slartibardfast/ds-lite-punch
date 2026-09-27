@@ -159,6 +159,47 @@ else
     note "lease: the entry left with the pokes that kept it"
 fi
 
+# The authority mints for an identity the store accepts, and for nobody else.
+STORE="$W/dp.tsv"
+stored_for() {
+    python3 -c "
+import hashlib, sys
+name, salt, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+print(hashlib.pbkdf2_hmac('sha256', pw.encode(), (name + salt).encode(), 5000, dklen=32)[:16].hex())
+" "$1" "$2" "$3"
+}
+salt=$(python3 -c "import secrets; print(secrets.token_hex(8))")
+printf 'U\talice\t%s\t%s\tBasic|Admin\n' "$salt" "$(stored_for alice "$salt" correct-horse)" > "$STORE"
+if printf 'wrong\n' | python3 "$HERE/mint-client.py" --store "$STORE" --name alice --allow "$PASS" \
+        --ca-dir "$W/ca" --out-dir "$W/clients" >/dev/null 2>&1; then
+    note "FAIL mint: a wrong password was accepted"
+    fail=1
+else
+    note "mint: a wrong password is refused"
+fi
+printf 'U\tbob\t%s\t%s\tBasic\n' "$salt" "$(stored_for bob "$salt" correct-horse)" > "$STORE"
+if printf 'correct-horse\n' | python3 "$HERE/mint-client.py" --store "$STORE" --name bob --allow "$PASS" \
+        --ca-dir "$W/ca" --out-dir "$W/clients" >/dev/null 2>&1; then
+    note "FAIL mint: an identity without the role was accepted"
+    fail=1
+else
+    note "mint: an identity without the required role is refused"
+fi
+printf 'U\talice\t%s\t%s\tBasic|Admin\n' "$salt" "$(stored_for alice "$salt" correct-horse)" > "$STORE"
+if printf 'correct-horse\n' | python3 "$HERE/mint-client.py" --store "$STORE" --name alice --allow "$PASS" \
+        --ca-dir "$W/ca" --out-dir "$W/clients" >/dev/null 2>&1; then
+    subject=$(openssl x509 -in "$W/clients/alice.crt" -noout -subject 2>/dev/null)
+    case "$subject" in
+        *"CN = alice"*"OU = $PASS"*|*"CN=alice"*"OU=$PASS"*)
+            note "mint: the certificate carries the identity and what it may reach" ;;
+        *)  note "FAIL mint: the subject reads '${subject:-nothing}'"
+            fail=1 ;;
+    esac
+else
+    note "FAIL mint: a valid identity was refused"
+    fail=1
+fi
+
 if [ "$fail" = 0 ]; then
     note "front-door harness: the split by name holds"
 else
