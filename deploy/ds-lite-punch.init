@@ -69,6 +69,10 @@ start_service() {
     POKEF=
     [ -n "$POKE" ] && POKEF="--poke $POKE"
 
+    # The identity: the certificate and key this daemon presents to the front.
+    IDENTF=
+    [ -n "$CLIENT_IDENTITY" ] && IDENTF="--client-identity $CLIENT_IDENTITY"
+
     # The carrier watch: the counter that records the helper's marked probe, and the alarm when it stops rising.
     WATCHF=
     [ "${CARRIER_PROBE:-0}" = "1" ] && WATCHF="--carrier-probe"
@@ -88,7 +92,7 @@ start_service() {
         --upnp-port "${UPNP_PORT:-49152}" \
         --lan-ip "${LAN_IP:-192.168.21.1}" \
         $NO_UPNP \
-        $ALLOW $PCPF $WATCHF $POKEF \
+        $ALLOW $PCPF $WATCHF $POKEF $IDENTF \
         ${OBSERVATION:+--observation}
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
