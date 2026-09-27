@@ -58,13 +58,13 @@ assignment with no operator in the loop. The listener creates the file empty at
 startup, which is what lets the configuration name it before the first poke has
 arrived.
 
-The shipped configuration reads that file for the UDP leg, through a map keyed on
-the listening port, and the harness proves the forward follows the learned tuple.
-The TCP leg's map is keyed on names, and its include belongs to the deployment:
-the poke's source is the address the front forwards to, and a TCP port can serve
-as a listening socket or as the source of a connection, one or the other. No
-single machine stands in for the line on that side, so that half is proven where
-the daemon's own listener sits at the mapping's port.
+The shipped configuration reads that file on both legs: the UDP leg through a map
+keyed on the listening port, and the TCP leg through a map keyed on names. The
+harness proves the UDP forward follows the learned tuple, and it stands in for the
+TCP leg's line, since no single machine can learn that one. A poke's source is the
+address the front forwards to, and a TCP port can serve as a listening socket or as
+the source of a connection, one or the other, so that half is learned where the
+daemon's own listener sits at the mapping's port.
 
 ## Hold the port
 
