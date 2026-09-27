@@ -163,11 +163,11 @@ def main():
         print("retrying the MAP after 4s (the protocol's own recovery)")
         sent_at = time.time()
         got = show_pcp("MAP (retry)", send(sock, req, wait=8.0), sent_at)
-    if args.hold and got is not None and got[3] == 0:
+    if args.keepalive and got is not None and got[3] == 0:
         # The outside's probes must land here, so the association is dissolved first: a connected socket delivers only from its peer.
         sock.connect(("0.0.0.0", 0))
         sock.settimeout(None)
-        print("KEEPALIVEING: the client is silent; the mapping is the daemon's", flush=True)
+        print("KEEPALIVE: the client is silent; the mapping is the daemon's", flush=True)
         while True:
             data, peer = sock.recvfrom(2048)
             print(f"RX {len(data)} bytes from {peer[0]}:{peer[1]} at {time.time():.3f}",
