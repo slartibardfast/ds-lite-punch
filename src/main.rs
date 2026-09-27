@@ -1010,8 +1010,8 @@ mod tests {
 
     #[test]
     fn the_default_stun_list_can_learn_a_tcp_mapping() {
-        let argv: Vec<String> = Vec::new();
-        let c = parse_args_from(&argv).expect("the defaults parse");
+        let c = parse_args_from(argv(&["--bind", "192.168.0.21:40000", "--target", "192.168.21.12:40002"]))
+            .expect("the defaults parse");
         assert!(
             c.stun.iter().any(|s| s == "stun.nextcloud.com:443"),
             "a TCP slot needs a server that answers STUN over TCP"
