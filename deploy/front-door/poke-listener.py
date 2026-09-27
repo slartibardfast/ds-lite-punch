@@ -28,18 +28,18 @@ import time
 MARK = b"dslp-poke"
 
 
-def write_table(path, table, reload_cmd):
+def write_table(path, table, reload_cmd, name):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         for proto in ("udp", "tcp"):
             if proto in table:
-                fh.write("%s %s\n" % (proto, table[proto]))
+                fh.write("%s %s;\n" % (name, table[proto]))
     os.replace(tmp, path)
     if reload_cmd:
         subprocess.run(reload_cmd, shell=True, check=False)
 
 
-def udp_loop(bind, table, path, reload_cmd):
+def udp_loop(bind, table, path, reload_cmd, name):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(bind)
@@ -49,18 +49,18 @@ def udp_loop(bind, table, path, reload_cmd):
             continue
         table["udp"] = "%s:%d" % (peer[0], peer[1])
         print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
-        write_table(path, table, reload_cmd)
+        write_table(path, table, reload_cmd, name)
 
 
-def handler(conn, table, path, reload_cmd):
+def handler(conn, table, path, reload_cmd, name):
     peer = conn.getpeername()
     table["tcp"] = "%s:%d" % (peer[0], peer[1])
     print("tcp poke from %s:%d" % (peer[0], peer[1]), flush=True)
-    write_table(path, table, reload_cmd)
+    write_table(path, table, reload_cmd, name)
     conn.close()
 
 
-def tcp_loop(bind, table, path, reload_cmd):
+def tcp_loop(bind, table, path, reload_cmd, name):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(bind)
@@ -68,24 +68,26 @@ def tcp_loop(bind, table, path, reload_cmd):
     while True:
         conn, _ = sock.accept()
         threading.Thread(
-            target=handler, args=(conn, table, path, reload_cmd), daemon=True
+            target=handler, args=(conn, table, path, reload_cmd, name), daemon=True
         ).start()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", required=True, help="the port the daemon pokes")
-    ap.add_argument("--out", required=True, help="the table the front routes to")
+    ap.add_argument("--out", required=True, help="the include the front routes with")
+    ap.add_argument("--name", required=True, help="the name this front serves")
     ap.add_argument("--reload", default="", help="a command to run after a change")
     args = ap.parse_args()
     host, _, port = args.listen.rpartition(":")
     bind = (host or "0.0.0.0", int(port))
     table = {}
+    write_table(args.out, table, "", args.name)
     threading.Thread(
-        target=udp_loop, args=(bind, table, args.out, args.reload), daemon=True
+        target=udp_loop, args=(bind, table, args.out, args.reload, args.name), daemon=True
     ).start()
     threading.Thread(
-        target=tcp_loop, args=(bind, table, args.out, args.reload), daemon=True
+        target=tcp_loop, args=(bind, table, args.out, args.reload, args.name), daemon=True
     ).start()
     print("listening for pokes on %s:%d" % bind, flush=True)
     while True:

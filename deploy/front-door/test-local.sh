@@ -108,7 +108,8 @@ case "$code" in
 esac
 
 # The front learns the line's tuple from the poke it receives, per protocol.
-python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams" >/dev/null 2>&1 &
+python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams.map" \
+    --name "$PASS" >/dev/null 2>&1 &
 PIDS+=($!)
 sleep 1
 python3 - <<'PY'
@@ -121,10 +122,11 @@ c.sendall(b"dslp-poke")
 c.close()
 PY
 sleep 1
-if grep -q '^udp 127.0.0.1:' "$W/upstreams" && grep -q '^tcp 127.0.0.1:' "$W/upstreams"; then
-    note "poke listener: learned both protocols, from the poke's own source"
+learnt=$(grep -c "^$PASS 127.0.0.1:" "$W/upstreams.map" || true)
+if [ "$learnt" = 2 ]; then
+    note "poke listener: both protocols in the include, keyed on the poke's own source"
 else
-    note "FAIL poke listener: the table does not carry both protocols"
+    note "FAIL poke listener: the include carries $learnt of the two protocols"
     fail=1
 fi
 
