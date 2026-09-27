@@ -124,6 +124,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut upnp_name = "ds-lite-punch IGD".to_string();
     let mut poke: Option<SocketAddrV4> = None;
     let mut client_identity: Option<(String, String)> = None;
+    let mut front_anchor: Option<String> = None;
     let mut carrier_probe = false;
     let mut carrier_probe_interval: u64 = 900;
     let mut carrier_probe_misses: u64 = 3;
@@ -200,6 +201,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
                     .split_once(':')
                     .ok_or_else(|| "--client-identity: expects cert.pem:key.pem".to_string())?;
                 client_identity = Some((cert.to_string(), key.to_string()));
+                i += 2
+            }
+            "--front-anchor" => {
+                front_anchor = Some(v()?.to_string());
                 i += 2
             }
             "--gateway" => {
@@ -365,6 +370,9 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     }
     if let Some((cert, key)) = client_identity.as_ref() {
         crate::identity::load_identity(cert, key).map_err(|e| format!("--client-identity: {e}"))?;
+    }
+    if let Some(anchor) = front_anchor.as_ref() {
+        crate::identity::der_from_file(anchor).map_err(|e| format!("--front-anchor: {e}"))?;
     }
     Ok(Config {
         bind,

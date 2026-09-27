@@ -172,6 +172,18 @@ fn cli(version: &str) -> Command {
                 ),
         )
         .arg(
+            Arg::new("front-anchor")
+                .long("front-anchor")
+                .value_name("CA.PEM")
+                .help("The authority whose certificate the front presents.")
+                .long_help(
+                    "The authority whose certificate the front presents, as a PEM file. The \
+                     daemon reads it at startup, so a file that cannot be read stops the daemon \
+                     at once, and it falls back to the public roots when the front's certificate \
+                     chains to one of those.",
+                ),
+        )
+        .arg(
             Arg::new("gc-grace-factor")
                 .long("gc-grace-factor")
                 .value_name("N")
