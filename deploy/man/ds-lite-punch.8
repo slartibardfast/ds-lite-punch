@@ -44,6 +44,9 @@ Maximum mappings per client. Default 16.
 \fB\-\-poke\fR \fI<ADDR>\fR
 A peer each keepalive also sends to, from the slot\*(Aqs own socket, so the carrier admits that peer\*(Aqs replies to the slot. The carrier refuses a source the line has never sent to, and this is how a port that has to be reached from outside becomes reachable. Address and port.
 .TP
+\fB\-\-client\-identity\fR \fI<CERT:KEY>\fR
+The certificate and key this daemon presents as its own identity when it calls the front, as two PEM paths separated by a colon. Both are read at startup, so a file that cannot be read stops the daemon rather than the first push.
+.TP
 \fB\-\-gc\-grace\-factor\fR \fI<N>\fR
 Grace multiple applied to a slot\*(Aqs lifetime before it is collected. Default 3.
 .TP

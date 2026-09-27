@@ -160,6 +160,18 @@ fn cli(version: &str) -> Command {
                 ),
         )
         .arg(
+            Arg::new("client-identity")
+                .long("client-identity")
+                .value_name("CERT:KEY")
+                .help("The certificate and key this daemon presents to the front.")
+                .long_help(
+                    "The certificate and key this daemon presents as its own identity when it \
+                     calls the front, as two PEM paths separated by a colon. Both are read at \
+                     startup, so a file that cannot be read stops the daemon rather than the \
+                     first push.",
+                ),
+        )
+        .arg(
             Arg::new("gc-grace-factor")
                 .long("gc-grace-factor")
                 .value_name("N")

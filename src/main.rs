@@ -4,6 +4,7 @@ mod ct;
 mod dp;
 mod engine;
 mod forward;
+mod identity;
 mod keepalive;
 mod mapping;
 mod nft;
@@ -122,6 +123,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut lan_ip = DEFAULT_LAN_IP;
     let mut upnp_name = "ds-lite-punch IGD".to_string();
     let mut poke: Option<SocketAddrV4> = None;
+    let mut client_identity: Option<(String, String)> = None;
     let mut carrier_probe = false;
     let mut carrier_probe_interval: u64 = 900;
     let mut carrier_probe_misses: u64 = 3;
@@ -190,6 +192,14 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
             }
             "--poke" => {
                 poke = Some(v()?.parse().map_err(|e| format!("--poke: {}", e))?);
+                i += 2
+            }
+            "--client-identity" => {
+                let v = v()?;
+                let (cert, key) = v
+                    .split_once(':')
+                    .ok_or_else(|| "--client-identity: expects cert.pem:key.pem".to_string())?;
+                client_identity = Some((cert.to_string(), key.to_string()));
                 i += 2
             }
             "--gateway" => {
@@ -352,6 +362,9 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
             // A TCP slot learns its tuple from a server that answers STUN over TCP, and neither of the two above does.
             "stun.nextcloud.com:443".to_string(),
         ];
+    }
+    if let Some((cert, key)) = client_identity.as_ref() {
+        crate::identity::load_identity(cert, key).map_err(|e| format!("--client-identity: {e}"))?;
     }
     Ok(Config {
         bind,
