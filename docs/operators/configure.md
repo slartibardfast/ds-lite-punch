@@ -103,6 +103,20 @@ carrier that has stopped look the same from the router, so the alarm names both
 causes. The helper is `deploy/carrier-probe.py`, and it runs on a host outside
 the line.
 
+## The front door
+
+Two keys belong to a front-door deployment, which
+[the recipe](front-door.md) describes in full.
+
+| Key | Default | What it does |
+|---|---|---|
+| `POKE` | none | The peer each keepalive also sends to, as `address:port`. The carrier admits the peers the line has spoken to, so a front reaches a held port after the slot's socket has spoken to it. Leave it unset for a line that serves nobody from outside. |
+| `CLIENT_IDENTITY` | none | The certificate and key the daemon presents to the front, as two PEM paths separated by a colon. Both are read at startup, so a file that cannot be read stops the service and the refusal names the flag. The daemon puts it to work when the control channel has a reader, which `call/0042` records. |
+
+The poke rides the keepalive interval, so `INTERVAL` governs how often the line
+speaks to the peer, and a peer the line has stopped speaking to stops being
+reachable once the carrier's mapping dies.
+
 ## Options with no environment key
 
 Some flags are reachable from the command line only. Add them to the `command`
