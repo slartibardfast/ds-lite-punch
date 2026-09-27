@@ -90,6 +90,8 @@ struct Config {
     carrier_probe_interval: u64,
     carrier_probe_misses: u64,
     carrier_probe_poll: u64,
+    /// every keepalive also sends here, so the carrier admits this peer's replies
+    poke: Option<SocketAddrV4>,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -119,6 +121,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut upnp_port: u16 = upnp::UPNP_DEFAULT_PORT;
     let mut lan_ip = DEFAULT_LAN_IP;
     let mut upnp_name = "ds-lite-punch IGD".to_string();
+    let mut poke: Option<SocketAddrV4> = None;
     let mut carrier_probe = false;
     let mut carrier_probe_interval: u64 = 900;
     let mut carrier_probe_misses: u64 = 3;
@@ -183,6 +186,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
             }
             "--interval" => {
                 interval_s = v()?.parse().map_err(|e| format!("--interval: {}", e))?;
+                i += 2
+            }
+            "--poke" => {
+                poke = Some(v()?.parse().map_err(|e| format!("--poke: {}", e))?);
                 i += 2
             }
             "--gateway" => {
@@ -350,6 +357,7 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         static_maps,
         stun,
         interval: Duration::from_secs(interval_s.max(1)),
+        poke,
         gateway,
         state_dir,
         slot_lo,
@@ -661,6 +669,7 @@ async fn main() {
         watch::channel(seed_external_ip(&cfg.state_dir, cfg.bind.port()));
     let publisher = Arc::new(Publisher::with_watch(&cfg.state_dir, ip_tx));
     let state = Arc::new(Mutex::new(State::new(servers.clone())));
+    state.lock().await.poke = cfg.poke;
     let target = cfg.target;
 
     // the ruleset installs once, then each slot gets the ingress translation and the accept, no pin
@@ -737,6 +746,7 @@ async fn main() {
         let state = Arc::new(Mutex::new(State::new(
             state.lock().await.servers.clone(),
         )));
+        state.lock().await.poke = cfg.poke;
         let target = SocketAddrV4::new(s.target, s.target_port);
         let publisher = publisher.clone();
         let bind_port = s.bind_port;
