@@ -120,6 +120,15 @@ mod tests {
         .expect("the extension file");
         run(&["x509", "-req", "-in", "daemon.csr", "-CA", "front.crt", "-CAkey", "front.key",
               "-CAcreateserial", "-days", "1", "-extfile", "daemon.ext", "-out", "daemon.crt"]);
+        run(&["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
+              "-keyout", "server.key", "-out", "server.csr"]);
+        std::fs::write(
+            dir.join("server.ext"),
+            "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n",
+        )
+        .expect("the extension file");
+        run(&["x509", "-req", "-in", "server.csr", "-CA", "front.crt", "-CAkey", "front.key",
+              "-CAcreateserial", "-days", "1", "-extfile", "server.ext", "-out", "server.crt"]);
         dir
     }
 
@@ -148,6 +157,70 @@ mod tests {
         );
         let e = built.err().expect("a mismatched key is refused");
         assert!(e.starts_with("the identity:"), "the refusal names the pairing: {e}");
+    }
+
+    #[test]
+    fn the_client_trusts_a_server_the_anchor_signed_and_refuses_another() {
+        use std::io::{Read, Write};
+        let dir = fixtures();
+        let chain = read_chain(&path_in(&dir, "server.crt")).expect("the server's chain");
+        let key = read_key(&path_in(&dir, "server.key")).expect("the server's key");
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .expect("the server's identity");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let addr = listener.local_addr().expect("its address");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((sock, _)) = listener.accept() else {
+                    return;
+                };
+                let conn =
+                    rustls::ServerConnection::new(std::sync::Arc::new(server.clone())).expect("a session");
+                let mut stream = rustls::StreamOwned::new(conn, sock);
+                let mut buf = [0u8; 1];
+                if stream.read(&mut buf).is_ok() {
+                    let _ = stream.write_all(b"ok");
+                }
+            }
+        });
+        let name = || rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+
+        let config = client_config(
+            &path_in(&dir, "daemon.crt"),
+            &path_in(&dir, "daemon.key"),
+            &path_in(&dir, "front.crt"),
+        )
+        .expect("the client's configuration");
+        let conn =
+            rustls::ClientConnection::new(std::sync::Arc::new(config), name()).expect("a session");
+        let sock = std::net::TcpStream::connect(addr).expect("a connection");
+        let mut stream = rustls::StreamOwned::new(conn, sock);
+        stream
+            .write_all(b"hello")
+            .expect("the client reaches a server the anchor signed");
+        let mut back = [0u8; 2];
+        let _ = stream.read(&mut back);
+
+        let stranger = client_config(
+            &path_in(&dir, "daemon.crt"),
+            &path_in(&dir, "daemon.key"),
+            &path_in(&dir, "other.crt"),
+        )
+        .expect("a configuration over an unrelated anchor");
+        let conn =
+            rustls::ClientConnection::new(std::sync::Arc::new(stranger), name()).expect("a session");
+        let sock = std::net::TcpStream::connect(addr).expect("a second connection");
+        let mut stream = rustls::StreamOwned::new(conn, sock);
+        assert!(
+            stream.write_all(b"hello").is_err(),
+            "a server the anchor did not sign is refused"
+        );
+        handle.join().expect("the server thread");
     }
 
     #[test]
