@@ -1006,6 +1006,69 @@ fn seed_external_ip(state_dir: &str, primary: u16) -> Ipv4Addr {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_poke_leaves_from_the_slots_own_socket() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let dest = match peer.local_addr().unwrap() {
+                SocketAddr::V4(v4) => v4,
+                _ => unreachable!(),
+            };
+            let state = Arc::new(Mutex::new(State::new(vec![SocketAddrV4::new(
+                Ipv4Addr::new(198, 51, 100, 7),
+                3478,
+            )])));
+            state.lock().await.poke = Some(dest);
+            let h = tokio::spawn(keepalive_loop(
+                slot.clone(),
+                state.clone(),
+                Duration::from_millis(50),
+                0,
+            ));
+            let mut buf = [0u8; 32];
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+                    .await
+                    .expect("the poke did not arrive")
+                    .unwrap();
+            h.abort();
+            assert_eq!(&buf[..n], POKE_MARK);
+            assert_eq!(from, slot.local_addr().unwrap(), "the poke must leave the slot's own socket");
+        });
+    }
+
+    #[test]
+    fn a_slot_with_no_peer_sends_no_poke() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let slot = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let state = Arc::new(Mutex::new(State::new(vec![SocketAddrV4::new(
+                Ipv4Addr::new(198, 51, 100, 7),
+                3478,
+            )])));
+            let h = tokio::spawn(keepalive_loop(
+                slot.clone(),
+                state.clone(),
+                Duration::from_millis(50),
+                0,
+            ));
+            let mut buf = [0u8; 32];
+            let got =
+                tokio::time::timeout(Duration::from_millis(300), peer.recv_from(&mut buf)).await;
+            h.abort();
+            assert!(got.is_err(), "a slot with no peer must send nothing");
+        });
+    }
+
     fn argv(rest: &[&str]) -> Vec<String> {
         let mut v = vec!["ds-lite-punch".to_string()];
         v.extend(rest.iter().map(|s| s.to_string()));
