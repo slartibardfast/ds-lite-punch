@@ -48,13 +48,14 @@ PIDS+=($!)
 
 # The configuration under test is the shipped one, rendered here with this harness's values.
 
-mkdir -p "$W/logs" "$W/tmp" && : > "$W/upstreams.map"
+# The include starts with the name line an operator would have, because the TCP leg cannot be learned on one machine and the harness stands in for it.
+mkdir -p "$W/logs" "$W/tmp"
+printf '%s 127.0.0.1:8444;\n' "$PASS" > "$W/upstreams.map"
 sed -e "s|<FRONT_MODULE>|$FRONT_MODULE|g" -e "s|<FRONT_ROOT>|$W|g" \
     -e "s|<CERT_DIR>|$W|g" -e "s|<PUBLIC_LISTEN>|8443|g" \
     -e "s|<PUBLIC_UDP_LISTEN>|8447|g" \
     -e "s|<LOCAL_TLS_LISTEN>|127.0.0.1:8446|g" \
-    -e "s|<PROTECTED_NAME>|$PROT|g" -e "s|<PASSTHRU_NAME>|$PASS|g" \
-    -e "s|<PASSTHRU_TUPLE>|127.0.0.1:8444|g" \
+    -e "s|<PROTECTED_NAME>|$PROT|g" \
     -e "s|<UPSTREAM_MAP>|$W/upstreams.map|g" \
     -e "s|<PROTECTED_UPSTREAM>|127.0.0.1:8445|g" \
     -e "s|<REJECT_BACKEND>|127.0.0.1:9|g" \
