@@ -458,7 +458,7 @@ async fn resolve_stun(hosts: &[String]) -> Vec<SocketAddrV4> {
     out
 }
 
-const POKE_MARK: &[u8] = b"dslp-poke";
+pub(crate) const POKE_MARK: &[u8] = b"dslp-poke";
 
 /// The slot keepalive loop; the caller owns the JoinHandle so a teardown can abort it.
 pub(crate) async fn keepalive_loop(
@@ -731,7 +731,7 @@ async fn main() {
             let bind_port = s.bind_port;
             tokio::spawn(tcpslot::run_tcp_slot(listener, target));
             tokio::spawn(tcpslot::run_connection(
-                bind_ip, bind_port, servers, vote, publisher,
+                bind_ip, bind_port, servers, vote, publisher, cfg.poke,
             ));
             continue;
         }
@@ -777,6 +777,7 @@ async fn main() {
                 interval: cfg.interval,
                 name: cfg.upnp_name.clone(),
                 grace_secs: u64::from(cfg.gc_grace_factor.saturating_mul(60)),
+                poke: cfg.poke,
             },
             table.clone(),
             publisher.clone(),

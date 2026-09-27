@@ -60,6 +60,8 @@ pub struct UpnpConfig {
     pub interval: Duration,
     pub name: String,
     pub grace_secs: u64,
+    /// The peer a granted TCP slot also dials, so the carrier admits it.
+    pub poke: Option<SocketAddrV4>,
 }
 
 /// One granted mapping: req_ext is the UPnP key, bind_port the granted inner R, desc the client's own label.
@@ -1053,8 +1055,16 @@ impl UpnpFacade {
         let vote = Arc::new(Mutex::new(VoteState::new()));
         let publisher = self.publisher.clone();
         let servers = self.cfg.servers.clone();
+        let poke = self.cfg.poke;
         let bind_ip = self.cfg.bind_ip;
-        let h2 = tokio::spawn(tcpslot::run_connection(bind_ip, bind_port, servers, vote, publisher));
+        let h2 = tokio::spawn(tcpslot::run_connection(
+            bind_ip,
+            bind_port,
+            servers,
+            vote,
+            publisher,
+            poke,
+        ));
         Ok(vec![h1, h2])
     }
 
@@ -3833,6 +3843,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "hammer".into(),
             grace_secs: 60,
@@ -3947,6 +3958,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "slot-revoke".into(),
             grace_secs: 60,
@@ -4165,6 +4177,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/containment".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "containment".into(),
             grace_secs: 60,
@@ -4482,6 +4495,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/wip2-listing".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "wip2-listing".into(),
             grace_secs: 60,
@@ -4625,6 +4639,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "restored-grant".into(),
             grace_secs: 60,
@@ -4697,6 +4712,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "gena-seq".into(),
             grace_secs: 60,
@@ -4781,6 +4797,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "lease-policy".into(),
             grace_secs: 60,
@@ -5219,6 +5236,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "routing".into(),
             grace_secs: 60,
@@ -5325,6 +5343,7 @@ mod tests {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "ssdp-loop".into(),
             grace_secs: 60,
@@ -5520,6 +5539,7 @@ mod ifindex_probe {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "interop".into(),
             grace_secs: 60,
@@ -5755,6 +5775,7 @@ mod ifindex_probe {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/dp-wire".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "dp-wire".into(),
             grace_secs: 60,
@@ -6231,6 +6252,7 @@ mod ifindex_probe {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/wip2-conn".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "wip2-conn".into(),
             grace_secs: 60,
@@ -6339,6 +6361,7 @@ mod ifindex_probe {
                 bind_ip: Ipv4Addr::LOCALHOST,
                 state_dir: "/tmp/wip2-conn-down".into(),
                 servers: Vec::new(),
+            poke: None,
                 interval: Duration::from_secs(2),
                 name: "wip2-conn-down".into(),
                 grace_secs: 60,
@@ -6514,6 +6537,7 @@ mod ifindex_probe {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "signal".into(),
             grace_secs: 60,
@@ -6607,6 +6631,7 @@ mod ifindex_probe {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: "/tmp/none".into(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "pcp".into(),
             grace_secs: 60,
@@ -6771,6 +6796,7 @@ mod ifindex_probe {
             bind_ip: Ipv4Addr::LOCALHOST,
             state_dir: dir.clone(),
             servers: Vec::new(),
+            poke: None,
             interval: Duration::from_secs(2),
             name: "tuple-file".into(),
             grace_secs: 60,

@@ -99,6 +99,24 @@ async fn connection_round(
     Ok((tuple, conn, local_port))
 }
 
+/// Pokes a nominated peer through a fold pin, so the dial leaves as the slot's own tuple, and removes the pin afterwards.
+async fn poke_round(bind_ip: Ipv4Addr, r: u16, dest: SocketAddrV4) -> io::Result<()> {
+    let sock = tokio::net::TcpSocket::new_v4()?;
+    sock.set_reuseaddr(true)?;
+    sock.bind(std::net::SocketAddr::V4(SocketAddrV4::new(bind_ip, 0)))?;
+    let local_port = sock.local_addr()?.port();
+    crate::nft::add_pin(bind_ip, local_port, r)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("poke fold pin: {e}")))?;
+    let result = async {
+        let mut conn = sock.connect(std::net::SocketAddr::V4(dest)).await?;
+        conn.write_all(crate::POKE_MARK).await?;
+        Ok(())
+    }
+    .await;
+    let _ = crate::nft::del_pin(bind_ip, local_port);
+    result
+}
+
 /// Refreshes the held connection each interval and re-establishes on error, rotating servers.
 pub async fn run_connection(
     bind_ip: Ipv4Addr,
@@ -106,6 +124,7 @@ pub async fn run_connection(
     servers: Vec<SocketAddrV4>,
     vote: Arc<Mutex<VoteState>>,
     publisher: Arc<Publisher>,
+    poke: Option<SocketAddrV4>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(TCP_KEEPALIVE_SECS));
     let mut state = ConnectionState::Dead;
@@ -115,6 +134,9 @@ pub async fn run_connection(
     loop {
         interval.tick().await;
         if state.is_live() && conn.is_some() {
+            if let Some(dest) = poke {
+                let _ = poke_round(bind_ip, r, dest).await;
+            }
             // Refresh the held connection: the STUN traffic re-arms the AFTR idle timer.
             let Some(c) = conn.as_mut() else {
                 continue;
