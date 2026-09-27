@@ -111,7 +111,7 @@ esac
 
 # The front learns the line's tuple from the poke it receives, and the UDP leg follows it.
 python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams.map" \
-    --name "$PASS" --udp-port 8447 \
+    --name "$PASS" --udp-port 8447 --lease 15 \
     --reload "$NGINX_BIN -c $W/nginx.conf -s reload" >/dev/null 2>&1 &
 PIDS+=($!)
 python3 - <<'PY' > "$W/udp-leg.txt" 2>&1 &
@@ -147,6 +147,15 @@ if [ "$learnt_name" = 1 ] && [ "$learnt_port" = 1 ] \
 else
     note "FAIL front learning: $learnt_name name-keyed, $learnt_port port-keyed, and $(tr -d '\n' <"$W/udp-leg.txt")"
     fail=1
+fi
+
+# A lease that stops being renewed stops being routed.
+sleep 17
+if [ -s "$W/upstreams.map" ]; then
+    note "FAIL lease: the include still carries $(tr '\n' ' ' <"$W/upstreams.map")"
+    fail=1
+else
+    note "lease: the entry left with the pokes that kept it"
 fi
 
 if [ "$fail" = 0 ]; then

@@ -49,6 +49,7 @@ def udp_loop(bind, table, path, reload_cmd, name):
         if not data.startswith(MARK):
             continue
         table["udp"] = "%s:%d" % (peer[0], peer[1])
+        table["udp_seen"] = time.time()
         print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
         write_table(path, table, reload_cmd, name)
 
@@ -56,6 +57,7 @@ def udp_loop(bind, table, path, reload_cmd, name):
 def handler(conn, table, path, reload_cmd, name):
     peer = conn.getpeername()
     table["tcp"] = "%s:%d" % (peer[0], peer[1])
+    table["tcp_seen"] = time.time()
     print("tcp poke from %s:%d" % (peer[0], peer[1]), flush=True)
     write_table(path, table, reload_cmd, name)
     conn.close()
@@ -73,12 +75,29 @@ def tcp_loop(bind, table, path, reload_cmd, name):
         ).start()
 
 
+def lease_watch(table, path, reload_cmd, name, lease):
+    if lease <= 0:
+        return
+    while True:
+        time.sleep(1)
+        now = time.time()
+        dropped = False
+        for proto in ("udp", "tcp"):
+            if proto in table and now - table.get(proto + "_seen", now) > lease:
+                del table[proto]
+                dropped = True
+        if dropped:
+            print("lease expired: the entry went with it", flush=True)
+            write_table(path, table, reload_cmd, name)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", required=True, help="the port the daemon pokes")
     ap.add_argument("--out", required=True, help="the include the front routes with")
     ap.add_argument("--name", required=True, help="the name this front serves")
     ap.add_argument("--udp-port", default="", help="the public UDP port the UDP map is keyed on")
+    ap.add_argument("--lease", type=int, default=0, help="withdraw an entry this many seconds after its last poke; 0 keeps it")
     ap.add_argument("--reload", default="", help="a command to run after a change")
     args = ap.parse_args()
     host, _, port = args.listen.rpartition(":")
@@ -92,6 +111,11 @@ def main():
     ).start()
     threading.Thread(
         target=tcp_loop, args=(bind, table, args.out, args.reload, args.name), daemon=True
+    ).start()
+    threading.Thread(
+        target=lease_watch,
+        args=(table, args.out, args.reload, args.name, args.lease),
+        daemon=True,
     ).start()
     print("listening for pokes on %s:%d" % bind, flush=True)
     while True:
