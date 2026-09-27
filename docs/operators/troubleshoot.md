@@ -169,6 +169,28 @@ absent. After you change the ACL file, restart the service.
 The carrier can also answer a request with a different port. A request for a
 port is a key, and the carrier is free to ignore it.
 
+## The daemon refuses the identity you minted
+
+The daemon reads `--client-identity` at startup and stops if the file cannot be
+used. The refusal names the flag and the reason, and one reason reads `invalid peer
+certificate: UnsupportedCertVersion`. That means the certificate is X.509 version
+one: it carries no extensions at all.
+
+A certificate from `openssl x509 -req` without an extensions file is exactly that,
+which is how `mint-client.py` minted before it was corrected. Ask the file:
+
+```
+openssl x509 -in alice.crt -noout -ext extendedKeyUsage
+```
+
+A version one certificate answers `No extensions in certificate`, and one the tool
+mints now answers `TLS Web Client Authentication`. Mint the identity again with the
+current tool, which writes `basicConstraints=CA:FALSE`, `keyUsage=digitalSignature`
+and `extendedKeyUsage=clientAuth` beside the certificate. The front's own
+certificate needs the same treatment on its side of the connection:
+`extendedKeyUsage=serverAuth` and a `subjectAltName` naming the address a client
+uses.
+
 ## Where to go next
 
 - [Install](install.md) the daemon.
