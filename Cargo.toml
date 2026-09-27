@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 libc = "0.2"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
 
 # Register the kani cfg so rustc stays quiet about the proof modules when Kani is not running.
 [lints.rust]
