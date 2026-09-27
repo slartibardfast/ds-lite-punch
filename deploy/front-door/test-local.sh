@@ -107,6 +107,27 @@ case "$code" in
                       fail=1 ;;
 esac
 
+# The front learns the line's tuple from the poke it receives, per protocol.
+python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams" >/dev/null 2>&1 &
+PIDS+=($!)
+sleep 1
+python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.sendto(b"dslp-poke", ("127.0.0.1", 41001))
+s.close()
+c = socket.create_connection(("127.0.0.1", 41001), timeout=3)
+c.sendall(b"dslp-poke")
+c.close()
+PY
+sleep 1
+if grep -q '^udp 127.0.0.1:' "$W/upstreams" && grep -q '^tcp 127.0.0.1:' "$W/upstreams"; then
+    note "poke listener: learned both protocols, from the poke's own source"
+else
+    note "FAIL poke listener: the table does not carry both protocols"
+    fail=1
+fi
+
 if [ "$fail" = 0 ]; then
     note "front-door harness: the split by name holds"
 else
