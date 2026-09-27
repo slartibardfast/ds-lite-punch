@@ -31,9 +31,10 @@ MARK = b"dslp-poke"
 def write_table(path, table, reload_cmd, name):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        for proto in ("udp", "tcp"):
-            if proto in table:
-                fh.write("%s %s;\n" % (name, table[proto]))
+        if "udp" in table and "udp_port" in table:
+            fh.write("%s %s;\n" % (table["udp_port"], table["udp"]))
+        if "tcp" in table:
+            fh.write("%s %s;\n" % (name, table["tcp"]))
     os.replace(tmp, path)
     if reload_cmd:
         subprocess.run(reload_cmd, shell=True, check=False)
@@ -77,11 +78,14 @@ def main():
     ap.add_argument("--listen", required=True, help="the port the daemon pokes")
     ap.add_argument("--out", required=True, help="the include the front routes with")
     ap.add_argument("--name", required=True, help="the name this front serves")
+    ap.add_argument("--udp-port", default="", help="the public UDP port the UDP map is keyed on")
     ap.add_argument("--reload", default="", help="a command to run after a change")
     args = ap.parse_args()
     host, _, port = args.listen.rpartition(":")
     bind = (host or "0.0.0.0", int(port))
     table = {}
+    if args.udp_port:
+        table["udp_port"] = args.udp_port
     write_table(args.out, table, "", args.name)
     threading.Thread(
         target=udp_loop, args=(bind, table, args.out, args.reload, args.name), daemon=True

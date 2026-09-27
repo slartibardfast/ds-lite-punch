@@ -48,12 +48,14 @@ PIDS+=($!)
 
 # The configuration under test is the shipped one, rendered here with this harness's values.
 
-mkdir -p "$W/logs" "$W/tmp"
+mkdir -p "$W/logs" "$W/tmp" && : > "$W/upstreams.map"
 sed -e "s|<FRONT_MODULE>|$FRONT_MODULE|g" -e "s|<FRONT_ROOT>|$W|g" \
     -e "s|<CERT_DIR>|$W|g" -e "s|<PUBLIC_LISTEN>|8443|g" \
+    -e "s|<PUBLIC_UDP_LISTEN>|8447|g" \
     -e "s|<LOCAL_TLS_LISTEN>|127.0.0.1:8446|g" \
     -e "s|<PROTECTED_NAME>|$PROT|g" -e "s|<PASSTHRU_NAME>|$PASS|g" \
     -e "s|<PASSTHRU_TUPLE>|127.0.0.1:8444|g" \
+    -e "s|<UPSTREAM_MAP>|$W/upstreams.map|g" \
     -e "s|<PROTECTED_UPSTREAM>|127.0.0.1:8445|g" \
     -e "s|<REJECT_BACKEND>|127.0.0.1:9|g" \
     "$HERE/nginx.conf" > "$W/nginx.conf"
@@ -109,7 +111,7 @@ esac
 
 # The front learns the line's tuple from the poke it receives, per protocol.
 python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams.map" \
-    --name "$PASS" >/dev/null 2>&1 &
+    --name "$PASS" --udp-port 8447 >/dev/null 2>&1 &
 PIDS+=($!)
 sleep 1
 python3 - <<'PY'
@@ -122,11 +124,12 @@ c.sendall(b"dslp-poke")
 c.close()
 PY
 sleep 1
-learnt=$(grep -c "^$PASS 127.0.0.1:" "$W/upstreams.map" || true)
-if [ "$learnt" = 2 ]; then
-    note "poke listener: both protocols in the include, keyed on the poke's own source"
+learnt_name=$(grep -c "^$PASS 127.0.0.1:" "$W/upstreams.map" || true)
+learnt_port=$(grep -c "^8447 127.0.0.1:" "$W/upstreams.map" || true)
+if [ "$learnt_name" = 1 ] && [ "$learnt_port" = 1 ]; then
+    note "poke listener: a name-keyed line for TCP, a port-keyed line for UDP"
 else
-    note "FAIL poke listener: the include carries $learnt of the two protocols"
+    note "FAIL poke listener: the include has $learnt_name name-keyed and $learnt_port port-keyed"
     fail=1
 fi
 
