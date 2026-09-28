@@ -16,9 +16,9 @@ local network.
 - **Answer.** The daemon answers UPnP IGD, PCP and NAT-PMP. A client can ask
   for a mapping, and it can read the mapping back.
 
-## State at 2026-09-19
+## State
 
-Working on the test router today:
+What holds on the test router:
 
 - A mapping kept alive survives the silence of its client. The external vantage
   answered the mapping after 30, 60, 120 and 300 seconds of silence
@@ -30,6 +30,11 @@ Working on the test router today:
 - The keepalive's admission: the operator names the devices whose mappings are
   kept alive.
 - The collision rules hold for a port that nobody allocated.
+- The front door's line side: the keepalive also pokes a nominated front, so the
+  carrier admits that front's arrivals at the held port, and the daemon carries a
+  certificate of its own for the control channel it opens
+  ([plan/0012](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0012-the-front-door/README.md),
+  [the operator page](docs/operators/front-door.md)).
 
 Evidence, for a reader who must re-derive these claims:
 
@@ -40,8 +45,8 @@ Evidence, for a reader who must re-derive these claims:
 | toolchain | `ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a` |
 | build | `cargo build --release --target x86_64-unknown-linux-musl` |
 | artifact | `target/x86_64-unknown-linux-musl/release/ds-lite-punch` |
-| artifact sha256 | `ab0f9bd517ef075885fd5b6e6a91b9fcc7e64ad9805e7d6450f2bd3eefd11a45` |
-| tests | 196 passed, 1 ignored |
+| artifact sha256 | the value [`.host-software`](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/.host-software) records, printed by the lane on every push |
+| tests | the suite, run by the lane on every push |
 | proofs | Kani harnesses: the STUN codec, the slot and TCP-mapping invariants, the SSDP grammar, the SOAP dispatch, the enumeration index, the session identifier, the sequence number |
 | lane | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 
@@ -64,18 +69,14 @@ and an empty upload fails the job. The test router runs the bytes from the lane
 
 ## Future work
 
-1. **The lobby case.** A console in a lobby sends no traffic. The keepalive must
-   survive that silence on a real console. This test needs the operator
-   ([plan/0009](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0009-mapping-keepalive-and-signalling/README.md)).
+1. **The lobby case.** The hold survives a quiet console
+   ([call/0030](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0030-a-mapping-ends-with-its-device.md)),
+   and the run that confirms it on a real console needs the operator
+   ([plan/0010](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0010-the-filtering-proved-and-watched/README.md)
+   names what its own run leaves out).
 2. **The Kani suite on a larger host.** The full suite waits for a host with
    more memory
    ([call/0019](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0019-facade-kani-deferred-to-larger-host.md)).
-3. **The R4 rule.** A late collision moves an allocation, and it never moves a
-   punch. Decide if the rule must follow the protocol of the entry
-   ([call/0027](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0027-collisions-for-punched-ports.md),
-   [result](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/results/RESULTS-2026-09-18-collision-yield.md)).
-4. **EIF loss.** Detect a change in the filtering behaviour of the carrier
-   ([plan/0004](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/plan/0004-ds-lite-punch/README.md)).
 
 ## Build
 
