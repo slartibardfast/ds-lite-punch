@@ -50,6 +50,29 @@ jobs:
             artifact-record.txt
           if-no-files-found: error
 
+  # The bundle is the build's hermeticity (call/0039), and the host's release stages it by name, so this job holds the producer to that contract and proves the offline build where a container runtime exists.
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: The bundle carries the snippet the host's release stages by name
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'sh tools/bundle-deps.sh deps-vendor.tar.gz'
+          # The host reads vendor-config.toml (host-lifecycle's stage_deps_bundle, v0.53.0 on, with no fallback): a snippet named otherwise is a release that cannot stage.
+          tar tzf deps-vendor.tar.gz | grep -qx 'vendor/'
+          tar tzf deps-vendor.tar.gz | grep -qx 'vendor-config.toml'
+          tar xzf deps-vendor.tar.gz
+          rm -f deps-vendor.tar.gz
+          cat vendor-config.toml >> .cargo/config.toml
+          rm -f vendor-config.toml
+      - name: The pinned toolchain builds the artifact with the network off
+        run: |
+          # An empty CARGO_HOME alongside --network none, so a crate missing from the bundle fails here rather than arriving from the image's registry cache.
+          docker run --rm --network none -e CARGO_HOME=/tmp/cargo-home -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'cargo build --release --locked --offline --target x86_64-unknown-linux-musl'
+          test -s "$ARTIFACT"
+
   # One definition generates the help text and the manual page, and this job regenerates both and holds them to it.
   docs:
     runs-on: ubuntu-latest
