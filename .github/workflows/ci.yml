@@ -32,10 +32,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # The line this job prints is the one `.host-software` records, and that record's hash comes from the recorded bundle built with the network off. A registry build hashes differently, so the bundle the committed lock names is staged first.
+      - name: Stage the recorded dependency bundle
+        run: |
+          read -r URL SHA _ < deps-bundle.lock
+          curl -fsSL --retry 3 -o deps-vendor.tar.gz "$URL"
+          echo "$SHA  deps-vendor.tar.gz" | sha256sum -c -
+          tar xzf deps-vendor.tar.gz
+          rm -f deps-vendor.tar.gz
+          cat vendor-config.toml >> .cargo/config.toml
+          rm -f vendor-config.toml
       - name: Build the release artifact in the pinned toolchain
         run: |
-          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
-            sh -c 'cargo build --release --locked --target x86_64-unknown-linux-musl'
+          # CARGO_HOME is left alone: the image's own cargo config names the musl linker, and hiding it links different bytes.
+          docker run --rm --network none -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'cargo build --release --target x86_64-unknown-linux-musl'
+          test -s "$ARTIFACT"
       # Printed in the form `.host-software` records, so re-deriving the anchor is a copy rather than a transcription.
       - name: Print the artifact hash as `.host-software` records it
         run: |
@@ -68,9 +80,9 @@ jobs:
           rm -f vendor-config.toml
       - name: The pinned toolchain builds the artifact with the network off
         run: |
-          # An empty CARGO_HOME alongside --network none, so a crate missing from the bundle fails here rather than arriving from the image's registry cache.
+          # An empty CARGO_HOME alongside --network none, so a crate missing from the bundle fails here rather than arriving from the image's registry cache. The image's cargo config is copied in, because it names the musl linker: without it this build links different bytes from the recorded ones.
           docker run --rm --network none -e CARGO_HOME=/tmp/cargo-home -v "$PWD":/src -w /src "$TOOLCHAIN" \
-            sh -c 'cargo build --release --locked --offline --target x86_64-unknown-linux-musl'
+            sh -c 'mkdir -p /tmp/cargo-home && cp /root/.cargo/config.toml /tmp/cargo-home/ && cargo build --release --locked --offline --target x86_64-unknown-linux-musl'
           test -s "$ARTIFACT"
 
   # One definition generates the help text and the manual page, and this job regenerates both and holds them to it.
