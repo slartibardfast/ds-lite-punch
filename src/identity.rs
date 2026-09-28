@@ -94,6 +94,12 @@ mod tests {
     }
 
     fn fixtures() -> std::path::PathBuf {
+        // One build per process: four tests running in parallel rewrote this one directory, and a reader then verified a certificate signed by the other run's authority, which rustls reports as BadSignature.
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(fixtures_once).clone()
+    }
+
+    fn fixtures_once() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dslp-identity-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let run = |args: &[&str]| {
