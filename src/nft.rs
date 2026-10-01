@@ -222,9 +222,7 @@ pub fn inbound_set_has(bind_port: u16, tcp: bool) -> bool {
     parse_port_set(&String::from_utf8_lossy(&out.stdout)).contains(&bind_port)
 }
 
-/// The element statements a grant installs: both protocols admit the port, and UDP adds the translation to
-/// the client. A TCP arrival is left for the daemon's own listener instead, which splices it to the client
-/// and answers from an address the line's policy rule selects, where a forwarded arrival's reply has none.
+/// The elements a grant installs: both protocols admit the port, and UDP adds the translation to the client.
 pub fn grant_script(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> String {
     let admitted = format!(
         "add element ip dslp {} {{ {} }}\n",
@@ -232,6 +230,7 @@ pub fn grant_script(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) 
         bind_port
     );
     if tcp {
+        // TCP keeps no translation, so the arrival reaches the daemon's listener, whose reply the line routes
         return admitted;
     }
     format!(
@@ -244,8 +243,7 @@ pub fn grant_script(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) 
     )
 }
 
-/// Grant a slot's datapath: accept the port on eth1, and install the elements its protocol's ingress path
-/// needs.
+/// Grant a slot's datapath: accept the port on eth1, and install the elements its protocol's ingress needs.
 pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
     // the grant installs no pin: egress keeps the client's port, and the ingress path differs by protocol
     run_script(&grant_script(client, int_port, bind_port, tcp))?;
