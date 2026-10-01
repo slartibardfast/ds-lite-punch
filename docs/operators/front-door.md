@@ -141,8 +141,9 @@ ip rule add from <service host> to <peer> lookup 1001 prio 25002
 ```
 
 The consoles on this network carry rules of their own and work for that reason. A
-deployment that would rather not configure the service host can wait for the
-daemon-side rewrite, which presents the daemon's own bind address and needs no rule.
+granted TCP slot needs none: the daemon's own connection to the client originates
+from its bind address, which carries the rule already, so the reply takes the line
+the mapping is on.
 
 ## What the carrier decides, not you
 

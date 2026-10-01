@@ -23,7 +23,8 @@ What holds on the test router:
 - A mapping kept alive survives the silence of its client. The external vantage
   answered the mapping after 30, 60, 120 and 300 seconds of silence
   ([measurements](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/results/RESULTS-2026-09-18-held-mapping-silence.md)).
-- Inbound UDP and TCP forward to the target, with the source address kept.
+- Inbound UDP forwards to the target with the source address kept, and a TCP
+  arrival is served by the daemon's own connection to the client.
 - The UPnP IGD facade answers for both service versions: `WANIPConnection:1`
   and `WANIPConnection:2`, with `DeviceProtection:1`.
 - PCP and NAT-PMP answer on UDP port 5351, on the local network only.
