@@ -222,31 +222,58 @@ pub fn inbound_set_has(bind_port: u16, tcp: bool) -> bool {
     parse_port_set(&String::from_utf8_lossy(&out.stdout)).contains(&bind_port)
 }
 
-/// Grant a slot's datapath: accept the port on eth1 and translate an ingress arrival to its owning client.
-pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
-    // the grant installs no pin: egress keeps the client's port, and ingress is translated instead
-    let script = format!(
-        "add element ip dslp {} {{ {} }}\n\
-         add element ip dslp {} {{ {} : {} . {} }}\n",
+/// The element statements a grant installs: both protocols admit the port, and UDP adds the translation to
+/// the client. A TCP arrival is left for the daemon's own listener instead, which splices it to the client
+/// and answers from an address the line's policy rule selects, where a forwarded arrival's reply has none.
+pub fn grant_script(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> String {
+    let admitted = format!(
+        "add element ip dslp {} {{ {} }}\n",
         inbound_set(tcp),
-        bind_port,
+        bind_port
+    );
+    if tcp {
+        return admitted;
+    }
+    format!(
+        "{}add element ip dslp {} {{ {} : {} . {} }}\n",
+        admitted,
         inbound_map(tcp),
         bind_port,
         client,
         int_port
-    );
-    run_script(&script)?;
+    )
+}
+
+/// Grant a slot's datapath: accept the port on eth1, and install the elements its protocol's ingress path
+/// needs.
+pub fn grant_datapath(client: Ipv4Addr, int_port: u16, bind_port: u16, tcp: bool) -> io::Result<()> {
+    // the grant installs no pin: egress keeps the client's port, and the ingress path differs by protocol
+    run_script(&grant_script(client, int_port, bind_port, tcp))?;
     add_input_accept(bind_port, tcp)
 }
 
 /// The statements that revoke a slot's datapath; each runs on its own, since a batch is all-or-nothing.
 pub fn revoke_statements(bind_port: u16, tcp: bool) -> Vec<String> {
     // no snat_map statement: the grant installs no pin, so a pin delete could only fail
-    vec![
-        format!("delete element ip dslp {} {{ {} }}", inbound_set(tcp), bind_port),
-        format!("delete element ip dslp {} {{ {} }}", inbound_map(tcp), bind_port),
-        format!("delete element inet fw4 {} {{ {} }}", accept_set(tcp), bind_port),
-    ]
+    let mut out = vec![format!(
+        "delete element ip dslp {} {{ {} }}",
+        inbound_set(tcp),
+        bind_port
+    )];
+    if !tcp {
+        // a TCP grant installs no translation element, so deleting one could only fail
+        out.push(format!(
+            "delete element ip dslp {} {{ {} }}",
+            inbound_map(tcp),
+            bind_port
+        ));
+    }
+    out.push(format!(
+        "delete element inet fw4 {} {{ {} }}",
+        accept_set(tcp),
+        bind_port
+    ));
+    out
 }
 
 /// Revoke a slot's datapath one statement at a time, and read the inbound set back afterwards.
@@ -965,17 +992,33 @@ mod tests {
     #[test]
     fn a_grant_translates_the_port_to_the_client_that_owns_it() {
         let client = Ipv4Addr::new(192, 168, 21, 11);
-        let script = format!(
-            "add element ip dslp {} {{ {} }}\nadd element ip dslp {} {{ {} : {} . {} }}\n",
-            INBOUND_SET_UDP,
-            40002,
-            INBOUND_MAP_UDP,
-            40002,
-            client,
-            41010
-        );
+        let script = grant_script(client, 41010, 40002, false);
         assert!(script.contains("dslp_in_udp { 40002 }"));
         assert!(script.contains("dslp_dnat_udp { 40002 : 192.168.21.11 . 41010 }"));
+    }
+
+    #[test]
+    fn a_tcp_grant_admits_the_port_and_leaves_the_arrival_to_the_listener() {
+        let client = Ipv4Addr::new(192, 168, 21, 11);
+        let script = grant_script(client, 41010, 40002, true);
+        assert!(script.contains("dslp_in_tcp { 40002 }"), "{script}");
+        // a translation would hand the arrival to the client, whose reply carries no rule for the line
+        assert!(!script.contains(INBOUND_MAP_TCP), "{script}");
+        assert!(!script.contains("192.168.21.11"), "{script}");
+    }
+
+    #[test]
+    fn a_tcp_revoke_deletes_what_its_grant_installed() {
+        let stmts = revoke_statements(40002, true);
+        assert_eq!(stmts.len(), 2, "{:?}", stmts);
+        assert!(stmts[0].contains(&format!("{} {{ 40002 }}", INBOUND_SET_TCP)));
+        assert!(stmts[1].contains(&format!("{} {{ 40002 }}", ACCEPT_SET_TCP)));
+        for s in &stmts {
+            assert!(
+                !s.contains(INBOUND_MAP_TCP),
+                "a translation the grant never installs: {s}"
+            );
+        }
     }
 
     #[test]
