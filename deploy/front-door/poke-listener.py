@@ -13,11 +13,14 @@ The table this writes is what the front routes to, one line per protocol:
 
 Run it beside nginx on the front. Give it the same port the daemon pokes, a path
 for the table, and, when the front should pick the table up, a reload command.
+With --http-listen it also answers the daemon's control-channel push from this
+same table, which is how the daemon learns the tuple the front sees for the line.
 
     poke-listener.py --listen 0.0.0.0:41001 --out /etc/front-door/upstreams \\
         --reload "nginx -s reload"
 """
 import argparse
+import http.server
 import os
 import socket
 import subprocess
@@ -38,6 +41,39 @@ def write_table(path, table, reload_cmd, name):
     os.replace(tmp, path)
     if reload_cmd:
         subprocess.run(reload_cmd, shell=True, check=False)
+
+
+class Report(http.server.BaseHTTPRequestHandler):
+    """Answer the daemon's push with the tuple this front sees, one line per protocol."""
+
+    def _answer(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        lines = []
+        for proto in ("udp", "tcp"):
+            if proto in self.server.table:
+                lines.append("%s %s" % (proto, self.server.table[proto]))
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = _answer
+    do_POST = _answer
+
+    def log_message(self, fmt, *args):
+        print("report: " + (fmt % args), flush=True)
+
+
+class ReportServer(http.server.ThreadingHTTPServer):
+    """Carry the front's own table to the handler, which answers every push with it."""
+
+    def __init__(self, bind, table):
+        self.table = table
+        super().__init__(bind, Report)
 
 
 def udp_loop(bind, table, path, reload_cmd, name):
@@ -99,6 +135,7 @@ def main():
     ap.add_argument("--udp-port", default="", help="the public UDP port the UDP map is keyed on")
     ap.add_argument("--lease", type=int, default=0, help="withdraw an entry this many seconds after its last poke; 0 keeps it")
     ap.add_argument("--reload", default="", help="a command to run after a change")
+    ap.add_argument("--http-listen", default="", help="the address the daemon's push is answered on; empty leaves the report off")
     args = ap.parse_args()
     host, _, port = args.listen.rpartition(":")
     bind = (host or "0.0.0.0", int(port))
@@ -118,6 +155,15 @@ def main():
         daemon=True,
     ).start()
     print("listening for pokes on %s:%d" % bind, flush=True)
+    if args.http_listen:
+        hhost, _, hport = args.http_listen.rpartition(":")
+        report = ReportServer((hhost or "127.0.0.1", int(hport)), table)
+        threading.Thread(target=report.serve_forever, daemon=True).start()
+        print(
+            "answering the daemon's push on %s:%d"
+            % (report.server_address[0], report.server_address[1]),
+            flush=True,
+        )
     while True:
         time.sleep(3600)
 

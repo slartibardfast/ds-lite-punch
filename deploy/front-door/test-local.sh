@@ -58,6 +58,7 @@ sed -e "s|<FRONT_MODULE>|$FRONT_MODULE|g" -e "s|<FRONT_ROOT>|$W|g" \
     -e "s|<PROTECTED_NAME>|$PROT|g" \
     -e "s|<UPSTREAM_MAP>|$W/upstreams.map|g" \
     -e "s|<PROTECTED_UPSTREAM>|127.0.0.1:8445|g" \
+    -e "s|<REPORT_UPSTREAM>|127.0.0.1:8448|g" \
     -e "s|<REJECT_BACKEND>|127.0.0.1:9|g" \
     "$HERE/nginx.conf" > "$W/nginx.conf"
 "$NGINX_BIN" -c "$W/nginx.conf" -t
@@ -112,7 +113,7 @@ esac
 
 # The front learns the line's tuple from the poke it receives, and the UDP leg follows it.
 python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams.map" \
-    --name "$PASS" --udp-port 8447 --lease 15 \
+    --name "$PASS" --udp-port 8447 --lease 15 --http-listen 127.0.0.1:8448 \
     --reload "$NGINX_BIN -c $W/nginx.conf -s reload" >/dev/null 2>&1 &
 PIDS+=($!)
 python3 - <<'PY' > "$W/udp-leg.txt" 2>&1 &
@@ -147,6 +148,21 @@ if [ "$learnt_name" = 1 ] && [ "$learnt_port" = 1 ] \
     note "the front follows the poke: the UDP forward went to the tuple it learned"
 else
     note "FAIL front learning: $learnt_name name-keyed, $learnt_port port-keyed, and $(tr -d '\n' <"$W/udp-leg.txt")"
+    fail=1
+fi
+
+# The control channel carries what the poke cannot: the daemon's push is answered with the tuple the front sees.
+if report=$(curl -sS --max-time 5 --cacert "$W/ca.crt" --cert "$W/client.crt" --key "$W/client.key" \
+        --resolve "$PROT:8443:127.0.0.1" -X POST --data-binary $'40000 17 127.0.0.1:8455\n' \
+        "https://$PROT:8443/table" 2>"$W/report.err"); then
+    case "$report" in
+        *"udp 127.0.0.1:8455"*)
+            note "control channel: the push was answered with the tuple the front sees" ;;
+        *)  note "FAIL control channel: the answer carried '${report:0:80}'"
+            fail=1 ;;
+    esac
+else
+    note "FAIL control channel: the push was refused: $(tr -d '\n' <"$W/report.err" | head -c 100)"
     fail=1
 fi
 

@@ -66,6 +66,10 @@ struct Config {
     interval: Duration,
     gateway: String,
     state_dir: String,
+    front_endpoint: Option<String>,
+    front_name: Option<String>,
+    client_identity: Option<(String, String)>,
+    front_anchor: Option<String>,
     slot_lo: u16,
     slot_hi: u16,
     max_slots: usize,
@@ -126,6 +130,8 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     let mut poke: Option<SocketAddrV4> = None;
     let mut client_identity: Option<(String, String)> = None;
     let mut front_anchor: Option<String> = None;
+    let mut front_endpoint: Option<String> = None;
+    let mut front_name: Option<String> = None;
     let mut carrier_probe = false;
     let mut carrier_probe_interval: u64 = 900;
     let mut carrier_probe_misses: u64 = 3;
@@ -206,6 +212,14 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
             }
             "--front-anchor" => {
                 front_anchor = Some(v()?.to_string());
+                i += 2
+            }
+            "--front-endpoint" => {
+                front_endpoint = Some(v()?.to_string());
+                i += 2
+            }
+            "--front-name" => {
+                front_name = Some(v()?.to_string());
                 i += 2
             }
             "--gateway" => {
@@ -375,6 +389,20 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
     if let Some(anchor) = front_anchor.as_ref() {
         crate::identity::der_from_file(anchor).map_err(|e| format!("--front-anchor: {e}"))?;
     }
+    // the control channel: an endpoint and the name the front serves, with the identity and the anchor it needs
+    match (front_endpoint.as_ref(), front_name.as_ref()) {
+        (Some(_), None) => return Err("--front-endpoint needs --front-name".to_string()),
+        (None, Some(_)) => return Err("--front-name needs --front-endpoint".to_string()),
+        (Some(_), Some(_)) => {
+            if client_identity.is_none() {
+                return Err("--front-endpoint needs --client-identity".to_string());
+            }
+            if front_anchor.is_none() {
+                return Err("--front-endpoint needs --front-anchor".to_string());
+            }
+        }
+        (None, None) => {}
+    }
     Ok(Config {
         bind,
         target,
@@ -384,6 +412,10 @@ fn parse_args_from(args: Vec<String>) -> Result<Config, String> {
         poke,
         gateway,
         state_dir,
+        front_endpoint,
+        front_name,
+        client_identity,
+        front_anchor,
         slot_lo,
         slot_hi,
         max_slots,
@@ -458,6 +490,58 @@ fn add_egress_rule(bind_ip: &SocketAddr, gateway: &str) {
     if let Ok(st) = status {
         if !st.success() {
             emiteln!("warn: ip rule egress {} -> {}", from, st);
+        }
+    }
+}
+
+/// How often the daemon tells the front the table it routes with, and reads the tuple the front sees for the line.
+const FRONT_REPORT_SECS: u64 = 60;
+
+/// Pushes the table whole on an interval, and records the tuples the front reports in its answer.
+async fn push_to_front(
+    endpoint: String,
+    name: String,
+    cert: String,
+    key: String,
+    anchor: String,
+    table: Arc<Mutex<slot::LeaseTable>>,
+    publisher: Arc<Publisher>,
+) {
+    let config = match crate::identity::client_config(&cert, &key, &anchor) {
+        Ok(config) => config,
+        Err(e) => {
+            emiteln!("front: the client configuration failed: {}", e);
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(Duration::from_secs(FRONT_REPORT_SECS));
+    loop {
+        interval.tick().await;
+        let entries: Vec<(u16, u8, String)> = {
+            let t = table.lock().await;
+            t.slots()
+                .iter()
+                .filter_map(|s| {
+                    let (ip, port) = publisher.slot_tuple(s.bind_port)?;
+                    Some((s.bind_port, s.proto.code(), format!("{}:{}", ip, port)))
+                })
+                .collect()
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        let body = front::table(&entries);
+        match front::push_whole(&endpoint, &name, "/table", &body, &config, 3) {
+            Ok(response) => {
+                for (proto, tuple) in front::reported(&response) {
+                    emitln!(
+                        "{{\"event\":\"front-view\",\"proto\":\"{}\",\"tuple\":\"{}\"}}",
+                        proto,
+                        tuple
+                    );
+                }
+            }
+            Err(e) => emiteln!("warn: the front push failed: {}", e),
         }
     }
 }
@@ -784,6 +868,24 @@ async fn main() {
         tokio::spawn(async move {
             run_slot(sock, state, table_for_slot, target, publisher, bind_port).await
         });
+    }
+
+    // the control channel: the table the front routes with, pushed whole, and its answer carries what the front sees
+    if let (Some(endpoint), Some(name), Some((cert, key)), Some(anchor)) = (
+        cfg.front_endpoint.clone(),
+        cfg.front_name.clone(),
+        cfg.client_identity.clone(),
+        cfg.front_anchor.clone(),
+    ) {
+        tokio::spawn(push_to_front(
+            endpoint,
+            name,
+            cert,
+            key,
+            anchor,
+            table.clone(),
+            publisher.clone(),
+        ));
     }
 
     // the UPnP IGD facade on br-lan: SSDP, description, SOAP and GENA, and it owns granted leases

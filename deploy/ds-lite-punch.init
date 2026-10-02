@@ -69,9 +69,14 @@ start_service() {
     POKEF=
     [ -n "$POKE" ] && POKEF="--poke $POKE"
 
-    # The identity: the certificate and key this daemon presents to the front.
+    # The identity: the certificate and key this daemon presents to the front, and the authority it accepts.
     IDENTF=
     [ -n "$CLIENT_IDENTITY" ] && IDENTF="--client-identity $CLIENT_IDENTITY"
+    [ -n "$FRONT_ANCHOR" ] && IDENTF="$IDENTF --front-anchor $FRONT_ANCHOR"
+
+    # The control channel: the front the daemon pushes its table to, under the name that front serves.
+    FRONTF=
+    [ -n "$FRONT_ENDPOINT" ] && FRONTF="--front-endpoint $FRONT_ENDPOINT --front-name $FRONT_NAME"
 
     # The carrier watch: the counter that records the helper's marked probe, and the alarm when it stops rising.
     WATCHF=
@@ -92,7 +97,7 @@ start_service() {
         --upnp-port "${UPNP_PORT:-49152}" \
         --lan-ip "${LAN_IP:-192.168.21.1}" \
         $NO_UPNP \
-        $ALLOW $PCPF $WATCHF $POKEF $IDENTF \
+        $ALLOW $PCPF $WATCHF $POKEF $IDENTF $FRONTF \
         ${OBSERVATION:+--observation}
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1

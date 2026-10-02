@@ -111,7 +111,10 @@ Two keys belong to a front-door deployment, which
 | Key | Default | What it does |
 |---|---|---|
 | `POKE` | none | The peer each keepalive also sends to, as `address:port`. The carrier admits the peers the line has spoken to, so a front reaches a held port after the slot's socket has spoken to it. Leave it unset for a line that serves nobody from outside. |
-| `CLIENT_IDENTITY` | none | The certificate and key the daemon presents to the front, as two PEM paths separated by a colon. Both are read at startup, so a file that cannot be read stops the service and the refusal names the flag. The daemon puts it to work when the control channel has a reader, which `call/0042` records. |
+| `CLIENT_IDENTITY` | none | The certificate and key the daemon presents to the front, as two PEM paths separated by a colon. Both are read at startup, so a file that cannot be read stops the service and the refusal names the flag. |
+| `FRONT_ANCHOR` | none | The authority whose certificate the front presents, as a PEM file, read at startup like the identity. A front whose certificate chains to a public root needs no anchor. |
+| `FRONT_ENDPOINT` | none | The front to push the routing table to, as `host:port`. Setting it turns the control channel on, and it needs `FRONT_NAME`, `CLIENT_IDENTITY` and `FRONT_ANCHOR`; the daemon refuses to start with the set incomplete. |
+| `FRONT_NAME` | none | The name the front serves, which the push is addressed to and the front's certificate is verified against. |
 
 The poke rides the keepalive interval, so `INTERVAL` governs how often the line
 speaks to the peer, and a peer the line has stopped speaking to stops being

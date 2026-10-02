@@ -43,6 +43,12 @@ Options:
       --front-anchor <CA.PEM>
           The authority whose certificate the front presents, as a PEM file. The daemon reads it at startup, so a file that cannot be read stops the daemon at once, and it falls back to the public roots when the front's certificate chains to one of those.
 
+      --front-endpoint <HOST:PORT>
+          The front's host and port, which turns the control channel on. The daemon pushes the table it routes with on an interval, and the front's answer carries the tuple the front sees for the line. It needs --front-name and the two halves of the identity, --client-identity and --front-anchor.
+
+      --front-name <NAME>
+          The name the front serves, and the name the daemon verifies the front's certificate against. It is the name a protected front answers on, so the push reaches a front that demands the daemon's own certificate.
+
       --gc-grace-factor <N>
           Grace multiple applied to a slot's lifetime before it is collected. Default 3.
 

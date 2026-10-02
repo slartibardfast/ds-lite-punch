@@ -28,7 +28,7 @@ fn split_endpoint(endpoint: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), port))
 }
 
-/// Sends the body to the endpoint over TLS, verifying the peer against the configured anchor, and returns the response's first line.
+/// Sends the body to the endpoint over TLS, verifying the peer against the configured anchor, and returns the whole response.
 pub fn push(
     endpoint: &str,
     name: &str,
@@ -56,16 +56,33 @@ pub fn push(
         .map_err(|e| format!("{}: {}", endpoint, e))?;
     let mut response = String::new();
     let mut buf = [0u8; 512];
-    while !response.contains('\n') {
-        let n = stream
-            .read(&mut buf)
-            .map_err(|e| format!("{}: {}", endpoint, e))?;
+    // the whole response, since the front's answer carries the tuple it sees for the line
+    while let Ok(n) = stream.read(&mut buf) {
         if n == 0 {
             break;
         }
         response.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
-    Ok(response.lines().next().unwrap_or_default().to_string())
+    Ok(response)
+}
+
+/// The tuples the front reports in its answer, one per protocol, as `udp <tuple>` and `tcp <tuple>`.
+pub fn reported(response: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    for line in response.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(proto), Some(tuple)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if proto != "udp" && proto != "tcp" {
+            continue;
+        }
+        if found.iter().any(|(p, _)| p == proto) {
+            continue;
+        }
+        found.push((proto.to_string(), tuple.trim_end_matches(';').to_string()));
+    }
+    found
 }
 
 /// Pushes the table whole, and on any failure sends the whole table again, so a reconnect repairs what was missed.
@@ -80,8 +97,13 @@ pub fn push_whole(
     let mut last = String::new();
     for _ in 0..attempts.max(1) {
         match push(endpoint, name, path, body, config) {
-            Ok(line) if line.contains("200") || line.contains("204") => return Ok(line),
-            Ok(line) => last = format!("{}: {}", endpoint, line),
+            Ok(response) => {
+                let first = response.lines().next().unwrap_or_default();
+                if first.contains("200") || first.contains("204") {
+                    return Ok(response);
+                }
+                last = format!("{}: {}", endpoint, first);
+            }
             Err(e) => last = e,
         }
     }
@@ -105,6 +127,26 @@ mod tests {
             (40001, 6, "a:2".to_string()),
         ]);
         assert_eq!(t.lines().count(), 2);
+    }
+
+    #[test]
+    fn the_fronts_report_is_read_per_protocol() {
+        let answer = "HTTP/1.0 200 OK\r\n\r\nudp 37.228.213.83:59348;\ntcp 37.228.213.83:59237;\n";
+        let seen = reported(answer);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], ("udp".to_string(), "37.228.213.83:59348".to_string()));
+        assert_eq!(seen[1], ("tcp".to_string(), "37.228.213.83:59237".to_string()));
+    }
+
+    #[test]
+    fn an_answer_without_a_tuple_reports_nothing() {
+        assert!(reported("HTTP/1.0 204 No Content\r\n\r\n").is_empty());
+        assert!(reported("").is_empty());
+        // a name-keyed line is the front's routing table rather than a report of what it sees
+        assert!(reported("HTTP/1.0 200 OK\r\n\r\nfront.example 1.2.3.4:5;\n").is_empty());
+        let repeated = reported("udp 1:1\nudp 2:2\n");
+        assert_eq!(repeated.len(), 1, "{repeated:?}");
+        assert_eq!(repeated[0].1, "1:1");
     }
 
     #[test]
@@ -191,7 +233,9 @@ mod tests {
         let config = server_config(&dir);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
         let endpoint = format!("127.0.0.1:{}", listener.local_addr().expect("an address").port());
-        let handle = std::thread::spawn(move || answer_one(&listener, config, Some("HTTP/1.0 204 No Content\r\n\r\n")));
+        let handle = std::thread::spawn(move || {
+            answer_one(&listener, config, Some("HTTP/1.0 200 OK\r\n\r\nudp 1.2.3.4:5\r\ntcp 1.2.3.4:6\r\n"))
+        });
         let client = crate::identity::client_config(
             &path_in(&dir, "daemon.crt"),
             &path_in(&dir, "daemon.key"),
@@ -199,7 +243,13 @@ mod tests {
         )
         .expect("the client's configuration");
         let out = push(&endpoint, "localhost", "/table", "40000 17 a:1\n", &client);
-        assert!(out.expect("the push answers").contains("204"));
+        let response = out.expect("the push answers");
+        assert!(response.contains("200"), "{response}");
+        // the answer is read whole, because the front's view of the line arrives in its body
+        let seen = reported(&response);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen.iter().any(|(p, t)| p == "udp" && t == "1.2.3.4:5"), "{seen:?}");
+        assert!(seen.iter().any(|(p, t)| p == "tcp" && t == "1.2.3.4:6"), "{seen:?}");
         let request = handle.join().expect("the server thread");
         assert!(request.contains("40000 17 a:1"), "the body arrives whole: {request}");
     }

@@ -184,6 +184,29 @@ fn cli(version: &str) -> Command {
                 ),
         )
         .arg(
+            Arg::new("front-endpoint")
+                .long("front-endpoint")
+                .value_name("HOST:PORT")
+                .help("The front to push the routing table to.")
+                .long_help(
+                    "The front's host and port, which turns the control channel on. The daemon \
+                     pushes the table it routes with on an interval, and the front's answer \
+                     carries the tuple the front sees for the line. It needs --front-name and \
+                     the two halves of the identity, --client-identity and --front-anchor.",
+                ),
+        )
+        .arg(
+            Arg::new("front-name")
+                .long("front-name")
+                .value_name("NAME")
+                .help("The name the front serves, which the push is addressed to.")
+                .long_help(
+                    "The name the front serves, and the name the daemon verifies the front's \
+                     certificate against. It is the name a protected front answers on, so the \
+                     push reaches a front that demands the daemon's own certificate.",
+                ),
+        )
+        .arg(
             Arg::new("gc-grace-factor")
                 .long("gc-grace-factor")
                 .value_name("N")
