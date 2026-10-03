@@ -186,13 +186,16 @@ else
     fail=1
 fi
 
-# A lease that stops being renewed stops being routed.
+# A lease that stops being renewed stops being routed, and a push's entry outlives it while the daemon keeps pushing.
 sleep 17
-if [ -s "$W/upstreams.map" ]; then
-    note "FAIL lease: the include still carries $(tr '\n' ' ' <"$W/upstreams.map")"
+if grep -q '# poke' "$W/upstreams.map"; then
+    note "FAIL lease: the include still routes a poke's own tuple: $(tr '\n' ' ' <"$W/upstreams.map")"
     fail=1
+elif grep -q '# push' "$W/upstreams.map"; then
+    note "lease: the poked entries left with the pokes, and the push's table still routes"
 else
-    note "lease: the entry left with the pokes that kept it"
+    note "FAIL lease: the include carries $(tr '\n' ' ' <"$W/upstreams.map" || true)"
+    fail=1
 fi
 
 # The authority mints for an identity the store accepts, and for nobody else.
