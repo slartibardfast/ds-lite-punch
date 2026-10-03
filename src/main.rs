@@ -533,11 +533,12 @@ async fn push_to_front(
         let body = front::table(&entries);
         match front::push_whole(&endpoint, &name, "/table", &body, &config, 3) {
             Ok(response) => {
-                for (proto, tuple) in front::reported(&response) {
+                for (proto, tuple, from) in front::reported(&response) {
                     emitln!(
-                        "{{\"event\":\"front-view\",\"proto\":\"{}\",\"tuple\":\"{}\"}}",
+                        "{{\"event\":\"front-view\",\"proto\":\"{}\",\"tuple\":\"{}\",\"from\":\"{}\"}}",
                         proto,
-                        tuple
+                        tuple,
+                        from
                     );
                 }
             }

@@ -13,8 +13,15 @@ The table this writes is what the front routes to, one line per protocol:
 
 Run it beside nginx on the front. Give it the same port the daemon pokes, a path
 for the table, and, when the front should pick the table up, a reload command.
-With --http-listen it also answers the daemon's control-channel push from this
-same table, which is how the daemon learns the tuple the front sees for the line.
+With --http-listen it also takes the daemon's control-channel push and answers
+it: the push's body is the table the daemon routes with, and the answer carries
+the tuple this front routes on for each protocol, and which view supplied it.
+
+Two views teach this front, in a fixed order (call/0046). The poke's own source
+is authoritative for its protocol while the lease holds it. A table the push
+carries fills a protocol the poke has not reached, and every line the include
+and the answer carry names its source, so a fallback never wins quietly and a
+protocol with neither says so.
 
     poke-listener.py --listen 0.0.0.0:41001 --out /etc/front-door/upstreams \\
         --reload "nginx -s reload"
@@ -29,31 +36,66 @@ import threading
 import time
 
 MARK = b"dslp-poke"
+PUSH_TTL = 180
+PROTOCOLS = {"17": "udp", "6": "tcp"}
 
 
-def write_table(path, table, reload_cmd, name):
+def picked(table, pushed, proto, now):
+    """The tuple this front routes on for a protocol, and the view that supplied it, the poke's first."""
+    if proto in table:
+        return table[proto], "poke"
+    entry = pushed.get(proto)
+    if entry and now - entry[1] <= PUSH_TTL:
+        return entry[0], "push"
+    return None, "none"
+
+
+def write_table(path, table, pushed, reload_cmd, name):
+    lines = []
+    for proto, key in (("udp", table.get("udp_port")), ("tcp", name)):
+        if not key:
+            continue
+        tuple_, source = picked(table, pushed, proto, time.time())
+        if tuple_:
+            lines.append("%s %s; # %s" % (key, tuple_, source))
+    text = "".join(line + "\n" for line in lines)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.read() == text:
+                return
+    except OSError:
+        pass
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        if "udp" in table and "udp_port" in table:
-            fh.write("%s %s;\n" % (table["udp_port"], table["udp"]))
-        if "tcp" in table:
-            fh.write("%s %s;\n" % (name, table["tcp"]))
+        fh.write(text)
     os.replace(tmp, path)
+    print("routing table: %s" % (text.replace("\n", " ").strip() or "(empty)"), flush=True)
     if reload_cmd:
         subprocess.run(reload_cmd, shell=True, check=False)
 
 
 class Report(http.server.BaseHTTPRequestHandler):
-    """Answer the daemon's push with the tuple this front sees, one line per protocol."""
+    """Take the daemon's table from its push, and answer with the tuple this front routes on."""
 
     def _answer(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length:
-            self.rfile.read(length)
+            pushed = {}
+            body = self.rfile.read(length).decode("utf-8", "replace")
+            for line in body.splitlines():
+                parts = line.split()
+                proto = PROTOCOLS.get(parts[1]) if len(parts) >= 3 else None
+                if proto:
+                    pushed[proto] = (parts[2], time.time())
+            if pushed:
+                self.server.pushed.update(pushed)
+                self.server.rewrite()
         lines = []
         for proto in ("udp", "tcp"):
-            if proto in self.server.table:
-                lines.append("%s %s" % (proto, self.server.table[proto]))
+            tuple_, source = picked(
+                self.server.table, self.server.pushed, proto, time.time()
+            )
+            lines.append("%s %s %s" % (proto, tuple_ or "none", source))
         body = ("\n".join(lines) + "\n").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -69,14 +111,16 @@ class Report(http.server.BaseHTTPRequestHandler):
 
 
 class ReportServer(http.server.ThreadingHTTPServer):
-    """Carry the front's own table to the handler, which answers every push with it."""
+    """Carry the front's two views to the handler, which answers every push with the picked one."""
 
-    def __init__(self, bind, table):
+    def __init__(self, bind, table, pushed, rewrite):
         self.table = table
+        self.pushed = pushed
+        self.rewrite = rewrite
         super().__init__(bind, Report)
 
 
-def udp_loop(bind, table, path, reload_cmd, name):
+def udp_loop(bind, table, pushed, path, reload_cmd, name):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(bind)
@@ -87,19 +131,19 @@ def udp_loop(bind, table, path, reload_cmd, name):
         table["udp"] = "%s:%d" % (peer[0], peer[1])
         table["udp_seen"] = time.time()
         print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
-        write_table(path, table, reload_cmd, name)
+        write_table(path, table, pushed, reload_cmd, name)
 
 
-def handler(conn, table, path, reload_cmd, name):
+def handler(conn, table, pushed, path, reload_cmd, name):
     peer = conn.getpeername()
     table["tcp"] = "%s:%d" % (peer[0], peer[1])
     table["tcp_seen"] = time.time()
     print("tcp poke from %s:%d" % (peer[0], peer[1]), flush=True)
-    write_table(path, table, reload_cmd, name)
+    write_table(path, table, pushed, reload_cmd, name)
     conn.close()
 
 
-def tcp_loop(bind, table, path, reload_cmd, name):
+def tcp_loop(bind, table, pushed, path, reload_cmd, name):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(bind)
@@ -107,11 +151,13 @@ def tcp_loop(bind, table, path, reload_cmd, name):
     while True:
         conn, _ = sock.accept()
         threading.Thread(
-            target=handler, args=(conn, table, path, reload_cmd, name), daemon=True
+            target=handler,
+            args=(conn, table, pushed, path, reload_cmd, name),
+            daemon=True,
         ).start()
 
 
-def lease_watch(table, path, reload_cmd, name, lease):
+def lease_watch(table, pushed, path, reload_cmd, name, lease):
     if lease <= 0:
         return
     while True:
@@ -124,7 +170,7 @@ def lease_watch(table, path, reload_cmd, name, lease):
                 dropped = True
         if dropped:
             print("lease expired: the entry went with it", flush=True)
-            write_table(path, table, reload_cmd, name)
+            write_table(path, table, pushed, reload_cmd, name)
 
 
 def main():
@@ -140,24 +186,33 @@ def main():
     host, _, port = args.listen.rpartition(":")
     bind = (host or "0.0.0.0", int(port))
     table = {}
+    pushed = {}
     if args.udp_port:
         table["udp_port"] = args.udp_port
-    write_table(args.out, table, "", args.name)
+
+    def rewrite():
+        write_table(args.out, table, pushed, args.reload, args.name)
+
+    rewrite()
     threading.Thread(
-        target=udp_loop, args=(bind, table, args.out, args.reload, args.name), daemon=True
+        target=udp_loop,
+        args=(bind, table, pushed, args.out, args.reload, args.name),
+        daemon=True,
     ).start()
     threading.Thread(
-        target=tcp_loop, args=(bind, table, args.out, args.reload, args.name), daemon=True
+        target=tcp_loop,
+        args=(bind, table, pushed, args.out, args.reload, args.name),
+        daemon=True,
     ).start()
     threading.Thread(
         target=lease_watch,
-        args=(table, args.out, args.reload, args.name, args.lease),
+        args=(table, pushed, args.out, args.reload, args.name, args.lease),
         daemon=True,
     ).start()
     print("listening for pokes on %s:%d" % bind, flush=True)
     if args.http_listen:
         hhost, _, hport = args.http_listen.rpartition(":")
-        report = ReportServer((hhost or "127.0.0.1", int(hport)), table)
+        report = ReportServer((hhost or "127.0.0.1", int(hport)), table, pushed, rewrite)
         threading.Thread(target=report.serve_forever, daemon=True).start()
         print(
             "answering the daemon's push on %s:%d"

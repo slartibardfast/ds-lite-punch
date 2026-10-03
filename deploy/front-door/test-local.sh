@@ -116,6 +116,26 @@ python3 "$HERE/poke-listener.py" --listen 127.0.0.1:41001 --out "$W/upstreams.ma
     --name "$PASS" --udp-port 8447 --lease 15 --http-listen 127.0.0.1:8448 \
     --reload "$NGINX_BIN -c $W/nginx.conf -s reload" >/dev/null 2>&1 &
 PIDS+=($!)
+
+# A push fills a protocol the poke has not reached, and names itself as the view that did (call/0046).
+python3 - <<'PY' > "$W/push-only.txt" 2>&1
+import time, urllib.request
+time.sleep(1)
+body = "40000 17 10.0.0.9:5000\n40001 6 10.0.0.9:5001\n"
+req = urllib.request.Request("http://127.0.0.1:8448/table", data=body.encode(), method="POST")
+with urllib.request.urlopen(req, timeout=5) as r:
+    print(r.read().decode().strip())
+PY
+sleep 2
+filled_udp=$(grep -c "10.0.0.9:5000; # push" "$W/upstreams.map" || true)
+filled_tcp=$(grep -c "10.0.0.9:5001; # push" "$W/upstreams.map" || true)
+if [ "$filled_udp" = 1 ] && [ "$filled_tcp" = 1 ] \
+    && grep -q 'udp 10.0.0.9:5000 push' "$W/push-only.txt"; then
+    note "the fallback: a push filled both protocols and named itself"
+else
+    note "FAIL fallback: $filled_udp udp and $filled_tcp tcp in the include, and $(tr -d '\n' <"$W/push-only.txt")"
+    fail=1
+fi
 python3 - <<'PY' > "$W/udp-leg.txt" 2>&1 &
 import socket, time
 time.sleep(1)
@@ -156,8 +176,8 @@ if report=$(curl -sS --max-time 5 --cacert "$W/ca.crt" --cert "$W/client.crt" --
         --resolve "$PROT:8443:127.0.0.1" -X POST --data-binary $'40000 17 127.0.0.1:8455\n' \
         "https://$PROT:8443/table" 2>"$W/report.err"); then
     case "$report" in
-        *"udp 127.0.0.1:8455"*)
-            note "control channel: the push was answered with the tuple the front sees" ;;
+        *"udp 127.0.0.1:8455 poke"*)
+            note "control channel: the push was answered with the poke's own tuple, named as the poke's" ;;
         *)  note "FAIL control channel: the answer carried '${report:0:80}'"
             fail=1 ;;
     esac

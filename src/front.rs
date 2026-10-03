@@ -66,9 +66,9 @@ pub fn push(
     Ok(response)
 }
 
-/// The tuples the front reports in its answer, one per protocol, as `udp <tuple>` and `tcp <tuple>`.
-pub fn reported(response: &str) -> Vec<(String, String)> {
-    let mut found: Vec<(String, String)> = Vec::new();
+/// The tuples the front reports in its answer, one per protocol, as `udp <tuple> <from>` and `tcp <tuple> <from>`.
+pub fn reported(response: &str) -> Vec<(String, String, String)> {
+    let mut found: Vec<(String, String, String)> = Vec::new();
     for line in response.lines() {
         let mut parts = line.split_whitespace();
         let (Some(proto), Some(tuple)) = (parts.next(), parts.next()) else {
@@ -77,10 +77,16 @@ pub fn reported(response: &str) -> Vec<(String, String)> {
         if proto != "udp" && proto != "tcp" {
             continue;
         }
-        if found.iter().any(|(p, _)| p == proto) {
+        if found.iter().any(|(p, _, _)| p == proto) {
             continue;
         }
-        found.push((proto.to_string(), tuple.trim_end_matches(';').to_string()));
+        // the view that supplied the tuple: a front that predates the marker names the tuple alone, which was the poke's
+        let from = parts.next().unwrap_or("poke");
+        found.push((
+            proto.to_string(),
+            tuple.trim_end_matches(';').to_string(),
+            from.trim_end_matches(';').to_string(),
+        ));
     }
     found
 }
@@ -131,20 +137,45 @@ mod tests {
 
     #[test]
     fn the_fronts_report_is_read_per_protocol() {
-        let answer = "HTTP/1.0 200 OK\r\n\r\nudp 37.228.213.83:59348;\ntcp 37.228.213.83:59237;\n";
+        let answer = "HTTP/1.0 200 OK\r\n\r\nudp 37.228.213.83:59348 poke;\ntcp 37.228.213.83:59237 push;\n";
         let seen = reported(answer);
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[0], ("udp".to_string(), "37.228.213.83:59348".to_string()));
-        assert_eq!(seen[1], ("tcp".to_string(), "37.228.213.83:59237".to_string()));
+        assert_eq!(
+            seen[0],
+            (
+                "udp".to_string(),
+                "37.228.213.83:59348".to_string(),
+                "poke".to_string()
+            )
+        );
+        assert_eq!(
+            seen[1],
+            (
+                "tcp".to_string(),
+                "37.228.213.83:59237".to_string(),
+                "push".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_protocol_the_front_routes_nothing_on_is_reported_as_such() {
+        let seen = reported("udp 1:1 poke\ntcp none none\n");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1].1, "none");
+        assert_eq!(seen[1].2, "none");
+        // a front that predates the marker names the tuple alone, and that view was the poke's
+        let older = reported("udp 1:1\n");
+        assert_eq!(older[0].2, "poke", "{older:?}");
     }
 
     #[test]
     fn an_answer_without_a_tuple_reports_nothing() {
         assert!(reported("HTTP/1.0 204 No Content\r\n\r\n").is_empty());
         assert!(reported("").is_empty());
-        // a name-keyed line is the front's routing table rather than a report of what it sees
+        // a name-keyed line is the front's routing table rather than a report of what it routes on
         assert!(reported("HTTP/1.0 200 OK\r\n\r\nfront.example 1.2.3.4:5;\n").is_empty());
-        let repeated = reported("udp 1:1\nudp 2:2\n");
+        let repeated = reported("udp 1:1 poke\nudp 2:2 push\n");
         assert_eq!(repeated.len(), 1, "{repeated:?}");
         assert_eq!(repeated[0].1, "1:1");
     }
@@ -248,8 +279,14 @@ mod tests {
         // the answer is read whole, because the front's view of the line arrives in its body
         let seen = reported(&response);
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen.iter().any(|(p, t)| p == "udp" && t == "1.2.3.4:5"), "{seen:?}");
-        assert!(seen.iter().any(|(p, t)| p == "tcp" && t == "1.2.3.4:6"), "{seen:?}");
+        assert!(
+            seen.iter().any(|(p, t, _)| p == "udp" && t == "1.2.3.4:5"),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(p, t, _)| p == "tcp" && t == "1.2.3.4:6"),
+            "{seen:?}"
+        );
         let request = handle.join().expect("the server thread");
         assert!(request.contains("40000 17 a:1"), "the body arrives whole: {request}");
     }
