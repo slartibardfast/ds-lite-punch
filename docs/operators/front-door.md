@@ -38,8 +38,8 @@ Debian and Ubuntu:
   only place a client certificate is checked.
 - The datagram leg is not nginx's at all. nginx's UDP proxy opens an ephemeral
   source port for its upstream, and the carrier admits a peer by the exact tuple the
-  line's mapping spoke to, so a forwarded datagram has to leave from the very port
-  the poke was addressed to. Only the relay's own socket does that.
+  line's mapping spoke to, so a forwarded datagram has to carry the port the poke
+  was addressed to as its source. Only the relay's own socket does that.
 
 `deploy/front-door/test-local.sh` proves the split on one machine: it renders the
 shipped file with throwaway values, mints a one-day authority and three leaves,
@@ -70,8 +70,8 @@ It writes the root, the relay, the rendered configuration and both units, checks
 the configuration with `nginx -t`, and starts them. Then the edge: **ingress**, from
 `0.0.0.0/0`, one rule for TCP and another for UDP on that port, with the **source
 port range left empty**. A source port range there admits only packets whose source
-port matches, which is how one front lost every connection while its rules looked
-right. Persist the host's own firewall rules separately, and point the daemon at
+port matches, which is how one front lost every connection even though its rules
+looked right. Persist the host's own firewall rules separately, and point the daemon at
 the front with `--poke <front>:$port`, `--client-identity`, `--front-anchor`,
 `--front-endpoint` and `--front-name`.
 
@@ -99,14 +99,14 @@ says so. `--udp-only` leaves the port's TCP half to nginx, where the name split
 lives.
 
 One flow at a time holds the socket: a datagram from a new client takes it over,
-and the datagrams that come back from the tuple go to that client. A front serving
+and the tuple's own datagrams go back to that client. A front serving
 many datagram clients at once wants the carrier's admission to accept them by
 address alone, which the measurements have not yet shown.
 
 The TCP leg is the next piece, and it is why the poke's dial on that port is routed
-to the relay's place in the configuration: a TCP arrival has to leave from the port
-the poke was addressed to, and a socket that listens there cannot also originate
-from it.
+to the relay's place in the configuration: a TCP arrival has to carry the port the
+poke was addressed to as its source, and a socket that listens there cannot also
+originate from it.
 
 ## Mint a client
 
