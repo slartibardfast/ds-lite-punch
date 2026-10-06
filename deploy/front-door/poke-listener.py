@@ -148,7 +148,6 @@ def udp_loop(bind, table, pushed, path, reload_cmd, name):
             table["udp_seen"] = time.time()
             print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
             write_table(path, table, pushed, reload_cmd, name)
-            sock.sendto(MARK, peer)
             continue
         tuple_, source = picked(table, pushed, "udp", time.time())
         slot = slot_of(tuple_) if tuple_ else None
