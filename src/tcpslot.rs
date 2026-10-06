@@ -135,7 +135,10 @@ pub async fn run_connection(
         interval.tick().await;
         if state.is_live() && conn.is_some() {
             if let Some(dest) = poke {
-                let _ = poke_round(bind_ip, r, dest).await;
+                // a silent failure here is a line that never spoke TCP to its front, and nothing else says so
+                if let Err(e) = poke_round(bind_ip, r, dest).await {
+                    crate::emiteln!("warn: the TCP poke to {} failed: {}", dest, e);
+                }
             }
             // Refresh the held connection: the STUN traffic re-arms the AFTR idle timer.
             let Some(c) = conn.as_mut() else {
