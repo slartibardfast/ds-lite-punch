@@ -344,7 +344,7 @@ pub fn ensure_ruleset() -> io::Result<()> {
 }
 
 /// The argv that lists a chain with its rule handles: without -a the listing carries none, so nothing can be re-placed.
-fn chain_listing_args() -> [&'static str; 5] {
+fn chain_listing_args() -> [&'static str; 6] {
     ["-a", "list", "chain", "inet", "fw4", "input"]
 }
 
