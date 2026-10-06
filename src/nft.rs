@@ -343,10 +343,15 @@ pub fn ensure_ruleset() -> io::Result<()> {
     Ok(())
 }
 
+/// The argv that lists a chain with its rule handles: without -a the listing carries none, so nothing can be re-placed.
+fn chain_listing_args() -> [&'static str; 5] {
+    ["-a", "list", "chain", "inet", "fw4", "input"]
+}
+
 /// Install the accept sets and their two rules, empty both, and sweep an older daemon's per-port rules.
 pub fn ensure_accept_sets() -> io::Result<()> {
     let listing = Command::new("nft")
-        .args(["list", "chain", "inet", "fw4", "input"])
+        .args(chain_listing_args())
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
@@ -817,6 +822,11 @@ mod tests {
             listing.find(tcp).unwrap() > listing.find("jump handle_reject").unwrap(),
             "the rule the listing carries sits after the reject"
         );
+        // A listing taken without -a carries no handle at all, so the rule is neither found nor moved.
+        assert_eq!(chain_listing_args()[0], "-a");
+        let bare = "\t\tjump handle_reject\n\t\tiifname \"eth1\" tcp dport @dslp_ports_tcp accept\n";
+        assert_eq!(reject_handle(bare), None);
+        assert!(rule_handles(bare, tcp).is_empty());
     }
 
     #[test]
