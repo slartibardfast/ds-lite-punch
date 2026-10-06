@@ -14,7 +14,7 @@ port it is without a tunnel between them.
 | Where | What it holds | What it does |
 |---|---|---|
 | The line | The mapping | The daemon pokes the front from a slot's own socket, which makes the carrier create and renew the mapping, and then reports the tuple the daemon has learned. |
-| The front | The name, and admission | nginx routes by name, passes a name through untouched or terminates it and demands a client certificate, and forwards to the carrier's tuple. |
+| The front | The name, admission, and the datagram socket | nginx routes by name on TCP, passes a name through untouched or terminates it and demands a client certificate, and the relay owns the public UDP port: the pokes land on it, it learns the tuple from them, and it sends everything else onward from that same socket. |
 | The client | A certificate, when the name is protected | It reaches the front's address and port, and never learns the carrier's tuple. |
 
 The exchange is two-fold, and it is worth keeping the halves apart. The line's half
@@ -25,46 +25,88 @@ that carries what the front needs to know.
 ## The front's configuration
 
 `deploy/front-door/nginx.conf` is the shipped configuration, written as a template
-whose tokens name the front's own paths, the carrier tuple for each pass-through
-name, and the local block that terminates the protected ones. Two facts about it
-matter on Debian and Ubuntu, and both are in the file:
+whose tokens name the front's own paths and the local block that terminates the
+protected ones. `deploy/front-door/render.sh` fills those tokens, `install.sh` runs
+it and writes the rest of the front, and the lane's harness renders through the same
+renderer, so what CI tests is the shipped shape. Three facts about it matter on
+Debian and Ubuntu:
 
 - The stream module is a dynamic module, so the configuration loads it by name.
 - The stream module in this nginx release cannot terminate several names on one
   listener, so a protected name is routed to a local `https` block that does the
   terminating. That block holds the only certificate the front has, and it is the
   only place a client certificate is checked.
+- The datagram leg is not nginx's at all. nginx's UDP proxy opens an ephemeral
+  source port for its upstream, and the carrier admits a peer by the exact tuple the
+  line's mapping spoke to, so a forwarded datagram has to leave from the very port
+  the poke was addressed to. Only the relay's own socket does that.
 
 `deploy/front-door/test-local.sh` proves the split on one machine: it renders the
 shipped file with throwaway values, mints a one-day authority and three leaves,
 and asserts that a pass-through name reaches the service's own certificate, that a
-protected name is refused without a client certificate and served with one, and
-that a name nobody published reaches nothing. The component's lane runs it.
+protected name is refused without a client certificate and served with one, that a
+name nobody published reaches nothing, and that a client's datagram leaves for the
+learned tuple from the socket the poke landed on. The component's lane runs it.
 
-## The front learns the tuple
+## Deploy it
 
-`deploy/front-door/poke-listener.py` is the other half of the exchange. It listens
-on the port the daemon pokes, on UDP and TCP, and writes the include the front
-routes with, one entry per protocol, taken from the source of each arrival. Run it
-beside nginx, with the name this front serves and a reload command:
+Two ceremonies, and neither runs where the other does. On the line, as root:
 
 ```
-poke-listener.py --listen 0.0.0.0:41001 --name passthru.example \
-    --out /etc/front-door/upstreams.map --reload "nginx -s reload"
+sh deploy/front-door/mint.sh --protected-name front.example --passthru-name passthru.example
 ```
 
-The file it writes is what a `map` includes, so the front follows the carrier's
-assignment with no operator in the loop. The listener creates the file empty at
-startup, which is what lets the configuration name it before the first poke has
-arrived.
+That mints the authority where `call/0040` requires it, signs the front's leaf and
+the daemon's own identity, and prints the copy commands for the front and the three
+settings for the daemon. On the front, as root:
 
-The shipped configuration reads that file on both legs: the UDP leg through a map
-keyed on the listening port, and the TCP leg through a map keyed on names. The
-harness proves the UDP forward follows the learned tuple, and it stands in for the
-TCP leg's line, since no single machine can learn that one. A poke's source is the
-address the front forwards to, and a TCP port can serve as a listening socket or as
-the source of a connection, one or the other, so that half is learned where the
-daemon's own listener sits at the mapping's port.
+```
+sh deploy/front-door/install.sh --public-port 8443 \
+    --protected-name front.example --protected-upstream 127.0.0.1:8080 \
+    --passthru-name passthru.example
+```
+
+It writes the root, the relay, the rendered configuration and both units, checks
+the configuration with `nginx -t`, and starts them. Then the edge: **ingress**, from
+`0.0.0.0/0`, one rule for TCP and another for UDP on that port, with the **source
+port range left empty**. A source port range there admits only packets whose source
+port matches, which is how one front lost every connection while its rules looked
+right. Persist the host's own firewall rules separately, and point the daemon at
+the front with `--poke <front>:$port`, `--client-identity`, `--front-anchor`,
+`--front-endpoint` and `--front-name`.
+
+## The relay learns the tuple and carries the datagrams
+
+`deploy/front-door/poke-listener.py` is the front's relay. It owns the public UDP
+port, so the daemon's pokes land on its socket and teach it the line's tuple, and
+every datagram that is not a poke leaves for that tuple from that same socket.
+`install.sh` runs it as a unit; run by hand it takes the port, the table's path, the
+name this front serves, and a reload command:
+
+```
+poke-listener.py --listen 0.0.0.0:8443 --name passthru.example \
+    --out /etc/front-door/upstreams.map --udp-port 8443 --udp-only \
+    --http-listen 127.0.0.1:8448 --lease 300 --reload "nginx -s reload"
+```
+
+Two views teach it, in a fixed order, which
+[call/0046](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0046-the-front-learns-from-the-poke-and-from-the-push.md)
+records. The poke's own source is authoritative for its protocol while the lease
+holds it, and the table the daemon's control-channel push carries fills a protocol
+the poke has not reached. Every line the status file and the answer carry names the
+view that supplied it, so a fallback never wins quietly and a protocol with neither
+says so. `--udp-only` leaves the port's TCP half to nginx, where the name split
+lives.
+
+One flow at a time holds the socket: a datagram from a new client takes it over,
+and the datagrams that come back from the tuple go to that client. A front serving
+many datagram clients at once wants the carrier's admission to accept them by
+address alone, which the measurements have not yet shown.
+
+The TCP leg is the next piece, and it is why the poke's dial on that port is routed
+to the relay's place in the configuration: a TCP arrival has to leave from the port
+the poke was addressed to, and a socket that listens there cannot also originate
+from it.
 
 ## Mint a client
 
@@ -120,15 +162,23 @@ front therefore cannot reach a held port by knowing its address, and the daemon
 pokes it:
 
 ```
---poke 170.9.238.141:41001
+--poke 170.9.238.141:8443
 ```
 
 Every keepalive interval, each slot's own socket sends a short datagram to that
-address. A TCP slot does the same with a connection, opened on a fresh port folded
-to the slot. The peer then sees the line's tuple in the traffic it receives, and it
-can answer. A UDP reply arrives with the peer's own address and port intact, which
-is what a service in the LAN will see. The reply to a TCP slot reaches the client
-that asked for the mapping, on that client's own port.
+address, which is the front's public port and the socket the relay holds. A TCP slot
+does the same with a connection, opened on a fresh port folded to the slot. The peer
+then sees the line's tuple in the traffic it receives, and it can answer. A UDP
+reply arrives with the peer's own address and port intact, which is what a service
+in the LAN will see. The reply to a TCP slot reaches the client that asked for the
+mapping, on that client's own port.
+
+The front's own provider has a part here too. The carrier admits the peer by the
+tuple it spoke to, so the front's datagrams have to leave with the port the poke was
+addressed to. A provider that rewrites the source port of what its host sends
+breaks that, and the front's traffic is refused at the carrier with nothing on the
+line to show for it. Check it before blaming the front: send from the host and look
+at what arrives, or run the two captures the milestone's results describe.
 
 ## The return path
 
@@ -159,9 +209,11 @@ the mapping is on.
 ## What a front door gives you, and what it gives up
 
 A name over TLS is served from a port the carrier holds, with no tunnel anywhere.
-Over UDP, and therefore over QUIC, the service sees the client's own address. Over
-TCP it does not, because the daemon's splice originates the connection; where the
-front terminates a name, PROXY protocol is the only way that address survives.
+The datagram leg carries HTTP/3 and QUIC, since both ride UDP, and by default one
+client at a time holds its socket. Over UDP the service sees the client's own
+address. Over TCP it does not, because the daemon's splice originates the
+connection; where the front terminates a name, PROXY protocol is the only way that
+address survives.
 
 A tunnel of the kind David Álvarez Rosa describes in
 [Self-Hosting Behind CGNAT](https://david.alvarezrosa.com/posts/self-hosting-behind-cgnat/)
@@ -181,3 +233,12 @@ are links out.
   carries the tasks, and its results directory holds the measurements this page
   summarises: the carrier's admission rule, the STUN-over-TCP finding, and the
   return path.
+- [call/0045](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0045-the-control-channel-carries-the-tuple-the-front-sees.md)
+  gives the control channel its payload, and
+  [call/0046](https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0046-the-front-learns-from-the-poke-and-from-the-push.md)
+  fixes the order of the front's two views.
+- [plan/0013](https://github.com/slartibardfast/agentic-ds-lite-punch/tree/main/plan/0013-the-fronts-two-views)
+  released the two views, and
+  [plan/0014](https://github.com/slartibardfast/agentic-ds-lite-punch/tree/main/plan/0014-the-fronts-legs)
+  carries the legs on the poked socket, with its results holding the admission
+  measurements and the datagram leg's run.

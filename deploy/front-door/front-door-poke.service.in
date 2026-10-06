@@ -1,0 +1,10 @@
+[Unit]
+Description=front door relay: the tuple the front routes on, learned from the poke, and the datagram leg
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 <FRONT_ROOT>/poke-listener.py --listen 0.0.0.0:<PUBLIC_PORT> --out <FRONT_ROOT>/upstreams.map --name <PASSTHRU_NAME> --udp-port <PUBLIC_PORT> --lease <LEASE> --http-listen 127.0.0.1:8448 --udp-only --reload "/usr/sbin/nginx -c <FRONT_ROOT>/nginx.conf -s reload"
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

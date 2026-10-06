@@ -46,21 +46,12 @@ mkdir -p "$W/www" && printf 'the protected service answered\n' > "$W/www/index.h
 (cd "$W/www" && exec python3 -m http.server 8445 --bind 127.0.0.1 >/dev/null 2>&1) &
 PIDS+=($!)
 
-# The configuration under test is the shipped one, rendered here with this harness's values.
-
-# The include starts with the name line an operator would have, because the TCP leg cannot be learned on one machine and the harness stands in for it.
-mkdir -p "$W/logs" "$W/tmp"
+# The configuration under test is the shipped one, rendered by the shipped renderer with this harness's values.
+mkdir -p "$W/logs" "$W/tmp" "$W/certs"
+cp "$W/ca.crt" "$W/client.crt" "$W/front.crt" "$W/front.key" "$W/certs/"
 printf '%s 127.0.0.1:8444;\n' "$PASS" > "$W/upstreams.map"
-sed -e "s|<FRONT_MODULE>|$FRONT_MODULE|g" -e "s|<FRONT_ROOT>|$W|g" \
-    -e "s|<CERT_DIR>|$W|g" -e "s|<PUBLIC_LISTEN>|8443|g" \
-    -e "s|<PUBLIC_UDP_LISTEN>|8447|g" \
-    -e "s|<LOCAL_TLS_LISTEN>|127.0.0.1:8446|g" \
-    -e "s|<PROTECTED_NAME>|$PROT|g" \
-    -e "s|<UPSTREAM_MAP>|$W/upstreams.map|g" \
-    -e "s|<PROTECTED_UPSTREAM>|127.0.0.1:8445|g" \
-    -e "s|<REPORT_UPSTREAM>|127.0.0.1:8448|g" \
-    -e "s|<REJECT_BACKEND>|127.0.0.1:9|g" \
-    "$HERE/nginx.conf" > "$W/nginx.conf"
+sh "$HERE/render.sh" --root "$W" --public-port 8443 --module "$FRONT_MODULE" \
+    --protected-name "$PROT" --protected-upstream 127.0.0.1:8445 > "$W/nginx.conf"
 "$NGINX_BIN" -c "$W/nginx.conf" -t
 "$NGINX_BIN" -c "$W/nginx.conf"
 sleep 1
