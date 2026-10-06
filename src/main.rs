@@ -859,6 +859,10 @@ async fn main() {
         let target = SocketAddrV4::new(s.target, s.target_port);
         let publisher = publisher.clone();
         let bind_port = s.bind_port;
+        // the fold: this slot's service answers as the slot's own tuple, which is how a front's carrier carries the reply (call/0047)
+        if let Err(e) = nft::add_pin(s.target, s.target_port, s.bind_port) {
+            emiteln!("warn: the fold pin for slot {} failed: {}", s.bind_port, e);
+        }
         // the keepalive is a sibling task; the caller owns both handles so a revocation can abort them
         let ka_sock = sock.clone();
         let ka_state = state.clone();

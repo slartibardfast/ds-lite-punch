@@ -635,9 +635,14 @@ pub fn parse_carrier_probe(text: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The element a pin installs: this flow's traffic leaves as the NAT address with the slot's port.
+pub fn pin_element(client: Ipv4Addr, client_port: u16, r: u16) -> String {
+    format!("{} . {} : {} . {}", client, client_port, NAT_ADDR, r)
+}
+
 /// Pin a console flow as (client_ip, client_port) -> (NAT_ADDR, R) in snat_map.
 pub fn add_pin(client: Ipv4Addr, client_port: u16, r: u16) -> io::Result<()> {
-    let elem = format!("{} . {} : {} . {}", client, client_port, NAT_ADDR, r);
+    let elem = pin_element(client, client_port, r);
     match run(&[
         "add", "element", "ip", "dslp", "snat_map",
         &format!("{{ {} }}", elem),
@@ -985,6 +990,13 @@ mod tests {
             assert!(text.contains(&format!("map @{}", inbound_map(tcp))));
             assert!(text.contains("iifname \"eth1\""));
         }
+    }
+
+    #[test]
+    fn a_pin_sends_a_flow_out_as_the_slots_own_tuple() {
+        // the fold a front-door slot uses for its service's replies, and the one a console's flow uses
+        let elem = pin_element(Ipv4Addr::new(192, 168, 21, 12), 40002, 40000);
+        assert_eq!(elem, "192.168.21.12 . 40002 : 192.168.0.21 . 40000");
     }
 
     #[test]
