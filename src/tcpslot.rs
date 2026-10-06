@@ -16,6 +16,9 @@ use crate::vote::{VoteDecision, VoteState};
 /// Keepalive interval for a TCP slot, strictly under the on-box 120 s silent-death bound.
 pub const TCP_KEEPALIVE_SECS: u64 = 60;
 
+/// The wait one STUN-over-TCP attempt gets; several public STUN servers answer datagrams alone, so a TCP dial to one draws nothing back.
+pub const STUN_TCP_TIMEOUT_SECS: u64 = 10;
+
 /// The mapping's connection state: Live while a STUN-over-TCP connection is up, Dead once it errored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnectionState {
@@ -87,16 +90,33 @@ async fn connection_round(
     crate::nft::add_pin(bind_ip, local_port, r).map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("connection fold pin: {e}"))
     })?;
-    let mut conn = sock
-        .connect(std::net::SocketAddr::V4(server))
-        .await?;
-    let txn = stun::random_txn();
-    conn.write_all(&stun::binding_request(&txn)).await?;
-    let mut buf = [0u8; 2048];
-    let n = conn.read(&mut buf).await?;
-    let tuple = stun::parse_mapped(&buf[..n])
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "connection STUN: no mapped tuple"))?;
-    Ok((tuple, conn, local_port))
+    let attempt = async move {
+        let mut conn = sock
+            .connect(std::net::SocketAddr::V4(server))
+            .await?;
+        let txn = stun::random_txn();
+        conn.write_all(&stun::binding_request(&txn)).await?;
+        let mut buf = [0u8; 2048];
+        let n = conn.read(&mut buf).await?;
+        stun::parse_mapped(&buf[..n])
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "connection STUN: no mapped tuple"))
+            .map(|tuple| (tuple, conn))
+    };
+    // A server that answers nothing must not hold the loop for the kernel's whole SYN-retry budget, and its fold must not outlive the attempt.
+    match tokio::time::timeout(Duration::from_secs(STUN_TCP_TIMEOUT_SECS), attempt).await {
+        Ok(Ok((tuple, conn))) => Ok((tuple, conn, local_port)),
+        Ok(Err(e)) => {
+            let _ = crate::nft::del_pin(bind_ip, local_port);
+            Err(e)
+        }
+        Err(_) => {
+            let _ = crate::nft::del_pin(bind_ip, local_port);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection STUN: no answer",
+            ))
+        }
+    }
 }
 
 /// Pokes a nominated peer through a fold pin, so the dial leaves as the slot's own tuple, and removes the pin afterwards.
@@ -133,13 +153,13 @@ pub async fn run_connection(
     let mut server_idx = 0usize;
     loop {
         interval.tick().await;
-        if state.is_live() && conn.is_some() {
-            if let Some(dest) = poke {
-                // a silent failure here is a line that never spoke TCP to its front, and nothing else says so
-                if let Err(e) = poke_round(bind_ip, r, dest).await {
-                    crate::emiteln!("warn: the TCP poke to {} failed: {}", dest, e);
-                }
+        // The poke leaves on every tick whatever the STUN link is doing: it is the line's TCP spoke to its front, and the mapping the front's dial needs is the one the poke makes.
+        if let Some(dest) = poke {
+            if let Err(e) = poke_round(bind_ip, r, dest).await {
+                crate::emiteln!("warn: the TCP poke to {} failed: {}", dest, e);
             }
+        }
+        if state.is_live() && conn.is_some() {
             // Refresh the held connection: the STUN traffic re-arms the AFTR idle timer.
             let Some(c) = conn.as_mut() else {
                 continue;
@@ -203,6 +223,12 @@ mod tests {
         assert!(!h.is_live());
         h.on_error(); // error from Dead is idempotent
         assert!(!h.is_live());
+    }
+
+    #[test]
+    fn a_stun_attempt_fits_inside_the_interval() {
+        // A server that never answers must be abandoned before the next tick, so the poke keeps its cadence.
+        assert!(STUN_TCP_TIMEOUT_SECS < TCP_KEEPALIVE_SECS);
     }
 }
 
