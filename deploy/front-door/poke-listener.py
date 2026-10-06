@@ -89,6 +89,7 @@ class Report(http.server.BaseHTTPRequestHandler):
         if length:
             pushed = {}
             body = self.rfile.read(length).decode("utf-8", "replace")
+            print("the push carried: %s" % body.replace("\n", " ").strip(), flush=True)
             for line in body.splitlines():
                 parts = line.split()
                 proto = PROTOCOLS.get(parts[1]) if len(parts) >= 3 else None
@@ -147,6 +148,7 @@ def udp_loop(bind, table, pushed, path, reload_cmd, name):
             table["udp_seen"] = time.time()
             print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
             write_table(path, table, pushed, reload_cmd, name)
+            sock.sendto(MARK, peer)
             continue
         tuple_, source = picked(table, pushed, "udp", time.time())
         slot = slot_of(tuple_) if tuple_ else None
