@@ -124,11 +124,11 @@ fn rule_handles(listing: &str, text: &str) -> Vec<u64> {
         .collect()
 }
 
-/// The handle of the chain's own reject: an accept the chain reaches after it is never evaluated.
-fn reject_handle(listing: &str) -> Option<u64> {
+/// The handle of the first per-zone input jump: the chain reaches an accept placed after it only once the zone's policy has run.
+fn zone_jump_handle(listing: &str) -> Option<u64> {
     listing
         .lines()
-        .find(|l| l.contains("jump handle_reject"))
+        .find(|l| l.contains("jump input_"))
         .and_then(|l| l.split_whitespace().last())
         .and_then(|t| t.parse::<u64>().ok())
 }
@@ -367,7 +367,7 @@ pub fn ensure_accept_sets() -> io::Result<()> {
         ]);
         // With no listing, leave the rule alone: a duplicate accept changes nothing about which packets pass.
         if let Some(l) = listing.as_deref() {
-            // The rule must be evaluated ahead of the chain's own reject, so it is re-placed immediately before that jump.
+            // The rule must be evaluated ahead of the per-zone jumps, whose policy would otherwise reset the arrival, so it is re-placed there.
             for h in rule_handles(l, &text) {
                 let _ = run(&[
                     "delete",
@@ -379,7 +379,7 @@ pub fn ensure_accept_sets() -> io::Result<()> {
                     &h.to_string(),
                 ]);
             }
-            match reject_handle(l) {
+            match zone_jump_handle(l) {
                 Some(h) => run(&[
                     "insert",
                     "rule",
@@ -809,23 +809,25 @@ mod tests {
     }
 
     #[test]
-    fn an_accept_past_the_reject_is_found_and_its_place_read() {
-        // The shape the box carried: the sets' rules appended after fw4's own reject, where they decide nothing.
-        let listing = "\t\tiifname \"eth1\" udp dport @dslp_ports_udp accept # handle 54939\n\
+    fn an_accept_past_the_zone_jump_is_found_and_its_place_read() {
+        // The shape the box carried: the sets' rules appended behind the zone jump, whose policy resets the arrival.
+        let listing = "\t\ttcp flags & (fin | syn | rst | ack) == syn jump syn_flood # handle 54730\n\
+                       \t\tiifname \"br-lan\" jump input_lan # handle 54731\n\
+                       \t\tiifname { \"eth1\", \"eth2\" } jump input_wan # handle 54733\n\
                        \t\tjump handle_reject # handle 54739\n\
                        \t\tiifname \"eth1\" tcp dport @dslp_ports_tcp accept # handle 54940\n";
         let rules = accept_rule_text();
         let tcp = &rules[1];
-        assert_eq!(reject_handle(listing), Some(54739));
+        assert_eq!(zone_jump_handle(listing), Some(54731));
         assert_eq!(rule_handles(listing, tcp), vec![54940]);
         assert!(
-            listing.find(tcp).unwrap() > listing.find("jump handle_reject").unwrap(),
-            "the rule the listing carries sits after the reject"
+            listing.find(tcp).unwrap() > listing.find("jump input_lan").unwrap(),
+            "the rule the listing carries sits behind the zone jump"
         );
         // A listing taken without -a carries no handle at all, so the rule is neither found nor moved.
         assert_eq!(chain_listing_args()[0], "-a");
-        let bare = "\t\tjump handle_reject\n\t\tiifname \"eth1\" tcp dport @dslp_ports_tcp accept\n";
-        assert_eq!(reject_handle(bare), None);
+        let bare = "\t\tiifname \"eth1\" jump input_wan\n\t\tiifname \"eth1\" tcp dport @dslp_ports_tcp accept\n";
+        assert_eq!(zone_jump_handle(bare), None);
         assert!(rule_handles(bare, tcp).is_empty());
     }
 
