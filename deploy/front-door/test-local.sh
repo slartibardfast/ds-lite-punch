@@ -145,7 +145,7 @@ s.sendto(b"dslp-poke", ("127.0.0.1", 41001))
 s.settimeout(10)
 try:
     data, peer = s.recvfrom(2048)
-    print("the front forwarded:", data.decode())
+    print("the front forwarded: %s from %d" % (data.decode(), peer[1]))
 except socket.timeout:
     print("the front forwarded nothing")
 PY
@@ -154,7 +154,7 @@ sleep 3
 python3 - <<'PY'
 import socket
 c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-c.sendto(b"the client spoke", ("127.0.0.1", 8447))
+c.sendto(b"the client spoke", ("127.0.0.1", 41001))
 c.close()
 t = socket.create_connection(("127.0.0.1", 41001), timeout=3)
 t.sendall(b"dslp-poke")
@@ -164,8 +164,8 @@ sleep 3
 learnt_name=$(grep -c "^$PASS 127.0.0.1:" "$W/upstreams.map" || true)
 learnt_port=$(grep -c "^8447 127.0.0.1:8455;" "$W/upstreams.map" || true)
 if [ "$learnt_name" = 1 ] && [ "$learnt_port" = 1 ] \
-    && grep -q 'the front forwarded: the client spoke' "$W/udp-leg.txt"; then
-    note "the front follows the poke: the UDP forward went to the tuple it learned"
+    && grep -q 'the front forwarded: the client spoke from 41001' "$W/udp-leg.txt"; then
+    note "the front follows the poke: the datagram left for the learned tuple from the socket the poke landed on"
 else
     note "FAIL front learning: $learnt_name name-keyed, $learnt_port port-keyed, and $(tr -d '\n' <"$W/udp-leg.txt")"
     fail=1

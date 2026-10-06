@@ -23,6 +23,13 @@ carries fills a protocol the poke has not reached, and every line the include
 and the answer carry names its source, so a fallback never wins quietly and a
 protocol with neither says so.
 
+The socket is also the datagram leg. A datagram that is not a poke goes onward
+to the tuple the front routes on, from this same socket, because the carrier
+admits a peer by the exact tuple the line's mapping spoke to, and one flow at a
+time holds it: a datagram from a new client takes the socket over, and the
+slot's own datagrams go back to that client. --udp-only leaves the TCP half of
+the port to another process, which is what a front whose TCP side is nginx does.
+
     poke-listener.py --listen 0.0.0.0:41001 --out /etc/front-door/upstreams \\
         --reload "nginx -s reload"
 """
@@ -120,18 +127,41 @@ class ReportServer(http.server.ThreadingHTTPServer):
         super().__init__(bind, Report)
 
 
+def slot_of(tuple_):
+    """The host and port a `host:port` tuple names, or None when it names nothing."""
+    host, _, port = tuple_.rpartition(":")
+    if not host or not port.isdigit():
+        return None
+    return (host, int(port))
+
+
 def udp_loop(bind, table, pushed, path, reload_cmd, name):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(bind)
+    client = None
     while True:
-        data, peer = sock.recvfrom(2048)
-        if not data.startswith(MARK):
+        data, peer = sock.recvfrom(65535)
+        if data.startswith(MARK):
+            table["udp"] = "%s:%d" % (peer[0], peer[1])
+            table["udp_seen"] = time.time()
+            print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
+            write_table(path, table, pushed, reload_cmd, name)
             continue
-        table["udp"] = "%s:%d" % (peer[0], peer[1])
-        table["udp_seen"] = time.time()
-        print("udp poke from %s:%d" % (peer[0], peer[1]), flush=True)
-        write_table(path, table, pushed, reload_cmd, name)
+        tuple_, source = picked(table, pushed, "udp", time.time())
+        slot = slot_of(tuple_) if tuple_ else None
+        if slot is None:
+            continue
+        if peer == client:
+            sock.sendto(data, slot)
+            continue
+        if peer == slot and client is not None:
+            sock.sendto(data, client)
+            continue
+        # one flow at a time on this socket: the arrival from a new client takes it over
+        client = peer
+        print("udp client %s:%d follows the %s tuple at %s" % (peer[0], peer[1], source, tuple_), flush=True)
+        sock.sendto(data, slot)
 
 
 def handler(conn, table, pushed, path, reload_cmd, name):
@@ -182,6 +212,7 @@ def main():
     ap.add_argument("--lease", type=int, default=0, help="withdraw an entry this many seconds after its last poke; 0 keeps it")
     ap.add_argument("--reload", default="", help="a command to run after a change")
     ap.add_argument("--http-listen", default="", help="the address the daemon's push is answered on; empty leaves the report off")
+    ap.add_argument("--udp-only", action="store_true", help="own the port for datagrams alone, for a front whose TCP side is another process's")
     args = ap.parse_args()
     host, _, port = args.listen.rpartition(":")
     bind = (host or "0.0.0.0", int(port))
@@ -199,11 +230,12 @@ def main():
         args=(bind, table, pushed, args.out, args.reload, args.name),
         daemon=True,
     ).start()
-    threading.Thread(
-        target=tcp_loop,
-        args=(bind, table, pushed, args.out, args.reload, args.name),
-        daemon=True,
-    ).start()
+    if not args.udp_only:
+        threading.Thread(
+            target=tcp_loop,
+            args=(bind, table, pushed, args.out, args.reload, args.name),
+            daemon=True,
+        ).start()
     threading.Thread(
         target=lease_watch,
         args=(table, pushed, args.out, args.reload, args.name, args.lease),
