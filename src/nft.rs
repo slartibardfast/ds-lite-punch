@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn a_pin_sends_a_flow_out_as_the_slots_own_tuple() {
-        // the fold a front-door slot uses for its service's replies, and the one a console's flow uses
+        // the fold a console's flow uses, and the one a TCP holder's STUN link uses
         let elem = pin_element(Ipv4Addr::new(192, 168, 21, 12), 40002, 40000);
         assert_eq!(elem, "192.168.21.12 . 40002 : 192.168.0.21 . 40000");
     }

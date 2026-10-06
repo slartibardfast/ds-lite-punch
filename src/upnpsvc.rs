@@ -1038,7 +1038,8 @@ impl UpnpFacade {
             crate::keepalive_loop(ka_sock, ka_state, interval, 0).await
         });
         let recv = tokio::spawn(async move {
-            crate::run_slot(sock, state, table, target, publisher, bind_port).await
+            // a granted lease's slot keeps the transparent forward: its peers are the client's own (call/0048)
+            crate::run_slot(sock, state, table, target, publisher, bind_port, false).await
         });
         Ok(vec![ka, recv])
     }

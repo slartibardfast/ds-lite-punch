@@ -612,9 +612,46 @@ pub(crate) async fn run_slot(
     target: SocketAddrV4,
     publisher: Arc<Publisher>,
     bind_port: u16,
+    relay: bool,
 ) {
     // STUN majority vote: publication needs two servers to agree; one dissent marks suspect
     let vote = Arc::new(Mutex::new(VoteState::new()));
+
+    // a relaying slot answers its service from this socket, so the service's own reply comes back here (call/0048)
+    let service: Option<Arc<UdpSocket>> = if relay {
+        match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                emiteln!("warn: slot {} cannot relay: {}", bind_port, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let peer: Arc<Mutex<Option<SocketAddrV4>>> = Arc::new(Mutex::new(None));
+    if let Some(svc) = service.as_ref() {
+        let sock = sock.clone();
+        let svc = Arc::clone(svc);
+        let peer = peer.clone();
+        // the service's answers leave the slot's own socket, where the mapping lives
+        tokio::spawn(async move {
+            let mut ans = vec![0u8; 65536];
+            loop {
+                match svc.recv_from(&mut ans).await {
+                    Ok((n, _)) => {
+                        let to = *peer.lock().await;
+                        if let Some(p) = to {
+                            if let Err(e) = sock.send_to(&ans[..n], p).await {
+                                emiteln!("warn: the service's answer failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => emiteln!("warn: the service socket failed: {}", e),
+                }
+            }
+        });
+    }
 
     // recv loop: classify STUN responses vs peer data; forward the latter.
     let mut buf = vec![0u8; 65536];
@@ -670,8 +707,19 @@ pub(crate) async fn run_slot(
                 let mut t = table.lock().await;
                 t.stamp_activity_if_stale(bind_port, Epoch::now(), LEASE_STAMP_MIN_S);
             }
-            if let Err(e) = forward::forward(pkt, src_v4, target) {
-                emiteln!("warn: forward {} -> {} failed: {}", src_v4, target, e);
+            match service.as_ref() {
+                // the relay: remember who spoke, hand the datagram to the service as its peer, and let the answer come back
+                Some(svc) => {
+                    *peer.lock().await = Some(src_v4);
+                    if let Err(e) = svc.send_to(pkt, target).await {
+                        emiteln!("warn: relay {} -> {} failed: {}", src_v4, target, e);
+                    }
+                }
+                None => {
+                    if let Err(e) = forward::forward(pkt, src_v4, target) {
+                        emiteln!("warn: forward {} -> {} failed: {}", src_v4, target, e);
+                    }
+                }
             }
         }
     }
@@ -859,10 +907,8 @@ async fn main() {
         let target = SocketAddrV4::new(s.target, s.target_port);
         let publisher = publisher.clone();
         let bind_port = s.bind_port;
-        // the fold: this slot's service answers as the slot's own tuple, which is how a front's carrier carries the reply (call/0047)
-        if let Err(e) = nft::add_pin(s.target, s.target_port, s.bind_port) {
-            emiteln!("warn: the fold pin for slot {} failed: {}", s.bind_port, e);
-        }
+        // a slot with a poke faces a front, so it relays: the daemon answers its service as the peer (call/0048)
+        let relay = cfg.poke.is_some();
         // the keepalive is a sibling task; the caller owns both handles so a revocation can abort them
         let ka_sock = sock.clone();
         let ka_state = state.clone();
@@ -871,7 +917,7 @@ async fn main() {
         });
         let table_for_slot = table.clone();
         tokio::spawn(async move {
-            run_slot(sock, state, table_for_slot, target, publisher, bind_port).await
+            run_slot(sock, state, table_for_slot, target, publisher, bind_port, relay).await
         });
     }
 
