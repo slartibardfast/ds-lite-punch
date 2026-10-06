@@ -114,6 +114,25 @@ fn legacy_rule_handles(listing: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The handles of the rule lines whose text is this accept rule's.
+fn rule_handles(listing: &str, text: &str) -> Vec<u64> {
+    listing
+        .lines()
+        .filter(|l| l.contains(text))
+        .filter_map(|l| l.split_whitespace().last())
+        .filter_map(|t| t.parse::<u64>().ok())
+        .collect()
+}
+
+/// The handle of the chain's own reject: an accept the chain reaches after it is never evaluated.
+fn reject_handle(listing: &str) -> Option<u64> {
+    listing
+        .lines()
+        .find(|l| l.contains("jump handle_reject"))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|t| t.parse::<u64>().ok())
+}
+
 /// The per-protocol sets of ports with an inbound translation, and the maps to their client tuples.
 pub const INBOUND_SET_UDP: &str = "dslp_in_udp";
 pub const INBOUND_SET_TCP: &str = "dslp_in_tcp";
@@ -342,12 +361,32 @@ pub fn ensure_accept_sets() -> io::Result<()> {
             "{ type inet_service ; size 65535 ; }",
         ]);
         // With no listing, leave the rule alone: a duplicate accept changes nothing about which packets pass.
-        let present = listing
-            .as_deref()
-            .map(|l| l.contains(&text))
-            .unwrap_or(true);
-        if !present {
-            run(&["add", "rule", "inet", "fw4", "input", &text])?;
+        if let Some(l) = listing.as_deref() {
+            // The rule must be evaluated ahead of the chain's own reject, so it is re-placed immediately before that jump.
+            for h in rule_handles(l, &text) {
+                let _ = run(&[
+                    "delete",
+                    "rule",
+                    "inet",
+                    "fw4",
+                    "input",
+                    "handle",
+                    &h.to_string(),
+                ]);
+            }
+            match reject_handle(l) {
+                Some(h) => run(&[
+                    "insert",
+                    "rule",
+                    "inet",
+                    "fw4",
+                    "input",
+                    "position",
+                    &h.to_string(),
+                    &text,
+                ])?,
+                None => run(&["insert", "rule", "inet", "fw4", "input", &text])?,
+            }
         }
         // a restart must not inherit the last run's accepted ports
         let _ = run(&["flush", "set", "inet", "fw4", accept_set(tcp)]);
@@ -761,6 +800,22 @@ mod tests {
         assert!(legacy_rule_handles("").is_empty());
         assert!(
             legacy_rule_handles("iifname \"eth1\" udp dport @dslp_ports_udp accept").is_empty()
+        );
+    }
+
+    #[test]
+    fn an_accept_past_the_reject_is_found_and_its_place_read() {
+        // The shape the box carried: the sets' rules appended after fw4's own reject, where they decide nothing.
+        let listing = "\t\tiifname \"eth1\" udp dport @dslp_ports_udp accept # handle 54939\n\
+                       \t\tjump handle_reject # handle 54739\n\
+                       \t\tiifname \"eth1\" tcp dport @dslp_ports_tcp accept # handle 54940\n";
+        let rules = accept_rule_text();
+        let tcp = &rules[1];
+        assert_eq!(reject_handle(listing), Some(54739));
+        assert_eq!(rule_handles(listing, tcp), vec![54940]);
+        assert!(
+            listing.find(tcp).unwrap() > listing.find("jump handle_reject").unwrap(),
+            "the rule the listing carries sits after the reject"
         );
     }
 
