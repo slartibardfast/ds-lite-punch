@@ -78,7 +78,7 @@ ip rule show
 | Where | What it is |
 |---|---|
 | `table ip dslp` | the daemon's own table: the sets and maps for the slot ports, the prerouting translation, and the keepalive's conntrack policy |
-| `inet fw4` | the accept rules the daemon inserts for the slot ports, each marked with the comment `dslitepunch-R` |
+| `inet fw4` | the two accept rules the daemon inserts for the slot ports, one per protocol and each placed ahead of the per-zone input jump, so an arrival meets the accept before the zone's policy |
 | `ip rule`, priority `25100` | the policy route the relay's own egress uses, over table `1001` |
 | `ip route`, table `1001` | the source route that keeps the relay's replies on the line the mapping is on |
 
