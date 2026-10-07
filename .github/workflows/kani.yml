@@ -1,6 +1,6 @@
 name: Kani
 
-# The Kani rung on a runner: call/0019 defers the facade harnesses to a host where CBMC converges, so this lane gates the tree's own harnesses and measures that question for the facade set, each harness bounded so one that stops converging cannot hold the run.
+# The Kani rung on a runner: call/0019 defers the facade harnesses to a host where CBMC converges, so one job gates the tree's own harnesses and a second measures that question, each harness bounded so one that stops converging cannot hold the run.
 
 on:
   workflow_dispatch:
@@ -12,9 +12,9 @@ permissions:
   contents: read
 
 jobs:
-  kani:
+  harnesses:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - name: Install the Kani this tree's proofs were written against
@@ -35,7 +35,7 @@ jobs:
           fail=0
           while read -r h; do
             case "$h" in upnp::*) continue ;; esac
-            if timeout 900 cargo kani --harness "$h" > "$RUNNER_TEMP/${h//:/_}.log" 2>&1; then
+            if timeout 600 cargo kani --harness "$h" > "$RUNNER_TEMP/${h//:/_}.log" 2>&1; then
               echo "PASS $h"
             else
               echo "FAIL $h"
@@ -44,9 +44,31 @@ jobs:
             fi
           done < "$RUNNER_TEMP/harnesses.txt"
           exit "$fail"
+      - name: Upload the per-harness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kani-logs
+          path: ${{ runner.temp }}/kani-*.log
+          if-no-files-found: ignore
+
+  facade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    # call/0019 records these as never run green anywhere, so this job produces the verdicts a record can rest on.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the Kani this tree's proofs were written against
+        # The version is pinned: a harness is written against a CBMC search strategy, and a new Kani is a new measurement.
+        run: |
+          cd "$RUNNER_TEMP"
+          cargo install kani-verifier --locked --version 0.67.0
+          cargo kani setup
+      - name: List the harnesses
+        run: |
+          cargo kani list | grep -oE '[a-z_]+::[a-z_]+::[a-z_0-9]+' | sort -u > "$RUNNER_TEMP/harnesses.txt"
       - name: Measure the facade harnesses, each bounded
-        # call/0019 records these as never run green anywhere, so this step produces the verdicts a record can rest on.
-        continue-on-error: true
         run: |
           set -uo pipefail
           while read -r h; do
@@ -62,6 +84,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kani-logs
+          name: kani-facade-logs
           path: ${{ runner.temp }}/kani-*.log
           if-no-files-found: ignore
