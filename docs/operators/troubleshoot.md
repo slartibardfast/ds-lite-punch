@@ -191,6 +191,44 @@ certificate needs the same treatment on its side of the connection:
 `extendedKeyUsage=serverAuth` and a `subjectAltName` naming the address a client
 uses.
 
+## Measuring an arrival on the router
+
+The carrier rewrites an arrival's destination to the slot's own port before the
+packet reaches the box, so a capture filters on the port the slot binds. A capture
+filtered on the external tuple port comes back empty, and an empty capture reads as
+a refusal by the carrier.
+
+```sh
+sh deploy/rig-capture.sh tcp 40001 20
+```
+
+The shape it shows:
+
+```text
+eth1  In  <front>.<peer> > 192.168.0.21.40001   an arrival, with the destination rewritten
+eth1  Out 192.168.0.21.40001 > <front>.<peer>   the answer, from the slot's own socket
+```
+
+A reset beside an arrival comes from the box's own firewall. The daemon accepts a
+slot's port by adding the port to a set that one rule per protocol reads, and that
+rule belongs ahead of the firewall's per-zone input jump, because the zone's policy
+resets an arrival it meets first:
+
+```sh
+nft -a list chain inet fw4 input | grep -nE "dslp_ports|jump input_"
+```
+
+The accept lines read before the first `jump input_` line. A restart places them
+there again.
+
+Reach a process by its identifier. A pattern matches the shell that carries it, and
+the kill then ends that shell before it prints anything:
+
+```sh
+pidof ds-lite-punch
+kill <pid>
+```
+
 ## Where to go next
 
 - [Install](install.md) the daemon.
