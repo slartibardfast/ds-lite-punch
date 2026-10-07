@@ -921,6 +921,8 @@ mod verify {
                 assert!(idle >= grace, "stale requires inbound silence past grace");
             }
             None => assert!(!owned_now && (missing < grace || idle < grace)),
+            // A device that left is release_reason's finding, so this function never reports one.
+            Some(ExitReason::DeviceGone) => unreachable!("exit_due reports ownership or staleness"),
         }
     }
 }
