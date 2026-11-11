@@ -160,7 +160,7 @@ class Carrier:
                     else "tcp sport %s " % pkt["dport"]
         out = nft_out(["-ae", "add", "rule", "ip", "carrier", "prerouting",
                        "iifname", '"%s"' % PUB, proto, "dport", str(ext),
-                       restrict, "ip daddr", PUB_IP,
+                       restrict, "ip daddr", PUB_IP, "counter",
                        "dnat ip to", "%s:%d" % (INSIDE_IP, pkt["sport"])])
         pre_handle = re.search(r"# handle (\d+)", out).group(1)
         dest_match = ""
