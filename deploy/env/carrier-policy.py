@@ -120,7 +120,7 @@ class Carrier:
         self.mappings = {}
         self.used_ports = set()
         self.seq = conf.get("sequential_base", "30000")
-        self.log = pathlib.Path(ARGS.log).open("a")
+        self.log = pathlib.Path(ARGS.log).open("w")
 
     def emit(self, line):
         stamp = time.strftime("%H:%M:%S")
