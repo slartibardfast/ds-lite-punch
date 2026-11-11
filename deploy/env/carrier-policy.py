@@ -47,8 +47,10 @@ def read_profile(path):
     return conf
 
 def nft(args):
-    subprocess.run(["nft"] + args, check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    done = subprocess.run(["nft"] + args, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise SystemExit("carrier-policy: nft %s failed: %s" % (
+            " ".join(args), (done.stderr or "").strip()))
 
 def nft_out(args):
     proc = subprocess.run(["nft"] + args, capture_output=True, text=True)
@@ -68,9 +70,27 @@ def setup_plane():
     nft(["add", "chain", "ip", "carrier", "postrouting",
          "{ type nat hook postrouting priority srcnat; }"])
     nft(["add", "chain", "ip", "carrier", "leak",
-         "{ type filter hook postrouting priority filter + 10; }"])
+         "{ type filter hook postrouting priority srcnat + 10; }"])
+    # A real carrier forwards only what its translation touched; a packet
+    # leaving the inside wire with a source that is not the carrier's own
+    # public address escaped the mapping, and that is the leak. The chain
+    # sits after the srcnat chain (priority 100), so a mapped flow arrives
+    # already carrying the public source and passes; one before the nat
+    # chain would drop every packet before its translation ran.
     nft(["add", "rule", "ip", "carrier", "leak",
-         "oifname", '"%s"' % PUB, "iifname", '"%s"' % INSIDE, "drop"])
+         "oifname", '"%s"' % PUB, "iifname", '"%s"' % INSIDE,
+         "ip", "saddr", "!=", PUB_IP, "counter", "drop"])
+    # The policy plane's own resends must leave no conntrack trace: a state
+    # entry for a resent datagram would make the peer's return datagrams
+    # look like replies of that same connection, and the dnat rules would
+    # never be consulted for them.
+    subprocess.run(["nft", "delete", "table", "ip", "carrier-raw"],
+                   capture_output=True)
+    nft(["add", "table", "ip", "carrier-raw"])
+    nft(["add", "chain", "ip", "carrier-raw", "out",
+         "{ type filter hook output priority raw; }"])
+    nft(["add", "rule", "ip", "carrier-raw", "out",
+         "ip", "saddr", PUB_IP, "udp", "sport", "1024-65535", "notrack"])
 
 def parse(frame, inside_ip):
     if len(frame) < 34 or frame[12:14] != b"\x08\x00":
@@ -172,16 +192,37 @@ class Carrier:
             dest_match = "ip daddr %s " % pkt["dst"]
         out = nft_out(["-ae", "add", "rule", "ip", "carrier", "postrouting",
                        "iifname", '"%s"' % INSIDE, proto, "sport",
-                       str(pkt["sport"]), dest_match, "snat ip to",
+                       str(pkt["sport"]), dest_match, "counter", "snat ip to",
                        "%s:%d" % (PUB_IP, ext)])
         post_handle = re.search(r"# handle (\d+)", out).group(1)
         return pre_handle, post_handle
+
+    def resend(self, pkt, ext):
+        """Deliver a tapped datagram from the carrier's own public tuple.
+
+        The kernel's copy of these datagrams never crosses: a flow's first
+        packet traverses postrouting before its snat rule exists, and the
+        connection's nat decision, committed as none, is reused by every
+        later packet — the snat rule is never evaluated again and the leak
+        chain drops each untranslated copy. The policy plane saw the packet
+        at L2 and carries the outbound leg itself, translated exactly as
+        the rule would have translated it."""
+        if pkt["proto"] != "udp":
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((PUB_IP, ext))
+            sock.sendto(pkt["payload"], (pkt["dst"], pkt["dport"]))
+            sock.close()
+        except OSError:
+            pass
 
     def handle_flow(self, pkt):
         key = self.key_of(pkt)
         now = time.time()
         if key in self.mappings:
             self.mappings[key]["last"] = now
+            self.resend(pkt, self.mappings[key]["ext"])
             return
         if pkt["proto"] == "tcp" and not pkt["syn"]:
             return
@@ -192,6 +233,7 @@ class Carrier:
         pre, post = self.program(pkt, ext)
         self.mappings[key] = {"ext": ext, "last": now,
                               "pre": pre, "post": post}
+        self.resend(pkt, ext)
         self.emit("ALLOC %s inside=%s:%d dest=%s:%d external=%s:%d" % (
             pkt["proto"], pkt["src"], pkt["sport"], pkt["dst"], pkt["dport"],
             PUB_IP, ext))
@@ -232,6 +274,15 @@ class Carrier:
             self.emit("EXPIRE silent %s mapping inside=%s:%d" % (
                 key[0], key[1], key[2]))
 
+    def dump_rules(self):
+        """The data plane's counters, so a run's log tells where datagrams
+        died: a snat counter that stays at zero while the leak counter
+        climbs is the translation never matching, and so on."""
+        for chain in ("prerouting", "postrouting", "leak"):
+            out = nft_out(["list", "chain", "ip", "carrier", chain])
+            counts = re.findall(r"counter packets (\d+) bytes \d+", out)
+            self.emit("RULES %s counters=%s" % (chain, ",".join(counts)))
+
 def main():
     global ARGS, INSIDE_IP, PUB, INSIDE
     ap = argparse.ArgumentParser()
@@ -241,6 +292,10 @@ def main():
     ap.add_argument("--inside-ip", default="10.9.2.2")
     ap.add_argument("--public-ip", default="10.9.0.1")
     ap.add_argument("--log", default="/tmp/carrier-policy.log")
+    ap.add_argument("--tcp-lane", default="",
+                    help="IP:PORT of a destination whose TCP flows get a "
+                         "pre-programmed, port-preserving mapping, opened "
+                         "before any flow can lose its first packet")
     ap.add_argument("--runtime", type=int, default=86400,
                     help="seconds the policy plane serves before exiting")
     global ARGS, INSIDE, PUB, INSIDE_IP, PUB_IP
@@ -251,6 +306,14 @@ def main():
     subprocess.run(["sysctl", "-q", "-w", "net.ipv4.ip_forward=1"],
                    capture_output=True)
     setup_plane()
+    if ARGS.tcp_lane:
+        # The spoke's TCP lane, opened before any flow exists: a rule that
+        # was never absent cannot lose its first packet to the nat race, and
+        # the daemon's TLS push rides it with a port-preserving translation.
+        host, _, port = ARGS.tcp_lane.rpartition(":")
+        nft(["add", "rule", "ip", "carrier", "postrouting",
+             "iifname", '"%s"' % INSIDE, "ip", "daddr", host,
+             "tcp", "dport", port, "counter", "snat", "ip", "to", PUB_IP])
     carrier = Carrier(conf)
     sel = selectors.DefaultSelector()
     sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
@@ -258,6 +321,7 @@ def main():
     sniffer.bind((INSIDE, 0))
     sel.register(sniffer, selectors.EVENT_READ)
     last_sweep = time.time()
+    last_dump = time.time()
     deadline = time.time() + int(ARGS.runtime)
     while time.time() < deadline:
         events = sel.select(timeout=1.0)
@@ -273,6 +337,9 @@ def main():
         if time.time() - last_sweep >= 1.0:
             carrier.sweep()
             last_sweep = time.time()
+        if time.time() - last_dump >= 10.0:
+            carrier.dump_rules()
+            last_dump = time.time()
     carrier.sweep()
 
 if __name__ == "__main__":

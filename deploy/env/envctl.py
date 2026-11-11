@@ -12,6 +12,7 @@ actor, and the probes run in the actors they probe.
     python3 deploy/env/envctl.py verify         prove the datagram path
     python3 deploy/env/envctl.py verify-policy  prove the carrier policy rows
     python3 deploy/env/envctl.py deploy-front   deploy the front by its own pipeline and probe it
+    python3 deploy/env/envctl.py up-b4          the front, the daemon and the service, probing the exchange
 
 setns into a child namespace requires capability over the current namespace's
 owner as well, which is why the controller moves itself into its own network
@@ -60,7 +61,7 @@ INTERNET_PUB = "10.9.0.10"
 STATE = pathlib.Path("/tmp/env-holders.txt")
 HOLDERS = {}
 POLICIES = []
-FRONT_STATE = pathlib.Path("/tmp/env-front-services.txt")
+SERVICES_STATE = pathlib.Path("/tmp/env-services.txt")
 ENV_ROOT = pathlib.Path("/tmp/dslp-env")
 FRONT_ROOT = ENV_ROOT / "front"
 FRONT_TLS = ENV_ROOT / "tls"
@@ -69,6 +70,13 @@ FRONT_PORT = 8443
 PROTECTED_NAME = "protected.env"
 PASSTHRU_NAME = "passthru.env"
 PROTECTED_UPSTREAM = "127.0.0.1:8080"
+B4_BIN = HERE.parent.parent / "target" / "x86_64-unknown-linux-musl" / \
+    "release" / "ds-lite-punch"
+B4_BIND = "10.9.2.2:40000"
+SERVICE_TARGET = "192.168.77.2:40001"
+B4_GATEWAY = "10.9.2.1"
+STUN_ENDPOINT = "10.9.0.10:3478"
+B4_LOG = ENV_ROOT / "b4.log"
 
 
 def unshare(flags):
@@ -150,18 +158,18 @@ def hold(name):
 
 
 def stop_front_services():
-    """SIGTERM the front's deployed processes from the services state file.
+    """SIGTERM the deployed service processes from the services state file.
     A signal needs only the same uid, so this works from a later invocation
-    that is outside the environment's user namespace."""
-    if not FRONT_STATE.exists():
+    once it has entered the actors' user namespace."""
+    if not SERVICES_STATE.exists():
         return
-    for line in FRONT_STATE.read_text().splitlines():
+    for line in SERVICES_STATE.read_text().splitlines():
         _, _, pid = line.partition(" ")
         try:
             os.kill(int(pid), 15)
-        except (ProcessLookupError, ValueError):
+        except (ProcessLookupError, ValueError, PermissionError):
             pass
-    FRONT_STATE.unlink(missing_ok=True)
+    SERVICES_STATE.unlink(missing_ok=True)
 
 
 def cmd_down():
@@ -181,7 +189,7 @@ def cmd_down():
         if pid:
             try:
                 os.kill(pid, 15)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
     for pid in POLICIES:
         try:
@@ -251,7 +259,7 @@ def pair(name_a, iface_a, cidr_a, name_b, iface_b, cidr_b):
         subprocess.run(["ip", "link", "set", iface_b, "up"], check=True)
 
 
-def start_policy(profile):
+def start_policy(profile, tcp_lane=""):
     pid = os.fork()
     if pid == 0:
         with netns("carrier"):
@@ -260,8 +268,13 @@ def start_policy(profile):
                      "--profile", str(HERE / "profiles" / (profile + ".conf")),
                      "--inside", "in0", "--public", "pub0",
                      "--inside-ip", B4_WAN_IP, "--public-ip", CARRIER_PUB,
-                     "--log", "/tmp/carrier-policy-" + profile + ".log"])
+                     "--log", "/tmp/carrier-policy-" + profile + ".log",
+                     "--tcp-lane", tcp_lane])
     POLICIES.append(pid)
+    # A run killed mid-verify leaves its policy plane running in a namespace
+    # no state file names; recording it here is what lets a later down stop
+    # it instead of leaking a select() loop forever.
+    record_service("policy-" + profile, pid)
     return pid
 
 
@@ -388,6 +401,22 @@ def provision_nginx():
     return str(nginx_bin), str(module)
 
 
+def exec_in(name, argv, log_path=None):
+    """Fork a child that runs argv inside the actor's network namespace and
+    return its pid; with log_path the child's output lands in that file,
+    which is what a namespace with no init has instead of journald."""
+    pid = os.fork()
+    if pid == 0:
+        if log_path is not None:
+            fd = os.open(str(log_path),
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+        with netns(name):
+            os.execv(argv[0], argv)
+    return pid
+
+
 def start_front_units():
     execs = {}
     for unit in sorted((FRONT_ROOT / "units").glob("*.service")):
@@ -398,18 +427,15 @@ def start_front_units():
     if sorted(execs) != wanted:
         raise SystemExit("envctl: the pipeline rendered %s, expected %s" % (
             sorted(execs), wanted))
-    poke_pid = None
-    for name in ("front-door-poke.service", "front-door-nginx.service"):
-        argv = shlex.split(execs[name])
-        pid = os.fork()
-        if pid == 0:
-            with netns("front"):
-                os.execv(argv[0], argv)
-        if name == "front-door-poke.service":
-            poke_pid = pid
+    # The relay's stdout is the front's own evidence (the pokes, the push,
+    # the tuple it learned), which is why the probes read it from a file.
+    poke_pid = exec_in("front",
+                       shlex.split(execs["front-door-poke.service"]),
+                       FRONT_ROOT / "logs" / "relay.log")
+    exec_in("front", shlex.split(execs["front-door-nginx.service"]))
     # The poke's pid is recorded before the wait, so a failure here still
     # leaves the running unit in the services state file for down to stop.
-    FRONT_STATE.write_text("poke %d\n" % poke_pid)
+    SERVICES_STATE.write_text("poke %d\n" % poke_pid)
     pid_path = FRONT_ROOT / "logs" / "front.pid"
     # nginx creates an empty pid file and fills it once the master daemonizes.
     deadline = time.time() + 5
@@ -422,7 +448,7 @@ def start_front_units():
         time.sleep(0.1)
     if not master:
         raise SystemExit("envctl: nginx never wrote its pid")
-    FRONT_STATE.write_text("poke %d\nnginx %d\n" % (poke_pid, master))
+    SERVICES_STATE.write_text("poke %d\nnginx %d\n" % (poke_pid, master))
 
 
 def table_answer():
@@ -499,17 +525,13 @@ def probe_failure(name, answer):
         print("--- access log: no request ever reached the https block ---")
 
 
-def cmd_deploy_front():
-    provision_nginx()
-    enter_own_namespaces()
-    cmd_down()
-    cmd_up()
-    # A fresh root and a fresh authority every run: the identity the
-    # previous run minted must not vouch for this one's probes, and
-    # mint.sh refuses to sign over an existing authority.
+def deploy_front(nginx_bin, module):
+    """The pipeline's three steps inside the front namespace, over a fresh
+    root and a fresh authority: the identity the previous run minted must
+    not vouch for this one's probes, and mint.sh refuses to sign over an
+    existing authority."""
     shutil.rmtree(FRONT_TLS, ignore_errors=True)
     shutil.rmtree(FRONT_ROOT, ignore_errors=True)
-    failures = []
     run("front", "sh", str(HERE.parent / "front-door" / "mint.sh"),
         "--dir", str(FRONT_TLS),
         "--protected-name", PROTECTED_NAME, "--passthru-name", PASSTHRU_NAME)
@@ -521,9 +543,6 @@ def cmd_deploy_front():
         str(FRONT_ROOT / "certs" / "front.crt"))
     run("front", "install", "-m", "0600", str(FRONT_TLS / "front.key"),
         str(FRONT_ROOT / "certs" / "front.key"))
-    nginx_bin, module = str(NGINX_ROOT / "usr" / "sbin" / "nginx"), str(
-        NGINX_ROOT / "usr" / "lib" / "nginx" / "modules" /
-        "ngx_stream_module.so")
     run("front", "sh", str(HERE.parent / "front-door" / "install.sh"),
         "--root", str(FRONT_ROOT), "--units-dir", str(FRONT_ROOT / "units"),
         "--public-port", str(FRONT_PORT),
@@ -533,6 +552,15 @@ def cmd_deploy_front():
         "--nginx", nginx_bin, "--module", module, "--user", "root")
     print("PASS front-deployment: install.sh rendered the configuration and both units inside the front namespace")
     start_front_units()
+
+
+def cmd_deploy_front():
+    nginx_bin, module = provision_nginx()
+    enter_own_namespaces()
+    cmd_down()
+    cmd_up()
+    deploy_front(nginx_bin, module)
+    failures = []
     time.sleep(0.5)
     answer = table_answer()
     ok_tls = "200 OK" in answer and "udp none" in answer
@@ -562,6 +590,167 @@ def cmd_deploy_front():
     if failures:
         raise SystemExit("deploy-front: failed rows in %s" % ", ".join(failures))
     print("deploy-front: the front serves by its own pipeline inside the front namespace")
+
+
+def record_service(name, pid):
+    with open(SERVICES_STATE, "a") as fh:
+        fh.write("%s %d\n" % (name, pid))
+
+
+def start_service_echo():
+    record_service("service", exec_in("service", [
+        sys.executable, str(HERE / "service-echo.py"),
+        "--bind", "192.168.77.2", "--port", "40001"]))
+
+
+def start_stun():
+    record_service("stun", exec_in("internet", [
+        sys.executable, str(HERE / "stun-server.py"),
+        "--bind", INTERNET_PUB, "--port", "3478"]))
+
+
+def start_b4():
+    if not B4_BIN.exists():
+        raise SystemExit(
+            "envctl: the daemon binary is missing at %s; build it with "
+            "cargo build --release --target x86_64-unknown-linux-musl"
+            % B4_BIN)
+    argv = [str(B4_BIN),
+            "--bind", B4_BIND,
+            "--target", SERVICE_TARGET,
+            "--stun", STUN_ENDPOINT,
+            "--interval", "2",
+            "--gateway", B4_GATEWAY,
+            # The static bind's port must sit inside the slot range or the
+            # lease table refuses it at startup; the init script's own
+            # SLOT_RANGE knob is the production form of the same answer.
+            "--slot-port-range", "40000-49999",
+            "--poke", "%s:%d" % (FRONT_PUB, FRONT_PORT),
+            "--front-endpoint", "%s:%d" % (FRONT_PUB, FRONT_PORT),
+            "--front-name", PROTECTED_NAME,
+            "--client-identity", "%s:%s" % (FRONT_TLS / "client.crt",
+                                            FRONT_TLS / "client.key"),
+            "--front-anchor", str(FRONT_TLS / "ca.crt"),
+            "--state-dir", str(ENV_ROOT / "b4-state"),
+            "--no-upnp"]
+    record_service("b4", exec_in("b4", argv, B4_LOG))
+
+
+def slot_roundtrip():
+    """The production shape: a client datagram to the front's public port,
+    which the relay forwards from its own socket to the tuple the poke
+    taught it, and the service's answer back to the same client. The relay's
+    socket is the destination the poke mapped, so the reply crosses the
+    poke's own per-destination mapping."""
+    payload = b"dslp-slot-roundtrip"
+    with netns("internet"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(8)
+        try:
+            sock.sendto(payload, (FRONT_PUB, FRONT_PORT))
+            data, peer = sock.recvfrom(2048)
+            return data == payload and peer[0] == FRONT_PUB and \
+                peer[1] == FRONT_PORT
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+
+def cmd_up_b4():
+    nginx_bin, module = provision_nginx()
+    enter_own_namespaces()
+    cmd_down()
+    cmd_up()
+    deploy_front(nginx_bin, module)
+    log = pathlib.Path("/tmp/carrier-policy-vm-dslite.log")
+    log.unlink(missing_ok=True)
+    # The TCP lane opens the spoke the daemon's TLS push rides, so the lane
+    # rule exists before its first packet can lose the nat race.
+    start_policy("vm-dslite", tcp_lane="%s:%d" % (FRONT_PUB, FRONT_PORT))
+    time.sleep(2)
+    start_service_echo()
+    start_stun()
+    # The daemon's lease records live at the fixed path /tmp/dslp, and a
+    # lease restored from another run's shape fails the current slot range
+    # at startup; the state directory carries a run's learned tuples the
+    # same way, and a stale one would publish a tuple this run never
+    # learned. The environment's daemon state is per-run.
+    shutil.rmtree("/tmp/dslp", ignore_errors=True)
+    shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
+    # The router's platform facts the daemon keys on: fw4 exists with an
+    # input chain for its accept sets, and the kernel forwards, because the
+    # preserved-source datapath is kernel-routed to the target.
+    run("b4", "nft", "add", "table", "inet", "fw4")
+    run("b4", "nft", "add", "chain", "inet", "fw4", "input",
+        "{ type filter hook input priority filter; policy accept; }")
+    run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    # Where the daemon's push SYN goes: two taps, one on each wire between
+    # the daemon and the front, so a blackholed connect names its wire.
+    tcpdump = shutil.which("tcpdump") or "/usr/bin/tcpdump"
+    record_service("tap-b4", exec_in("b4", [
+        "/usr/bin/timeout", "70", tcpdump, "-i", "eth1", "-n", "-l",
+        "-Z", "root", "tcp", "port", str(FRONT_PORT)],
+        ENV_ROOT / "tap-b4.log"))
+    record_service("tap-front", exec_in("front", [
+        "/usr/bin/timeout", "70", tcpdump, "-i", "pub0", "-n", "-l",
+        "-Z", "root", "tcp", "port", str(FRONT_PORT)],
+        ENV_ROOT / "tap-front.log"))
+    start_b4()
+    failures = []
+    # Row 1: the daemon's writes hold a carrier mapping — the poke flow's
+    # own allocation, which is the tuple the front learns and the slot is
+    # reached on.
+    deadline = time.time() + 15
+    alloc = ""
+    while time.time() < deadline:
+        text = log.read_text() if log.exists() else ""
+        match = re.search(r"ALLOC udp inside=10\.9\.2\.2:40000 "
+                          r"dest=10\.9\.0\.11:8443 "
+                          r"external=10\.9\.0\.1:(\d+)", text)
+        if match:
+            alloc = text
+            break
+        time.sleep(0.5)
+    ok_map = bool(alloc)
+    print("%s b4-and-service: the daemon's writes hold a carrier mapping" % (
+        "PASS" if ok_map else "FAIL"))
+    if not ok_map:
+        failures.append("the carrier mapping")
+        print("--- the policy log saw ---")
+        print("\n".join(alloc.splitlines()[-10:]) or "(empty)")
+    # Row 2: the service answers through the slot, in the production shape:
+    # a client datagram to the front's public port, and its answer back.
+    ok_slot = slot_roundtrip()
+    print("%s b4-and-service: a client datagram to the front crossed the slot and the service's answer returned" % (
+        "PASS" if ok_slot else "FAIL"))
+    if not ok_slot:
+        failures.append("the slot roundtrip")
+    # Row 3: the daemon's push reaches the front's report.
+    relay_log = FRONT_ROOT / "logs" / "relay.log"
+    deadline = time.time() + 90
+    pushed = False
+    while time.time() < deadline:
+        text = relay_log.read_text(errors="replace") if relay_log.exists() else ""
+        if "the push carried:" in text:
+            pushed = True
+            break
+        time.sleep(2)
+    ok_push = pushed
+    print("%s b4-and-service: the daemon's push reached the front's report" % (
+        "PASS" if ok_push else "FAIL"))
+    if not ok_push:
+        failures.append("the push")
+        print("--- the relay log saw ---")
+        print(relay_log.read_text(errors="replace")[-500:] if relay_log.exists() else "(absent)")
+        print("--- the daemon's log tail ---")
+        print(B4_LOG.read_text(errors="replace")[-500:] if B4_LOG.exists() else "(absent)")
+    map_path = FRONT_ROOT / "upstreams.map"
+    if map_path.exists():
+        print("the front routes on: %s" % map_path.read_text().strip().replace("\n", " | "))
+    if failures:
+        raise SystemExit("up-b4: failed rows in %s" % ", ".join(failures))
+    print("up-b4: the daemon, the front and the service stand in the environment")
 
 
 # The per-profile expectations: what each profile SHOULD deliver, per the
@@ -694,11 +883,12 @@ def cmd_verify():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["up", "down", "verify",
-                                        "verify-policy", "deploy-front"])
+                                        "verify-policy", "deploy-front",
+                                        "up-b4"])
     args = ap.parse_args()
     {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
-     "verify-policy": cmd_verify_policy,
-     "deploy-front": cmd_deploy_front}[args.command]()
+     "verify-policy": cmd_verify_policy, "deploy-front": cmd_deploy_front,
+     "up-b4": cmd_up_b4}[args.command]()
 
 
 if __name__ == "__main__":
