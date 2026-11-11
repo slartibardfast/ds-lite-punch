@@ -13,6 +13,7 @@ actor, and the probes run in the actors they probe.
     python3 deploy/env/envctl.py verify-policy  prove the carrier policy rows
     python3 deploy/env/envctl.py deploy-front   deploy the front by its own pipeline and probe it
     python3 deploy/env/envctl.py up-b4          the front, the daemon and the service, probing the exchange
+    python3 deploy/env/envctl.py drift-check    hash the deployed front against a fresh pipeline render
 
 setns into a child namespace requires capability over the current namespace's
 owner as well, which is why the controller moves itself into its own network
@@ -753,6 +754,91 @@ def cmd_up_b4():
     print("up-b4: the daemon, the front and the service stand in the environment")
 
 
+# The deployment drift check: the record the repository ships is what its own
+# pipeline renders now, so the check re-runs install.sh into a throwaway root
+# with the same flags and hashes the deployed files against the probe's. A
+# deployed tree from an older pipeline passes a snapshot comparison but not
+# this one, which is the stale-relay class the check exists to catch.
+
+DRIFT_FILES = ("poke-listener.py", "nginx.conf",
+               "units/front-door-nginx.service", "units/front-door-poke.service")
+
+
+def deployment_drift():
+    """The deployed files that differ from a fresh pipeline render, by path."""
+    probe = ENV_ROOT / "drift-probe"
+    shutil.rmtree(probe, ignore_errors=True)
+    run("front", "install", "-d", str(probe / "certs"))
+    for name, mode in (("ca.crt", "0644"), ("front.crt", "0644"),
+                       ("front.key", "0600")):
+        run("front", "install", "-m", mode, str(FRONT_TLS / name),
+            str(probe / "certs" / name))
+    run("front", "sh", str(HERE.parent / "front-door" / "install.sh"),
+        "--root", str(probe), "--units-dir", str(probe / "units"),
+        "--public-port", str(FRONT_PORT),
+        "--protected-name", PROTECTED_NAME,
+        "--protected-upstream", PROTECTED_UPSTREAM,
+        "--passthru-name", PASSTHRU_NAME, "--lease", "300",
+        "--nginx", str(NGINX_ROOT / "usr" / "sbin" / "nginx"),
+        "--module", str(NGINX_ROOT / "usr" / "lib" / "nginx" / "modules" /
+                        "ngx_stream_module.so"), "--user", "root")
+    drifted = []
+    # The rendered files carry their own root's path; the probe's bytes are
+    # read as if they had been rendered into the deployed root.
+    probe_tag = str(probe).encode()
+    root_tag = str(FRONT_ROOT).encode()
+    for rel in DRIFT_FILES:
+        deployed = FRONT_ROOT / rel
+        fresh = probe / rel
+        if not deployed.exists() or not fresh.exists() or \
+                deployed.read_bytes() != fresh.read_bytes().replace(
+                    probe_tag, root_tag):
+            drifted.append(rel)
+    return drifted
+
+
+def cmd_drift_check():
+    nginx_bin, module = provision_nginx()
+    enter_own_namespaces()
+    cmd_down()
+    cmd_up()
+    deploy_front(nginx_bin, module)
+    failures = []
+    drifted = deployment_drift()
+    ok_clean = not drifted
+    print("%s drift-check: a clean deployment matches the record" % (
+        "PASS" if ok_clean else "FAIL"))
+    if not ok_clean:
+        failures.append("the clean check")
+        print("--- the clean deployment differed in: %s" % ", ".join(drifted))
+    # A seeded drift: one edited deployed file must fail the check by name.
+    victim = FRONT_ROOT / "poke-listener.py"
+    keep = victim.read_bytes()
+    victim.write_bytes(keep + b"# seeded drift for the drift check\n")
+    drifted = deployment_drift()
+    ok_seeded = "poke-listener.py" in drifted
+    print("%s drift-check: a seeded drift fails the check and names its file" % (
+        "PASS" if ok_seeded else "FAIL"))
+    if not ok_seeded:
+        failures.append("the seeded drift")
+        print("--- the seeded drift was not named; the check saw: %s" % (
+            ", ".join(drifted) or "nothing"))
+    # The restoration: the repository's own installer content, replaced by
+    # the same copy the pipeline makes.
+    run("front", "install", "-m", "0755",
+        str(HERE.parent / "front-door" / "poke-listener.py"), str(victim))
+    drifted = deployment_drift()
+    ok_restored = not drifted
+    print("%s drift-check: the restored deployment matches the record" % (
+        "PASS" if ok_restored else "FAIL"))
+    if not ok_restored:
+        failures.append("the restoration")
+        print("--- the restoration differed in: %s" % ", ".join(drifted))
+    if failures:
+        raise SystemExit("drift-check: failed rows in %s" % ", ".join(failures))
+    print("drift-check: the deployed front is the record's own")
+
+
 # The per-profile expectations: what each profile SHOULD deliver, per the
 # research note. A profile row that fails is a policy defect, not a test
 # defect, until the profile is corrected in the record.
@@ -884,11 +970,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["up", "down", "verify",
                                         "verify-policy", "deploy-front",
-                                        "up-b4"])
+                                        "up-b4", "drift-check"])
     args = ap.parse_args()
     {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
      "verify-policy": cmd_verify_policy, "deploy-front": cmd_deploy_front,
-     "up-b4": cmd_up_b4}[args.command]()
+     "up-b4": cmd_up_b4, "drift-check": cmd_drift_check}[args.command]()
 
 
 if __name__ == "__main__":
