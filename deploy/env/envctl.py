@@ -311,6 +311,7 @@ def cmd_verify_policy():
               ("rfc-bcp", False, 9999, True, False),
               ("symmetric", True, 8443, False, False))
     for profile, want_distinct, front_port, stranger_cross, silence in matrix:
+        pathlib.Path("/tmp/carrier-policy-" + profile + ".log").unlink(missing_ok=True)
         policy = start_policy(profile)
         time.sleep(2)
         poke_from_b4(FRONT_PUB, 8443)

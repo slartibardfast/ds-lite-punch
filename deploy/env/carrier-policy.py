@@ -58,6 +58,10 @@ def nft_out(args):
     return proc.stdout
 
 def setup_plane():
+    # A killed predecessor leaves its table behind; the delete is tolerant of
+    # absence and the create starts every run from a clean plane.
+    subprocess.run(["nft", "delete", "table", "ip", "carrier"],
+                   capture_output=True)
     nft(["add", "table", "ip", "carrier"])
     nft(["add", "chain", "ip", "carrier", "prerouting",
          "{ type nat hook prerouting priority dstnat; }"])
