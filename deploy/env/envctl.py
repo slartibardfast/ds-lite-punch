@@ -28,6 +28,7 @@ import ctypes
 import os
 import pathlib
 import re
+import selectors
 import socket
 import subprocess
 import sys
@@ -265,6 +266,14 @@ def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
                 pass
         os._exit(0)
     os.close(ready_write)
+    # A bounded read: a listener that never binds fails the run with its name, instead of holding the caller.
+    sel = selectors.DefaultSelector()
+    sel.register(ready_read, selectors.EVENT_READ)
+    signalled = bool(sel.select(timeout=15))
+    sel.close()
+    if not signalled:
+        os.close(ready_read)
+        raise SystemExit("envctl: the crossing's listener never bound; the environment is not serving")
     os.read(ready_read, 1)
     os.close(ready_read)
     with netns(ns):
@@ -274,8 +283,7 @@ def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
         sock.sendto(payload, (dest_ip, dest_port))
         sock.close()
     time.sleep(1.5)
-    os.kill(listener, 15)
-    os.waitpid(listener, 0)
+    kill_and_reap(listener, 5)
     path = pathlib.Path("/tmp/b4-rx.txt")
     return path.read_text() if path.exists() else ""
 
