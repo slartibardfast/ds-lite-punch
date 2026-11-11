@@ -246,11 +246,16 @@ def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
     """Sends one datagram from inside an actor and returns what the b4's
     listener received."""
     pathlib.Path("/tmp/b4-rx.txt").unlink(missing_ok=True)
+    ready_read, ready_write = os.pipe()
     listener = os.fork()
     if listener == 0:
+        os.close(ready_read)
         with netns("b4"):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind((B4_WAN_IP, B4_PORT))
+            # The bind is signalled before the send, so the arrival can never
+            # outrun the socket it is meant for.
+            os.write(ready_write, b"1")
             sock.settimeout(4)
             try:
                 data, peer = sock.recvfrom(256)
@@ -259,7 +264,9 @@ def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
             except socket.timeout:
                 pass
         os._exit(0)
-    time.sleep(0.4)
+    os.close(ready_write)
+    os.read(ready_read, 1)
+    os.close(ready_read)
     with netns(ns):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if ip:
