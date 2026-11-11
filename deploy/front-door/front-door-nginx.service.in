@@ -5,10 +5,10 @@ After=network-online.target
 [Service]
 Type=forking
 PIDFile=<FRONT_ROOT>/logs/front.pid
-ExecStartPre=/usr/sbin/nginx -c <FRONT_ROOT>/nginx.conf -t
-ExecStart=/usr/sbin/nginx -c <FRONT_ROOT>/nginx.conf
-ExecReload=/usr/sbin/nginx -c <FRONT_ROOT>/nginx.conf -s reload
-ExecStop=/usr/sbin/nginx -c <FRONT_ROOT>/nginx.conf -s quit
+ExecStartPre=<NGINX_BIN> -c <FRONT_ROOT>/nginx.conf -t
+ExecStart=<NGINX_BIN> -c <FRONT_ROOT>/nginx.conf
+ExecReload=<NGINX_BIN> -c <FRONT_ROOT>/nginx.conf -s reload
+ExecStop=<NGINX_BIN> -c <FRONT_ROOT>/nginx.conf -s quit
 Restart=on-failure
 
 [Install]

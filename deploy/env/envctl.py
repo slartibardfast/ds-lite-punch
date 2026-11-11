@@ -11,6 +11,7 @@ actor, and the probes run in the actors they probe.
     python3 deploy/env/envctl.py down           tear it down
     python3 deploy/env/envctl.py verify         prove the datagram path
     python3 deploy/env/envctl.py verify-policy  prove the carrier policy rows
+    python3 deploy/env/envctl.py deploy-front   deploy the front by its own pipeline and probe it
 
 setns into a child namespace requires capability over the current namespace's
 owner as well, which is why the controller moves itself into its own network
@@ -29,6 +30,8 @@ import os
 import pathlib
 import re
 import selectors
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -57,6 +60,15 @@ INTERNET_PUB = "10.9.0.10"
 STATE = pathlib.Path("/tmp/env-holders.txt")
 HOLDERS = {}
 POLICIES = []
+FRONT_STATE = pathlib.Path("/tmp/env-front-services.txt")
+ENV_ROOT = pathlib.Path("/tmp/dslp-env")
+FRONT_ROOT = ENV_ROOT / "front"
+FRONT_TLS = ENV_ROOT / "tls"
+NGINX_ROOT = ENV_ROOT / "nginx-root"
+FRONT_PORT = 8443
+PROTECTED_NAME = "protected.env"
+PASSTHRU_NAME = "passthru.env"
+PROTECTED_UPSTREAM = "127.0.0.1:8080"
 
 
 def unshare(flags):
@@ -74,6 +86,10 @@ def setns(fd):
 def enter_own_namespaces():
     uid, gid = os.getuid(), os.getgid()
     unshare(CLONE_NEWUSER | CLONE_NEWNS)
+    # An unprivileged process may map only its own uid, and only over
+    # inside-uid 0, and only after denying setgroups for the gid map — the
+    # kernel grants nothing wider without the setuid newuidmap helper, and
+    # that helper's policy refuses every variant on this machine.
     for path, content in (("/proc/self/setgroups", "deny"),
                           ("/proc/self/gid_map", "0 %d 1" % gid),
                           ("/proc/self/uid_map", "0 %d 1" % uid)):
@@ -133,8 +149,35 @@ def hold(name):
     raise SystemExit("envctl: the %s namespace never settled" % name)
 
 
+def stop_front_services():
+    """SIGTERM the front's deployed processes from the services state file.
+    A signal needs only the same uid, so this works from a later invocation
+    that is outside the environment's user namespace."""
+    if not FRONT_STATE.exists():
+        return
+    for line in FRONT_STATE.read_text().splitlines():
+        _, _, pid = line.partition(" ")
+        try:
+            os.kill(int(pid), 15)
+        except (ProcessLookupError, ValueError):
+            pass
+    FRONT_STATE.unlink(missing_ok=True)
+
+
 def cmd_down():
-    for pid in POLICIES + [HOLDERS.get(name) for name in ACTORS]:
+    stop_front_services()
+    # A previous invocation's holders are not in HOLDERS; the state file is
+    # the only record of them, and an environment left standing holds the
+    # bridge addresses the next stand-up wants.
+    stale = []
+    if STATE.exists():
+        for line in STATE.read_text().splitlines():
+            _, _, pid = line.partition(" ")
+            try:
+                stale.append(int(pid))
+            except ValueError:
+                pass
+    for pid in POLICIES + stale + [HOLDERS.get(name) for name in ACTORS]:
         if pid:
             try:
                 os.kill(pid, 15)
@@ -316,6 +359,211 @@ def allocations(profile):
     return re.findall(r"external=10\.9\.0\.1:(\d+)", policy_log(profile))
 
 
+# The front's deployment: the repository's own pipeline (mint, install, units)
+# runs inside the front namespace, where no init exists to enable the units,
+# so the harness starts each unit's own ExecStart line. The distro nginx and
+# its stream module are provisioned unprivileged into the environment's cache,
+# because the pipeline's --nginx and --module already name their binaries.
+
+def provision_nginx():
+    nginx_bin = NGINX_ROOT / "usr" / "sbin" / "nginx"
+    module = NGINX_ROOT / "usr" / "lib" / "nginx" / "modules" / \
+        "ngx_stream_module.so"
+    if nginx_bin.exists() and module.exists():
+        return str(nginx_bin), str(module)
+    ENV_ROOT.mkdir(parents=True, exist_ok=True)
+    scratch = ENV_ROOT / "debs"
+    scratch.mkdir(exist_ok=True)
+    # The download needs the network, so this runs before the controller
+    # enters its own (linkless) namespace.
+    subprocess.run(["apt", "download", "nginx", "libnginx-mod-stream"],
+                   cwd=scratch, check=True, capture_output=True)
+    for deb in scratch.glob("*.deb"):
+        subprocess.run(["dpkg-deb", "-x", str(deb), str(NGINX_ROOT)],
+                       check=True, capture_output=True)
+        deb.unlink()
+    scratch.rmdir()
+    if not nginx_bin.exists() or not module.exists():
+        raise SystemExit("envctl: the nginx extraction produced no binary and stream module")
+    return str(nginx_bin), str(module)
+
+
+def start_front_units():
+    execs = {}
+    for unit in sorted((FRONT_ROOT / "units").glob("*.service")):
+        for line in unit.read_text().splitlines():
+            if line.startswith("ExecStart="):
+                execs[unit.name] = line.split("=", 1)[1]
+    wanted = ["front-door-nginx.service", "front-door-poke.service"]
+    if sorted(execs) != wanted:
+        raise SystemExit("envctl: the pipeline rendered %s, expected %s" % (
+            sorted(execs), wanted))
+    poke_pid = None
+    for name in ("front-door-poke.service", "front-door-nginx.service"):
+        argv = shlex.split(execs[name])
+        pid = os.fork()
+        if pid == 0:
+            with netns("front"):
+                os.execv(argv[0], argv)
+        if name == "front-door-poke.service":
+            poke_pid = pid
+    # The poke's pid is recorded before the wait, so a failure here still
+    # leaves the running unit in the services state file for down to stop.
+    FRONT_STATE.write_text("poke %d\n" % poke_pid)
+    pid_path = FRONT_ROOT / "logs" / "front.pid"
+    # nginx creates an empty pid file and fills it once the master daemonizes.
+    deadline = time.time() + 5
+    master = 0
+    while time.time() < deadline:
+        text = pid_path.read_text().strip() if pid_path.exists() else ""
+        if text.isdigit():
+            master = int(text)
+            break
+        time.sleep(0.1)
+    if not master:
+        raise SystemExit("envctl: nginx never wrote its pid")
+    FRONT_STATE.write_text("poke %d\nnginx %d\n" % (poke_pid, master))
+
+
+def table_answer():
+    """The protected name's answer over the public port, asked from the
+    internet actor with the daemon's identity the mint signed."""
+    request = b"GET /table HTTP/1.0\r\nHost: " + PROTECTED_NAME.encode() + \
+        b"\r\n\r\n"
+    with netns("internet"):
+        proc = subprocess.run(
+            ["openssl", "s_client", "-connect", "%s:%d" % (FRONT_PUB, FRONT_PORT),
+             "-servername", PROTECTED_NAME,
+             "-CAfile", str(FRONT_TLS / "ca.crt"),
+             "-cert", str(FRONT_TLS / "client.crt"),
+             "-key", str(FRONT_TLS / "client.key"),
+             # s_client's default shuts the session down the moment stdin
+             # ends, which races the answer and logs a 499; wait for the
+             # server's own close instead.
+             "-ign_eof"],
+            input=request, capture_output=True, timeout=15)
+    return proc.stdout.decode(errors="replace")
+
+
+def front_ns_pids():
+    """Every live process in the front actor's network namespace, with its
+    command line, so a failed probe names what was actually serving."""
+    mark = os.readlink("/proc/%d/ns/net" % HOLDERS["front"])
+    live = []
+    for entry in sorted(pathlib.Path("/proc").iterdir(), key=lambda p: p.name):
+        if not entry.name.isdigit():
+            continue
+        try:
+            if os.readlink(str(entry / "ns" / "net")) != mark:
+                continue
+            cmd = (entry / "cmdline").read_bytes().replace(
+                b"\0", b" ").decode(errors="replace").strip()
+            live.append("%s %s" % (entry.name, cmd[:90]))
+        except OSError:
+            continue
+    return live
+
+
+def probe_failure(name, answer):
+    print("--- the %s probe saw ---" % name)
+    print("\n".join(answer.splitlines()[-25:]))
+    log = FRONT_ROOT / "logs" / "front.log"
+    if log.exists():
+        print("--- the front's error log tail ---")
+        print("\n".join(log.read_text(errors="replace").splitlines()[-15:]))
+    print("--- live in the front namespace ---")
+    print("\n".join(front_ns_pids()) or "(nothing)")
+    with netns("front"):
+        report = subprocess.run(
+            [sys.executable, "-c",
+             "import urllib.request; print(urllib.request.urlopen("
+             "'http://127.0.0.1:8448/table', timeout=5).read().decode())"],
+            capture_output=True, text=True, timeout=10)
+        https = subprocess.run(
+            ["openssl", "s_client", "-connect", "127.0.0.1:8446",
+             "-servername", PROTECTED_NAME,
+             "-CAfile", str(FRONT_TLS / "ca.crt"),
+             "-cert", str(FRONT_TLS / "client.crt"),
+             "-key", str(FRONT_TLS / "client.key")],
+            input=b"GET /table HTTP/1.0\r\nHost: " + PROTECTED_NAME.encode() +
+            b"\r\n\r\n", capture_output=True, timeout=10)
+    print("--- the report server, asked directly: rc=%d %s" % (
+        report.returncode, (report.stdout or report.stderr).strip()[:200]))
+    print("--- the https block, asked directly: rc=%d 200_ok=%s" % (
+        https.returncode, "200 OK" in https.stdout.decode(errors="replace")))
+    acc = FRONT_ROOT / "logs" / "access.log"
+    if acc.exists() and acc.read_text().strip():
+        print("--- access log ---")
+        print(acc.read_text(errors="replace").strip()[-500:])
+    else:
+        print("--- access log: no request ever reached the https block ---")
+
+
+def cmd_deploy_front():
+    provision_nginx()
+    enter_own_namespaces()
+    cmd_down()
+    cmd_up()
+    # A fresh root and a fresh authority every run: the identity the
+    # previous run minted must not vouch for this one's probes, and
+    # mint.sh refuses to sign over an existing authority.
+    shutil.rmtree(FRONT_TLS, ignore_errors=True)
+    shutil.rmtree(FRONT_ROOT, ignore_errors=True)
+    failures = []
+    run("front", "sh", str(HERE.parent / "front-door" / "mint.sh"),
+        "--dir", str(FRONT_TLS),
+        "--protected-name", PROTECTED_NAME, "--passthru-name", PASSTHRU_NAME)
+    print("PASS front-deployment: mint.sh signed the authority and both identities inside the front namespace")
+    run("front", "install", "-d", str(FRONT_ROOT / "certs"))
+    run("front", "install", "-m", "0644", str(FRONT_TLS / "ca.crt"),
+        str(FRONT_ROOT / "certs" / "ca.crt"))
+    run("front", "install", "-m", "0644", str(FRONT_TLS / "front.crt"),
+        str(FRONT_ROOT / "certs" / "front.crt"))
+    run("front", "install", "-m", "0600", str(FRONT_TLS / "front.key"),
+        str(FRONT_ROOT / "certs" / "front.key"))
+    nginx_bin, module = str(NGINX_ROOT / "usr" / "sbin" / "nginx"), str(
+        NGINX_ROOT / "usr" / "lib" / "nginx" / "modules" /
+        "ngx_stream_module.so")
+    run("front", "sh", str(HERE.parent / "front-door" / "install.sh"),
+        "--root", str(FRONT_ROOT), "--units-dir", str(FRONT_ROOT / "units"),
+        "--public-port", str(FRONT_PORT),
+        "--protected-name", PROTECTED_NAME,
+        "--protected-upstream", PROTECTED_UPSTREAM,
+        "--passthru-name", PASSTHRU_NAME, "--lease", "300",
+        "--nginx", nginx_bin, "--module", module, "--user", "root")
+    print("PASS front-deployment: install.sh rendered the configuration and both units inside the front namespace")
+    start_front_units()
+    time.sleep(0.5)
+    answer = table_answer()
+    ok_tls = "200 OK" in answer and "udp none" in answer
+    print("%s front-deployment: the protected name answers the table over TLS with the daemon's identity" % (
+        "PASS" if ok_tls else "FAIL"))
+    if not ok_tls:
+        failures.append("protected-name TLS")
+        probe_failure("protected-name", answer)
+    with netns("internet"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(b"dslp-poke", (FRONT_PUB, FRONT_PORT))
+        sock.close()
+    time.sleep(1.5)
+    map_path = FRONT_ROOT / "upstreams.map"
+    map_text = map_path.read_text() if map_path.exists() else ""
+    ok_poke = map_text.startswith("8443 10.9.0.10:") and "# poke" in map_text
+    print("%s front-deployment: a poke taught the relay the tuple and the map names it" % (
+        "PASS" if ok_poke else "FAIL"))
+    if not ok_poke:
+        failures.append("the poke's tuple in the map")
+    answer = table_answer()
+    ok_reload = "200 OK" in answer and "udp 10.9.0.10:" in answer
+    print("%s front-deployment: nginx reloaded on the map change and still serves" % (
+        "PASS" if ok_reload else "FAIL"))
+    if not ok_reload:
+        failures.append("the reload")
+    if failures:
+        raise SystemExit("deploy-front: failed rows in %s" % ", ".join(failures))
+    print("deploy-front: the front serves by its own pipeline inside the front namespace")
+
+
 # The per-profile expectations: what each profile SHOULD deliver, per the
 # research note. A profile row that fails is a policy defect, not a test
 # defect, until the profile is corrected in the record.
@@ -446,10 +694,11 @@ def cmd_verify():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["up", "down", "verify",
-                                        "verify-policy"])
+                                        "verify-policy", "deploy-front"])
     args = ap.parse_args()
     {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
-     "verify-policy": cmd_verify_policy}[args.command]()
+     "verify-policy": cmd_verify_policy,
+     "deploy-front": cmd_deploy_front}[args.command]()
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ reject_backend=127.0.0.1:9
 module=/usr/lib/nginx/modules/ngx_stream_module.so
 protected_name=
 protected_upstream=
+user=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -23,6 +24,7 @@ while [ $# -gt 0 ]; do
         --module) module=$2; shift 2 ;;
         --protected-name) protected_name=$2; shift 2 ;;
         --protected-upstream) protected_upstream=$2; shift 2 ;;
+        --user) user=$2; shift 2 ;;
         *) echo "render: unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -32,9 +34,19 @@ if [ -z "$protected_name" ] || [ -z "$protected_upstream" ]; then
     exit 2
 fi
 
+# The workers' account: a front that runs where the package's default account
+# is not a valid id (a user namespace) must name one that is, because nginx
+# chowns its temp paths to it at startup and an unmapped id fails the start.
+if [ -n "$user" ]; then
+    user_line="user $user;"
+else
+    user_line=
+fi
+
 rendered=$(sed \
     -e "s|<FRONT_MODULE>|$module|g" \
     -e "s|<FRONT_ROOT>|$root|g" \
+    -e "s|<FRONT_USER>|$user_line|g" \
     -e "s|<CERT_DIR>|$root/certs|g" \
     -e "s|<PUBLIC_LISTEN>|$public_port|g" \
     -e "s|<LOCAL_TLS_LISTEN>|$local_tls_listen|g" \

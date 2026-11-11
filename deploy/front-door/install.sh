@@ -9,6 +9,8 @@ public_port=8443
 protected_name=
 protected_upstream=
 passthru_name=
+user=
+units_dir=
 lease=300
 module=/usr/lib/nginx/modules/ngx_stream_module.so
 nginx_bin=/usr/sbin/nginx
@@ -20,6 +22,8 @@ while [ $# -gt 0 ]; do
         --protected-name) protected_name=$2; shift 2 ;;
         --protected-upstream) protected_upstream=$2; shift 2 ;;
         --passthru-name) passthru_name=$2; shift 2 ;;
+        --user) user=$2; shift 2 ;;
+        --units-dir) units_dir=$2; shift 2 ;;
         --lease) lease=$2; shift 2 ;;
         --module) module=$2; shift 2 ;;
         --nginx) nginx_bin=$2; shift 2 ;;
@@ -27,7 +31,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ "$(id -u)" != "0" ]; then
+# The systemd path enables units and so needs root; a --units-dir install
+# writes only under its own root and units directory, where the caller's
+# account is enough.
+if [ -z "$units_dir" ] && [ "$(id -u)" != "0" ]; then
     echo "install: run it as root" >&2
     exit 1
 fi
@@ -49,16 +56,27 @@ chmod 0755 "$root/poke-listener.py"
 : >"$root/upstreams.map"
 
 sh "$HERE/render.sh" --root "$root" --public-port "$public_port" --module "$module" \
-    --protected-name "$protected_name" --protected-upstream "$protected_upstream" >"$root/nginx.conf"
+    --protected-name "$protected_name" --protected-upstream "$protected_upstream" \
+    --user "$user" >"$root/nginx.conf"
 
-sed -e "s|<FRONT_ROOT>|$root|g" "$HERE/front-door-nginx.service.in" >"/etc/systemd/system/front-door-nginx.service"
-sed -e "s|<FRONT_ROOT>|$root|g" -e "s|<PUBLIC_PORT>|$public_port|g" \
+units_target=${units_dir:-/etc/systemd/system}
+if [ -n "$units_dir" ]; then
+    mkdir -p "$units_dir"
+fi
+sed -e "s|<FRONT_ROOT>|$root|g" -e "s|<NGINX_BIN>|$nginx_bin|g" \
+    "$HERE/front-door-nginx.service.in" >"$units_target/front-door-nginx.service"
+sed -e "s|<FRONT_ROOT>|$root|g" -e "s|<NGINX_BIN>|$nginx_bin|g" \
+    -e "s|<PUBLIC_PORT>|$public_port|g" \
     -e "s|<PASSTHRU_NAME>|$passthru_name|g" -e "s|<LEASE>|$lease|g" \
-    "$HERE/front-door-poke.service.in" >"/etc/systemd/system/front-door-poke.service"
+    "$HERE/front-door-poke.service.in" >"$units_target/front-door-poke.service"
 
 "$nginx_bin" -c "$root/nginx.conf" -t
-systemctl daemon-reload
-systemctl enable --now front-door-poke front-door-nginx
+if [ -n "$units_dir" ]; then
+    echo "install: units rendered to $units_dir; no init enables them here, their ExecStart lines are the front's processes"
+else
+    systemctl daemon-reload
+    systemctl enable --now front-door-poke front-door-nginx
+fi
 
 cat <<EOF
 
