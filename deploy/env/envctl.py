@@ -311,7 +311,6 @@ def cmd_verify_policy():
               ("rfc-bcp", False, 9999, True, False),
               ("symmetric", True, 8443, False, False))
     for profile, want_distinct, front_port, stranger_cross, silence in matrix:
-        pathlib.Path("/tmp/b4-rx.txt").unlink(missing_ok=True)
         policy = start_policy(profile)
         time.sleep(2)
         poke_from_b4(FRONT_PUB, 8443)
@@ -326,7 +325,7 @@ def cmd_verify_policy():
         print("%s %s: the poked peer's arrival crossed" % (
             "PASS" if ok_cross else "FAIL", profile))
         stranger = cross_from("internet", INTERNET_PUB, 9999, CARRIER_PUB, ext)
-        ok_stranger = bool(stranger) == stranger_cross
+        ok_stranger = bool(stranger.strip()) == stranger_cross
         print("%s %s: the stranger's arrival %s" % (
             "PASS" if ok_stranger else "FAIL", profile,
             "crossed" if stranger else "was refused"))
@@ -353,8 +352,7 @@ def cmd_verify_policy():
             if not ok:
                 failures.append("%s %s" % (profile, label))
         kill_policy(policy)
-    finally_state = cmd_down
-    finally_state()
+    cmd_down()
     if failures:
         raise SystemExit("verify-policy: failed rows in %s" % (
             ", ".join(failures)))
