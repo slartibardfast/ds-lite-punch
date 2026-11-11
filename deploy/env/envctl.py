@@ -236,10 +236,8 @@ def kill_and_reap(pid, timeout_s=5):
         return
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        try:
-            os.waitpid(pid, os.WNOHANG)
-            return
-        except ChildProcessError:
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
             return
         time.sleep(0.05)
     try:
@@ -260,6 +258,7 @@ def kill_policy(pid):
 def poke_from_b4(dest_ip, dest_port):
     with netns("b4"):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((B4_WAN_IP, B4_PORT))
         sock.sendto(b"dslp-poke", (dest_ip, dest_port))
         sock.close()
@@ -275,6 +274,9 @@ def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
         os.close(ready_read)
         with netns("b4"):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Reuse: the previous crossing's listener socket may linger while
+            # the kernel clears it, and this bind must not fail on that.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((B4_WAN_IP, B4_PORT))
             # The bind is signalled before the send, so the arrival can never
             # outrun the socket it is meant for.
@@ -349,6 +351,8 @@ def cmd_verify_policy():
               ("symmetric", True, 8443, False, False))
     for profile, want_distinct, front_port, stranger_cross, silence in matrix:
         pathlib.Path("/tmp/carrier-policy-" + profile + ".log").unlink(missing_ok=True)
+        cmd_down()
+        cmd_up()
         policy = start_policy(profile)
         time.sleep(2)
         poke_from_b4(FRONT_PUB, 8443)
@@ -362,7 +366,20 @@ def cmd_verify_policy():
         ok_cross = bool(crossed)
         print("%s %s: the poked peer's arrival crossed" % (
             "PASS" if ok_cross else "FAIL", profile))
+        cap = os.fork()
+        if cap == 0:
+            with netns("b4"):
+                subprocess.run(["timeout", "10", "tcpdump", "-i", "eth1",
+                                "-n", "-l", "-Z", "root",
+                                "udp and port 40000"],
+                               stdout=open("/tmp/dbg-b4cap.txt", "w"),
+                               stderr=open("/tmp/dbg-b4err.txt", "w"))
+            os._exit(0)
+        time.sleep(0.5)
         stranger = cross_from("internet", INTERNET_PUB, 9999, CARRIER_PUB, ext)
+        time.sleep(2)
+        os.kill(cap, 15)
+        os.waitpid(cap, 0)
         ok_stranger = bool(stranger.strip()) == stranger_cross
         print("%s %s: the stranger's arrival %s" % (
             "PASS" if ok_stranger else "FAIL", profile,
