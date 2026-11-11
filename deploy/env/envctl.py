@@ -227,6 +227,28 @@ def policy_log(profile):
     return path.read_text() if path.exists() else ""
 
 
+def kill_and_reap(pid, timeout_s=5):
+    """SIGTERM, then a bounded reap; SIGKILL if the process refuses to die.
+    An unbounded waitpid on a holder of a terminal fd hangs the caller."""
+    try:
+        os.kill(pid, 15)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+            return
+        except ChildProcessError:
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    except (ProcessLookupError, ChildProcessError):
+        pass
+
+
 def kill_policy(pid):
     try:
         os.kill(pid, 15)
