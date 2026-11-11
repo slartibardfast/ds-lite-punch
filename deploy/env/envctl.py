@@ -306,49 +306,55 @@ def cmd_verify_policy():
     enter_own_namespaces()
     cmd_up()
     failures = []
-    try:
-        for profile in ("vm-dslite", "rfc-bcp", "symmetric"):
-            expect = EXPECTATIONS[profile]
-            policy = start_policy(profile)
-            time.sleep(2)
-            poke_from_b4(FRONT_PUB, 8443)
-            time.sleep(1)
-            ports = allocations(profile)
-            want = 2 if expect["per_destination"] else 1
-            ok_alloc = len(set(ports)) == want
-            print("%s %s: allocation %s" % (
-                "PASS" if ok_alloc else "FAIL", profile, ports))
-            ext = int(ports[0]) if ports else 0
-            crossed = cross_from("front", FRONT_PUB, expect["cross_port"],
-                                 CARRIER_PUB, ext)
-            ok_cross = bool(crossed)
-            print("%s %s: the poked peer's arrival crossed" % (
-                "PASS" if ok_cross else "FAIL", profile))
-            stranger = cross_from("internet", INTERNET_PUB, 9999,
-                                  CARRIER_PUB, ext)
-            ok_stranger = bool(stranger) == expect["stranger"]
-            print("%s %s: the stranger's arrival %s" % (
-                "PASS" if ok_stranger else "FAIL", profile,
-                "crossed" if stranger else "was refused"))
-            ok_silence = True
-            if expect["silence"]:
-                idle = int(re.search(r"udp_idle_s = (\d+)", (HERE / "profiles" /
-                            (profile + ".conf")).read_text()).group(1))
-                time.sleep(idle + 2)
-                again = cross_from("front", FRONT_PUB, expect["cross_port"],
-                                   CARRIER_PUB, ext)
-                ok_silence = not again
-                print("%s %s: silence expired the mapping" % (
-                    "PASS" if ok_silence else "FAIL", profile))
-            for label, ok in (("allocation", ok_alloc),
-                              ("crossing", ok_cross),
-                              ("stranger", ok_stranger),
-                              ("silence", ok_silence)):
-                if not ok:
-                    failures.append("%s %s" % (profile, label))
-            kill_policy(policy)
-    finally:
-        cmd_down()
+    # profile, distinct-tuples?, crossing front port, stranger crosses?, silence test?
+    matrix = (("vm-dslite", True, 9999, False, True),
+              ("rfc-bcp", False, 9999, True, False),
+              ("symmetric", True, 8443, False, False))
+    for profile, want_distinct, front_port, stranger_cross, silence in matrix:
+        pathlib.Path("/tmp/b4-rx.txt").unlink(missing_ok=True)
+        policy = start_policy(profile)
+        time.sleep(2)
+        poke_from_b4(FRONT_PUB, 8443)
+        time.sleep(1)
+        ports = allocations(profile)
+        ext = int(ports[0]) if ports else 0
+        ok_alloc = bool(ext)
+        print("%s %s: allocation %s" % ("PASS" if ok_alloc else "FAIL",
+              profile, ports))
+        crossed = cross_from("front", FRONT_PUB, front_port, CARRIER_PUB, ext)
+        ok_cross = bool(crossed)
+        print("%s %s: the poked peer's arrival crossed" % (
+            "PASS" if ok_cross else "FAIL", profile))
+        stranger = cross_from("internet", INTERNET_PUB, 9999, CARRIER_PUB, ext)
+        ok_stranger = bool(stranger) == stranger_cross
+        print("%s %s: the stranger's arrival %s" % (
+            "PASS" if ok_stranger else "FAIL", profile,
+            "crossed" if stranger else "was refused"))
+        poke_from_b4(INTERNET_PUB, 8443)
+        time.sleep(1)
+        distinct = len(set(allocations(profile)))
+        ok_dest = (distinct >= 2) == want_distinct
+        print("%s %s: %d tuple(s) for one source port (want %s)" % (
+            "PASS" if ok_dest else "FAIL", profile, distinct,
+            "per destination" if want_distinct else "one mapping"))
+        ok_silence = True
+        if silence:
+            idle = int(re.search(r"udp_idle_s = (\d+)", (HERE / "profiles" /
+                        (profile + ".conf")).read_text()).group(1))
+            time.sleep(idle + 2)
+            again = cross_from("front", FRONT_PUB, front_port, CARRIER_PUB, ext)
+            ok_silence = not again
+            print("%s %s: silence expired the mapping" % (
+                "PASS" if ok_silence else "FAIL", profile))
+        for label, ok in (("allocation", ok_alloc), ("crossing", ok_cross),
+                          ("stranger", ok_stranger),
+                          ("per-destination", ok_dest),
+                          ("silence", ok_silence)):
+            if not ok:
+                failures.append("%s %s" % (profile, label))
+        kill_policy(policy)
+    finally_state = cmd_down
+    finally_state()
     if failures:
         raise SystemExit("verify-policy: failed rows in %s" % (
             ", ".join(failures)))
