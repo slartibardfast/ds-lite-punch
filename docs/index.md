@@ -21,6 +21,12 @@ megabyte, and procd manages it as one service.
 | [Upgrade](operators/upgrade.md) | how a release is made, the upgrade, the rollback, and the removal |
 | [Troubleshoot](operators/troubleshoot.md) | the failure cases measured on a working line |
 
+## The manual
+
+| Page | What it covers |
+|---|---|
+| [The manual](manual.md) | both sides of the front door: the household runbook, then the client's recipes |
+
 ## Reference
 
 - The manual page:

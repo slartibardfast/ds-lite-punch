@@ -3,7 +3,7 @@
 set -u
 
 missing=0
-for doc in README.md docs/index.md docs/operators/*.md; do
+for doc in README.md docs/*.md docs/operators/*.md; do
     [ -f "$doc" ] || continue
     dir=$(dirname "$doc")
     for target in $(grep -o ']([^)]*)' "$doc" | sed 's/^](//; s/)$//'); do
