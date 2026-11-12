@@ -15,6 +15,7 @@ actor, and the probes run in the actors they probe.
     python3 deploy/env/envctl.py up-b4          the front, the daemon and the service, probing the exchange
     python3 deploy/env/envctl.py drift-check    hash the deployed front against a fresh pipeline render
     python3 deploy/env/envctl.py harness        the nginx feature's scenario rows across the three profiles
+    python3 deploy/env/envctl.py monitors       the external monitor and the router-side sampler, run once
 
 setns into a child namespace requires capability over the current namespace's
 owner as well, which is why the controller moves itself into its own network
@@ -101,10 +102,7 @@ def setns(fd):
 def enter_own_namespaces():
     uid, gid = os.getuid(), os.getgid()
     unshare(CLONE_NEWUSER | CLONE_NEWNS)
-    # An unprivileged process may map only its own uid, and only over
-    # inside-uid 0, and only after denying setgroups for the gid map — the
-    # kernel grants nothing wider without the setuid newuidmap helper, and
-    # that helper's policy refuses every variant on this machine.
+    # An unprivileged process may map only its own uid, and only over inside-uid 0, and only after denying setgroups for the gid map — the kernel grants nothing wider without the setuid newuidmap helper, and that helper's policy refuses every variant on this machine.
     for path, content in (("/proc/self/setgroups", "deny"),
                           ("/proc/self/gid_map", "0 %d 1" % gid),
                           ("/proc/self/uid_map", "0 %d 1" % uid)):
@@ -151,8 +149,7 @@ def hold(name):
         finally:
             os._exit(0)
     HOLDERS[name] = pid
-    # The child unshares and brings lo up on its own schedule; the parent's
-    # first setns races that and would land in the wrong namespace.
+    # The child unshares and brings lo up on its own schedule; the parent's first setns races that and would land in the wrong namespace.
     deadline = time.time() + 10
     while time.time() < deadline:
         with netns(name):
@@ -181,9 +178,7 @@ def stop_front_services():
 
 def cmd_down():
     stop_front_services()
-    # A previous invocation's holders are not in HOLDERS; the state file is
-    # the only record of them, and an environment left standing holds the
-    # bridge addresses the next stand-up wants.
+    # A previous invocation's holders are not in HOLDERS; the state file is the only record of them, and an environment left standing holds the bridge addresses the next stand-up wants.
     stale = []
     if STATE.exists():
         for line in STATE.read_text().splitlines():
@@ -279,9 +274,7 @@ def start_policy(profile, tcp_lanes=()):
         with netns("carrier"):
             os.execv(sys.executable, argv)
     POLICIES.append(pid)
-    # A run killed mid-verify leaves its policy plane running in a namespace
-    # no state file names; recording it here is what lets a later down stop
-    # it instead of leaking a select() loop forever.
+    # A run killed mid-verify leaves its policy plane running in a namespace no state file names; recording it here is what lets a later down stop it instead of leaking a select() loop forever.
     record_service("policy-" + profile, pid)
     return pid
 
@@ -338,12 +331,10 @@ def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
         os.close(ready_read)
         with netns("b4"):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # Reuse: the previous crossing's listener socket may linger while
-            # the kernel clears it, and this bind must not fail on that.
+            # Reuse: the previous crossing's listener socket may linger while the kernel clears it, and this bind must not fail on that.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((B4_WAN_IP, B4_PORT))
-            # The bind is signalled before the send, so the arrival can never
-            # outrun the socket it is meant for.
+            # The bind is signalled before the send, so the arrival can never outrun the socket it is meant for.
             os.write(ready_write, b"1")
             sock.settimeout(4)
             try:
@@ -380,11 +371,7 @@ def allocations(profile):
     return re.findall(r"external=10\.9\.0\.1:(\d+)", policy_log(profile))
 
 
-# The front's deployment: the repository's own pipeline (mint, install, units)
-# runs inside the front namespace, where no init exists to enable the units,
-# so the harness starts each unit's own ExecStart line. The distro nginx and
-# its stream module are provisioned unprivileged into the environment's cache,
-# because the pipeline's --nginx and --module already name their binaries.
+# The front's deployment: the repository's own pipeline (mint, install, units) runs inside the front namespace, where no init exists to enable the units, so the harness starts each unit's own ExecStart line. The distro nginx and its stream module are provisioned unprivileged into the environment's cache, because the pipeline's --nginx and --module already name their binaries.
 
 def provision_nginx():
     nginx_bin = NGINX_ROOT / "usr" / "sbin" / "nginx"
@@ -395,8 +382,7 @@ def provision_nginx():
     ENV_ROOT.mkdir(parents=True, exist_ok=True)
     scratch = ENV_ROOT / "debs"
     scratch.mkdir(exist_ok=True)
-    # The download needs the network, so this runs before the controller
-    # enters its own (linkless) namespace.
+    # The download needs the network, so this runs before the controller enters its own (linkless) namespace.
     subprocess.run(["apt", "download", "nginx", "libnginx-mod-stream"],
                    cwd=scratch, check=True, capture_output=True)
     for deb in scratch.glob("*.deb"):
@@ -435,14 +421,12 @@ def start_front_units():
     if sorted(execs) != wanted:
         raise SystemExit("envctl: the pipeline rendered %s, expected %s" % (
             sorted(execs), wanted))
-    # The relay's stdout is the front's own evidence (the pokes, the push,
-    # the tuple it learned), which is why the probes read it from a file.
+    # The relay's stdout is the front's own evidence (the pokes, the push, the tuple it learned), which is why the probes read it from a file.
     poke_pid = exec_in("front",
                        shlex.split(execs["front-door-poke.service"]),
                        FRONT_ROOT / "logs" / "relay.log")
     exec_in("front", shlex.split(execs["front-door-nginx.service"]))
-    # The poke's pid is recorded before the wait, so a failure here still
-    # leaves the running unit in the services state file for down to stop.
+    # The poke's pid is recorded before the wait, so a failure here still leaves the running unit in the services state file for down to stop.
     SERVICES_STATE.write_text("poke %d\n" % poke_pid)
     pid_path = FRONT_ROOT / "logs" / "front.pid"
     # nginx creates an empty pid file and fills it once the master daemonizes.
@@ -471,9 +455,7 @@ def table_answer():
              "-CAfile", str(FRONT_TLS / "ca.crt"),
              "-cert", str(FRONT_TLS / "client.crt"),
              "-key", str(FRONT_TLS / "client.key"),
-             # s_client's default shuts the session down the moment stdin
-             # ends, which races the answer and logs a 499; wait for the
-             # server's own close instead.
+             # s_client's default shuts the session down the moment stdin ends, which races the answer and logs a 499; wait for the server's own close instead.
              "-ign_eof"],
             input=request, capture_output=True, timeout=15)
     return proc.stdout.decode(errors="replace")
@@ -633,9 +615,7 @@ def start_b4(pcp=False):
             "--stun", STUN_ENDPOINT,
             "--interval", "2",
             "--gateway", B4_GATEWAY,
-            # The static bind's port must sit inside the slot range or the
-            # lease table refuses it at startup; the init script's own
-            # SLOT_RANGE knob is the production form of the same answer.
+            # The static bind's port must sit inside the slot range or the lease table refuses it at startup; the init script's own SLOT_RANGE knob is the production form of the same answer.
             "--slot-port-range", "40000-49999",
             "--poke", "%s:%d" % (FRONT_PUB, FRONT_PORT),
             "--front-endpoint", "%s:%d" % (FRONT_PUB, FRONT_PORT),
@@ -645,9 +625,7 @@ def start_b4(pcp=False):
             "--front-anchor", str(FRONT_TLS / "ca.crt"),
             "--state-dir", str(ENV_ROOT / "b4-state")]
     if pcp:
-        # The shared port: PCP on the LAN address, with the facade its
-        # grant machinery needs. A granted TCP mapping is how the service
-        # puts its own TLS port behind the passthrough name.
+        # The shared port: PCP on the LAN address, with the facade its grant machinery needs. A granted TCP mapping is how the service puts its own TLS port behind the passthrough name.
         argv += ["--pcp", "--lan-ip", "192.168.77.1"]
     else:
         argv += ["--no-upnp"]
@@ -683,30 +661,21 @@ def cmd_up_b4():
     deploy_front(nginx_bin, module)
     log = pathlib.Path("/tmp/carrier-policy-vm-dslite.log")
     log.unlink(missing_ok=True)
-    # The TCP lanes open the spokes the daemon's TLS push and its TCP STUN
-    # link ride, so their rules exist before any packet can lose the nat
-    # race.
+    # The TCP lanes open the spokes the daemon's TLS push and its TCP STUN link ride, so their rules exist before any packet can lose the nat race.
     start_policy("vm-dslite", tcp_lanes=("%s:%d" % (FRONT_PUB, FRONT_PORT),
                                          "%s:%d" % (INTERNET_PUB, 3478)))
     time.sleep(2)
     start_service_echo(tls=True)
     start_stun()
-    # The daemon's lease records live at the fixed path /tmp/dslp, and a
-    # lease restored from another run's shape fails the current slot range
-    # at startup; the state directory carries a run's learned tuples the
-    # same way, and a stale one would publish a tuple this run never
-    # learned. The environment's daemon state is per-run.
+    # The daemon's lease records live at the fixed path /tmp/dslp, and a lease restored from another run's shape fails the current slot range at startup; the state directory carries a run's learned tuples the same way, and a stale one would publish a tuple this run never learned. The environment's daemon state is per-run.
     shutil.rmtree("/tmp/dslp", ignore_errors=True)
     shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
-    # The router's platform facts the daemon keys on: fw4 exists with an
-    # input chain for its accept sets, and the kernel forwards, because the
-    # preserved-source datapath is kernel-routed to the target.
+    # The router's platform facts the daemon keys on: fw4 exists with an input chain for its accept sets, and the kernel forwards, because the preserved-source datapath is kernel-routed to the target.
     run("b4", "nft", "add", "table", "inet", "fw4")
     run("b4", "nft", "add", "chain", "inet", "fw4", "input",
         "{ type filter hook input priority filter; policy accept; }")
     run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
-    # Where the daemon's push SYN goes: two taps, one on each wire between
-    # the daemon and the front, so a blackholed connect names its wire.
+    # Where the daemon's push SYN goes: two taps, one on each wire between the daemon and the front, so a blackholed connect names its wire.
     tcpdump = shutil.which("tcpdump") or "/usr/bin/tcpdump"
     record_service("tap-b4", exec_in("b4", [
         "/usr/bin/timeout", "70", tcpdump, "-i", "eth1", "-n", "-l",
@@ -718,9 +687,7 @@ def cmd_up_b4():
         ENV_ROOT / "tap-front.log"))
     start_b4()
     failures = []
-    # Row 1: the daemon's writes hold a carrier mapping — the poke flow's
-    # own allocation, which is the tuple the front learns and the slot is
-    # reached on.
+    # Row 1: the daemon's writes hold a carrier mapping — the poke flow's own allocation, which is the tuple the front learns and the slot is reached on.
     deadline = time.time() + 15
     alloc = ""
     while time.time() < deadline:
@@ -739,8 +706,7 @@ def cmd_up_b4():
         failures.append("the carrier mapping")
         print("--- the policy log saw ---")
         print("\n".join(alloc.splitlines()[-10:]) or "(empty)")
-    # Row 2: the service answers through the slot, in the production shape:
-    # a client datagram to the front's public port, and its answer back.
+    # Row 2: the service answers through the slot, in the production shape: a client datagram to the front's public port, and its answer back.
     ok_slot = slot_roundtrip()
     print("%s b4-and-service: a client datagram to the front crossed the slot and the service's answer returned" % (
         "PASS" if ok_slot else "FAIL"))
@@ -773,11 +739,7 @@ def cmd_up_b4():
     print("up-b4: the daemon, the front and the service stand in the environment")
 
 
-# The deployment drift check: the record the repository ships is what its own
-# pipeline renders now, so the check re-runs install.sh into a throwaway root
-# with the same flags and hashes the deployed files against the probe's. A
-# deployed tree from an older pipeline passes a snapshot comparison but not
-# this one, which is the stale-relay class the check exists to catch.
+# The deployment drift check: the record the repository ships is what its own pipeline renders now, so the check re-runs install.sh into a throwaway root with the same flags and hashes the deployed files against the probe's. A deployed tree from an older pipeline passes a snapshot comparison but not this one, which is the stale-relay class the check exists to catch.
 
 DRIFT_FILES = ("poke-listener.py", "nginx.conf",
                "units/front-door-nginx.service", "units/front-door-poke.service")
@@ -802,8 +764,7 @@ def deployment_drift():
         "--module", str(NGINX_ROOT / "usr" / "lib" / "nginx" / "modules" /
                         "ngx_stream_module.so"), "--user", "root")
     drifted = []
-    # The rendered files carry their own root's path; the probe's bytes are
-    # read as if they had been rendered into the deployed root.
+    # The rendered files carry their own root's path; the probe's bytes are read as if they had been rendered into the deployed root.
     probe_tag = str(probe).encode()
     root_tag = str(FRONT_ROOT).encode()
     for rel in DRIFT_FILES:
@@ -842,8 +803,7 @@ def cmd_drift_check():
         failures.append("the seeded drift")
         print("--- the seeded drift was not named; the check saw: %s" % (
             ", ".join(drifted) or "nothing"))
-    # The restoration: the repository's own installer content, replaced by
-    # the same copy the pipeline makes.
+    # The restoration: the repository's own installer content, replaced by the same copy the pipeline makes.
     run("front", "install", "-m", "0755",
         str(HERE.parent / "front-door" / "poke-listener.py"), str(victim))
     drifted = deployment_drift()
@@ -858,20 +818,12 @@ def cmd_drift_check():
     print("drift-check: the deployed front is the record's own")
 
 
-# The harness: the nginx feature's scenario rows, per carrier profile, in one
-# command. Every row drives the real stack — the daemon dials with production
-# flags, the front is deployed by its pipeline, the service answers with its
-# own certificate — and the rows that depend on the carrier's behaviour assert
-# per profile: the stranger crosses under endpoint-independent filtering and
-# is refused under address-dependent and port-and-address dependent.
+# The harness: the nginx feature's scenario rows, per carrier profile, in one command. Every row drives the real stack — the daemon dials with production flags, the front is deployed by its pipeline, the service answers with its own certificate — and the rows that depend on the carrier's behaviour assert per profile: the stranger crosses under endpoint-independent filtering and is refused under address-dependent and port-and-address dependent.
 
 HARNESS_PROFILES = ("vm-dslite", "rfc-bcp", "symmetric")
 HARNESS_STRANGER_CROSSES = {"vm-dslite": False, "rfc-bcp": True,
                             "symmetric": False}
-# The passthrough's egress is nginx's own socket, and a carrier that filters
-# on the peer's port admits only the poke's own; under address-and-port
-# dependent filtering the faithful carrier refuses it, and the row asserts
-# that refusal rather than pretending the front could work.
+# The passthrough's egress is nginx's own socket, and a carrier that filters on the peer's port admits only the poke's own; under address-and-port dependent filtering the faithful carrier refuses it, and the row asserts that refusal rather than pretending the front could work.
 HARNESS_PASSTHROUGH_SERVES = {"vm-dslite": True, "rfc-bcp": True,
                               "symmetric": False}
 HARNESS_LEASE = 8
@@ -1017,8 +969,7 @@ def pcp_grant_tcp(int_port, sug_ext_port, lifetime=3600):
         granted = int(code) == 0
     except ValueError:
         granted = False
-    # The granted port is the carrier's to assign: the suggestion is a
-    # request, and the answer names whatever the line actually gave.
+    # The granted port is the carrier's to assign: the suggestion is a request, and the answer names whatever the line actually gave.
     return granted, detail
 
 
@@ -1030,9 +981,7 @@ def harness_profile(profile, nginx_bin, module):
     run("internet", "ip", "addr", "add", STRANGER_ADDR + "/24", "dev", "pub0")
     deploy_front(nginx_bin, module, lease=str(HARNESS_LEASE))
     mint_service_cert()
-    # The profile's own log is unlinked before the policy plane starts, so
-    # the poll reads the file this run's plane writes and never an orphaned
-    # name.
+    # The profile's own log is unlinked before the policy plane starts, so the poll reads the file this run's plane writes and never an orphaned name.
     log = pathlib.Path("/tmp/carrier-policy-" + profile + ".log")
     log.unlink(missing_ok=True)
     start_policy(profile, tcp_lanes=("%s:%d" % (FRONT_PUB, FRONT_PORT),
@@ -1040,20 +989,15 @@ def harness_profile(profile, nginx_bin, module):
     time.sleep(2)
     start_service_echo(tls=True)
     start_stun()
-    # The daemon's lease and state records are per-run: /tmp/dslp is the
-    # fixed lease path a foreign shape would fail at startup, and the state
-    # directory's stale tuples would publish a tuple this run never learned.
+    # The daemon's lease and state records are per-run: /tmp/dslp is the fixed lease path a foreign shape would fail at startup, and the state directory's stale tuples would publish a tuple this run never learned.
     shutil.rmtree("/tmp/dslp", ignore_errors=True)
     shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
-    # The router's platform facts the daemon keys on: fw4 exists with an
-    # input chain for its accept sets, and the kernel forwards, because the
-    # preserved-source datapath is kernel-routed to the target.
+    # The router's platform facts the daemon keys on: fw4 exists with an input chain for its accept sets, and the kernel forwards, because the preserved-source datapath is kernel-routed to the target.
     run("b4", "nft", "add", "table", "inet", "fw4")
     run("b4", "nft", "add", "chain", "inet", "fw4", "input",
         "{ type filter hook input priority filter; policy accept; }")
     run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
-    # Where the daemon's folded TCP dials go: taps on each wire between the
-    # daemon and the front, so a blackholed connect names its wire.
+    # Where the daemon's folded TCP dials go: taps on each wire between the daemon and the front, so a blackholed connect names its wire.
     tcpdump = shutil.which("tcpdump") or "/usr/bin/tcpdump"
     record_service("tap-b4", exec_in("b4", [
         "/usr/bin/timeout", "120", tcpdump, "-i", "eth1", "-n", "-l",
@@ -1063,9 +1007,7 @@ def harness_profile(profile, nginx_bin, module):
         "-Z", "root", "tcp"], ENV_ROOT / "tap-front.log"))
     start_b4(pcp=True)
 
-    # Row: the service grants its own TCP mapping over PCP, the production
-    # shared-port path. The granted slot is what puts the service's TLS
-    # port behind the passthrough name.
+    # Row: the service grants its own TCP mapping over PCP, the production shared-port path. The granted slot is what puts the service's TLS port behind the passthrough name.
     time.sleep(2)
     ok_pcp, grant_detail = pcp_grant_tcp(40001, 40000)
     print("%s harness[%s]: the service granted a TCP mapping over PCP" % (
@@ -1075,10 +1017,7 @@ def harness_profile(profile, nginx_bin, module):
         print("--- the PCP answer: %s | the daemon's log tail ---" % grant_detail)
         print(B4_LOG.read_text(errors="replace")[-400:] if B4_LOG.exists() else "(absent)")
 
-    # Row: the mapping holds. The relay's own map is the authoritative poke
-    # view on every profile: endpoint-independent carriers reuse the STUN
-    # flow's allocation for the poke, per-destination carriers allocate a
-    # new one, and the map names whichever tuple the line gave the poke.
+    # Row: the mapping holds. The relay's own map is the authoritative poke view on every profile: endpoint-independent carriers reuse the STUN flow's allocation for the poke, per-destination carriers allocate a new one, and the map names whichever tuple the line gave the poke.
     map_path = FRONT_ROOT / "upstreams.map"
     relay_log = FRONT_ROOT / "logs" / "relay.log"
     deadline = time.time() + 15
@@ -1104,9 +1043,7 @@ def harness_profile(profile, nginx_bin, module):
     if not ok_slot:
         failures.append("the datagram leg")
 
-    # Row: the relay follows the poke. A poke from another source is named
-    # in the relay's own log, and the daemon's next keepalive writes the
-    # map back to its tuple.
+    # Row: the relay follows the poke. A poke from another source is named in the relay's own log, and the daemon's next keepalive writes the map back to its tuple.
     map_path = FRONT_ROOT / "upstreams.map"
     relay_log = FRONT_ROOT / "logs" / "relay.log"
     manual_poke(55555)
@@ -1134,9 +1071,7 @@ def harness_profile(profile, nginx_bin, module):
     if not ok_stranger:
         failures.append("the stranger")
 
-    # Rows: the push and the names. The passthrough name waits for the
-    # push to carry the daemon's TCP tuple, on the 60 second report
-    # interval, so this block polls up to 90 seconds once.
+    # Rows: the push and the names. The passthrough name waits for the push to carry the daemon's TCP tuple, on the 60 second report interval, so this block polls up to 90 seconds once.
     relay_log = FRONT_ROOT / "logs" / "relay.log"
     deadline = time.time() + 90
     tcp_named = False
@@ -1191,8 +1126,7 @@ def harness_profile(profile, nginx_bin, module):
     if not ok_dark:
         failures.append("the unpublished name")
 
-    # Row: the lease expires. The daemon is paused past the lease, the
-    # relay withdraws its entry, and the daemon's keepalive refills it.
+    # Row: the lease expires. The daemon is paused past the lease, the relay withdraws its entry, and the daemon's keepalive refills it.
     b4_pid = relay_state_pid("b4")
     ok_lease = b4_pid is not None
     withdrawn_map = "(no daemon pid)"
@@ -1202,8 +1136,7 @@ def harness_profile(profile, nginx_bin, module):
         map_text = map_path.read_text() if map_path.exists() else ""
         relay_text = relay_log.read_text(errors="replace") if relay_log.exists() else ""
         withdrawn_map = map_text
-        # The lease withdraws the poke's own entry; a pushed view persists on
-        # its own expiry, so the withdrawal shows as the poke line leaving.
+        # The lease withdraws the poke's own entry; a pushed view persists on its own expiry, so the withdrawal shows as the poke line leaving.
         withdrawn = "lease expired" in relay_text and "# poke" not in withdrawn_map
         os.kill(b4_pid, 18)  # SIGCONT
         time.sleep(5)
@@ -1218,6 +1151,76 @@ def harness_profile(profile, nginx_bin, module):
         print("--- after the refill the map reads: %r" % (
             map_text.strip() if map_path.exists() else "(absent)"))
     return failures
+
+
+def cmd_monitors():
+    """The exchange standing, with the repository's two monitors run against
+    it once each: the external monitor asks the published path from the
+    internet actor, and the router-side sampler reads the daemon's log and
+    the line's counters from the b4 actor."""
+    nginx_bin, module = provision_nginx()
+    enter_own_namespaces()
+    cmd_down()
+    cmd_up()
+    deploy_front(nginx_bin, module)
+    mint_service_cert()
+    start_policy("vm-dslite", tcp_lanes=("%s:%d" % (FRONT_PUB, FRONT_PORT),
+                                         "%s:%d" % (INTERNET_PUB, 3478)))
+    time.sleep(2)
+    start_service_echo(tls=True)
+    start_stun()
+    shutil.rmtree("/tmp/dslp", ignore_errors=True)
+    shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
+    run("b4", "nft", "add", "table", "inet", "fw4")
+    run("b4", "nft", "add", "chain", "inet", "fw4", "input",
+        "{ type filter hook input priority filter; policy accept; }")
+    run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    start_b4(pcp=True)
+    time.sleep(2)
+    pcp_grant_tcp(40001, 40000)
+    # The external monitor's passthrough check needs the route the push names, and the push rides its 60 second interval.
+    map_path = FRONT_ROOT / "upstreams.map"
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        map_text = map_path.read_text() if map_path.exists() else ""
+        if "passthru.env " in map_text:
+            break
+        time.sleep(3)
+    failures = []
+    service_sha = hashlib.sha256(
+        (ENV_ROOT / "service-tls" / "service.der").read_bytes()).hexdigest()
+    with netns("internet"):
+        ext = subprocess.run(
+            [sys.executable, str(HERE.parent / "monitor" /
+                                 "external-monitor.py"), "--once",
+             "--endpoint", "%s:%d" % (FRONT_PUB, FRONT_PORT),
+             "--protected", PROTECTED_NAME, "--passthru", PASSTHRU_NAME,
+             "--ca", str(FRONT_TLS / "ca.crt"),
+             "--client-cert", str(FRONT_TLS / "client.crt"),
+             "--client-key", str(FRONT_TLS / "client.key"),
+             "--service-cert-sha256", service_sha],
+            capture_output=True, text=True, timeout=120)
+    ok_ext = ext.returncode == 0
+    print("%s monitors: the external monitor answered over the published path" % (
+        "PASS" if ok_ext else "FAIL"))
+    print("\n".join(ext.stdout.strip().splitlines()[-4:]) or ext.stderr.strip()[-200:])
+    if not ok_ext:
+        failures.append("the external monitor")
+    with netns("b4"):
+        sampler = subprocess.run(
+            [sys.executable, str(HERE.parent / "monitor" /
+                                 "router-sampler.py"), "--once",
+             "--log", str(B4_LOG), "--iface", "eth1"],
+            capture_output=True, text=True, timeout=60)
+    ok_sampler = sampler.returncode == 0 and '"iface"' in sampler.stdout
+    print("%s monitors: the router-side sampler named its events" % (
+        "PASS" if ok_sampler else "FAIL"))
+    print("\n".join(sampler.stdout.strip().splitlines()[-2:]) or sampler.stderr.strip()[-200:])
+    if not ok_sampler:
+        failures.append("the router-side sampler")
+    if failures:
+        raise SystemExit("monitors: failed rows in %s" % ", ".join(failures))
+    print("monitors: the correlation pair stands and answers")
 
 
 def cmd_harness(only=None):
@@ -1237,19 +1240,13 @@ def cmd_harness(only=None):
             "%s: %s" % (p, ", ".join(r)) for p, r in failed.items()))
     else:
         print("harness: every scenario row green across the three profiles")
-    # The run deliberately orphans its holders and services (the standing
-    # environment serves the tasks that follow), and the interpreter's
-    # shutdown has been seen to sleep past its own final print with that
-    # many live forks; the verdict is already on the log, so the controller
-    # exits by syscall rather than risk a CI lane hanging after it.
+    # The run deliberately orphans its holders and services (the standing environment serves the tasks that follow), and the interpreter's shutdown has been seen to sleep past its own final print with that many live forks; the verdict is already on the log, so the controller exits by syscall rather than risk a CI lane hanging after it.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)
 
 
-# The per-profile expectations: what each profile SHOULD deliver, per the
-# research note. A profile row that fails is a policy defect, not a test
-# defect, until the profile is corrected in the record.
+# The per-profile expectations: what each profile SHOULD deliver, per the research note. A profile row that fails is a policy defect, not a test defect, until the profile is corrected in the record.
 EXPECTATIONS = {
     "vm-dslite": {
         "cross_port": 9999,    # any port of the poked peer's address crosses
@@ -1378,14 +1375,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["up", "down", "verify",
                                         "verify-policy", "deploy-front",
-                                        "up-b4", "drift-check", "harness"])
+                                        "up-b4", "drift-check", "harness",
+                                        "monitors"])
     ap.add_argument("profile", nargs="?", default=None,
                     help="with harness: one profile instead of all three")
     args = ap.parse_args()
     commands = {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
                 "verify-policy": cmd_verify_policy,
                 "deploy-front": cmd_deploy_front, "up-b4": cmd_up_b4,
-                "drift-check": cmd_drift_check, "harness": cmd_harness}
+                "drift-check": cmd_drift_check, "harness": cmd_harness,
+                "monitors": cmd_monitors}
     if args.command == "harness":
         commands[args.command](args.profile)
     else:

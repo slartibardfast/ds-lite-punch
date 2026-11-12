@@ -676,10 +676,7 @@ pub fn parse_carrier_probe(text: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// The element a pin installs: this flow's traffic leaves as the NAT address with the slot's port.
-/// The fold presents the flow as the relay's own bind address and the slot's
-/// port: production binds the hub-LAN address, so there it egresses as the
-/// hub; anywhere else it egresses as whatever the deployment actually bound.
+// / The element a pin installs: this flow's traffic leaves as the NAT address with the slot's port. / The fold presents the flow as the relay's own bind address and the slot's / port: production binds the hub-LAN address, so there it egresses as the / hub; anywhere else it egresses as whatever the deployment actually bound.
 pub fn pin_element(client: Ipv4Addr, client_port: u16, nat_addr: Ipv4Addr, r: u16) -> String {
     format!("{} . {} : {} . {}", client, client_port, nat_addr, r)
 }

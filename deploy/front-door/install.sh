@@ -1,5 +1,4 @@
-#!/bin/sh
-# Install the front on this host, as root: its root, its relay, its rendered configuration and both units. Safe to run again. It mints nothing, which is mint.sh's job on the line, and it opens no edge.
+# !/bin/sh Install the front on this host, as root: its root, its relay, its rendered configuration and both units. Safe to run again. It mints nothing, which is mint.sh's job on the line, and it opens no edge.
 set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -31,9 +30,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# The systemd path enables units and so needs root; a --units-dir install
-# writes only under its own root and units directory, where the caller's
-# account is enough.
+# The systemd path enables units and so needs root; a --units-dir install writes only under its own root and units directory, where the caller's account is enough.
 if [ -z "$units_dir" ] && [ "$(id -u)" != "0" ]; then
     echo "install: run it as root" >&2
     exit 1

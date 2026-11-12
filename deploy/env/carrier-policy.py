@@ -60,8 +60,7 @@ def nft_out(args):
     return proc.stdout
 
 def setup_plane():
-    # A killed predecessor leaves its table behind; the delete is tolerant of
-    # absence and the create starts every run from a clean plane.
+    # A killed predecessor leaves its table behind; the delete is tolerant of absence and the create starts every run from a clean plane.
     subprocess.run(["nft", "delete", "table", "ip", "carrier"],
                    capture_output=True)
     nft(["add", "table", "ip", "carrier"])
@@ -71,19 +70,11 @@ def setup_plane():
          "{ type nat hook postrouting priority srcnat; }"])
     nft(["add", "chain", "ip", "carrier", "leak",
          "{ type filter hook postrouting priority srcnat + 10; }"])
-    # A real carrier forwards only what its translation touched; a packet
-    # leaving the inside wire with a source that is not the carrier's own
-    # public address escaped the mapping, and that is the leak. The chain
-    # sits after the srcnat chain (priority 100), so a mapped flow arrives
-    # already carrying the public source and passes; one before the nat
-    # chain would drop every packet before its translation ran.
+    # A real carrier forwards only what its translation touched; a packet leaving the inside wire with a source that is not the carrier's own public address escaped the mapping, and that is the leak. The chain sits after the srcnat chain (priority 100), so a mapped flow arrives already carrying the public source and passes; one before the nat chain would drop every packet before its translation ran.
     nft(["add", "rule", "ip", "carrier", "leak",
          "oifname", '"%s"' % PUB, "iifname", '"%s"' % INSIDE,
          "ip", "saddr", "!=", PUB_IP, "counter", "drop"])
-    # The policy plane's own resends must leave no conntrack trace: a state
-    # entry for a resent datagram would make the peer's return datagrams
-    # look like replies of that same connection, and the dnat rules would
-    # never be consulted for them.
+    # The policy plane's own resends must leave no conntrack trace: a state entry for a resent datagram would make the peer's return datagrams look like replies of that same connection, and the dnat rules would never be consulted for them.
     subprocess.run(["nft", "delete", "table", "ip", "carrier-raw"],
                    capture_output=True)
     nft(["add", "table", "ip", "carrier-raw"])
@@ -308,10 +299,7 @@ def main():
                    capture_output=True)
     setup_plane()
     for lane in ARGS.tcp_lane:
-        # The spoke's TCP lanes, opened before any flow exists: a rule that
-        # was never absent cannot lose its first packet to the nat race, and
-        # the daemon's TLS push and its TCP STUN link ride them with a
-        # port-preserving translation.
+        # The spoke's TCP lanes, opened before any flow exists: a rule that was never absent cannot lose its first packet to the nat race, and the daemon's TLS push and its TCP STUN link ride them with a port-preserving translation.
         host, _, port = lane.rpartition(":")
         nft(["add", "rule", "ip", "carrier", "postrouting",
              "iifname", '"%s"' % INSIDE, "ip", "daddr", host,

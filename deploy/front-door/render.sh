@@ -1,5 +1,4 @@
-#!/bin/sh
-# Render the front's nginx configuration from its template, filling the tokens this front's shape sets.
+# !/bin/sh Render the front's nginx configuration from its template, filling the tokens this front's shape sets.
 set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -34,9 +33,7 @@ if [ -z "$protected_name" ] || [ -z "$protected_upstream" ]; then
     exit 2
 fi
 
-# The workers' account: a front that runs where the package's default account
-# is not a valid id (a user namespace) must name one that is, because nginx
-# chowns its temp paths to it at startup and an unmapped id fails the start.
+# The workers' account: a front that runs where the package's default account is not a valid id (a user namespace) must name one that is, because nginx chowns its temp paths to it at startup and an unmapped id fails the start.
 if [ -n "$user" ]; then
     user_line="user $user;"
 else
