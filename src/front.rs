@@ -174,7 +174,7 @@ mod tests {
         assert!(reported("HTTP/1.0 204 No Content\r\n\r\n").is_empty());
         assert!(reported("").is_empty());
         // a name-keyed line is the front's routing table rather than a report of what it routes on
-        assert!(reported("HTTP/1.0 200 OK\r\n\r\nfront.example 1.2.3.4:5;\n").is_empty());
+        assert!(reported("HTTP/1.0 200 OK\r\n\r\nfront.example.com 1.2.3.4:5;\n").is_empty());
         let repeated = reported("udp 1:1 poke\nudp 2:2 push\n");
         assert_eq!(repeated.len(), 1, "{repeated:?}");
         assert_eq!(repeated[0].1, "1:1");

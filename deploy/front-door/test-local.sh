@@ -12,8 +12,8 @@ FRONT_MODULE=${FRONT_MODULE:-/usr/lib/nginx/modules/ngx_stream_module.so}
 [ -x "${NGINX_BIN:-}" ] || { echo "set NGINX_BIN to an nginx binary" >&2; exit 2; }
 [ -f "${FRONT_MODULE:-}" ] || { echo "set FRONT_MODULE to the stream module object" >&2; exit 2; }
 
-PASS=passthru.example
-PROT=protected.example
+PASS=passthru.example.com
+PROT=protected.example.com
 W=$(mktemp -d)
 PIDS=()
 cleanup() {
@@ -94,8 +94,8 @@ else
     fail=1
 fi
 
-code=$(curl -sS --max-time 5 --resolve "unknown.example:8443:127.0.0.1" \
-        "https://unknown.example:8443/" -o /dev/null -w '%{http_code}' 2>/dev/null || echo "curl-failed")
+code=$(curl -sS --max-time 5 --resolve "unknown.example.com:8443:127.0.0.1" \
+        "https://unknown.example.com:8443/" -o /dev/null -w '%{http_code}' 2>/dev/null || echo "curl-failed")
 case "$code" in
     000*|curl-failed) note "unknown name: refused at the transport (no connection)" ;;
     *)                note "FAIL unknown name: it answered '$code'"

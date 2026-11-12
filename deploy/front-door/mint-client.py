@@ -6,7 +6,7 @@ password against the store the daemon already keeps, and signs a certificate tha
 carries what its identity may reach:
 
     printf '%s\\n' "$password" | mint-client.py --store /tmp/dslp/dp.tsv \\
-        --name alice --allow passthru.example --ca-dir /etc/front-door/ca \\
+        --name alice --allow passthru.example.com --ca-dir /etc/front-door/ca \\
         --out-dir /etc/front-door/clients
 
 The password arrives on standard input, so it stays out of a process list and out

@@ -53,7 +53,7 @@ learned tuple from the socket the poke landed on. The component's lane runs it.
 Two ceremonies, and neither runs where the other does. On the line, as root:
 
 ```
-sh deploy/front-door/mint.sh --protected-name front.example --passthru-name passthru.example
+sh deploy/front-door/mint.sh --protected-name front.example.com --passthru-name passthru.example.com
 ```
 
 That mints the authority where `call/0040` requires it, signs the front's leaf and
@@ -62,8 +62,8 @@ settings for the daemon. On the front, as root:
 
 ```
 sh deploy/front-door/install.sh --public-port 8443 \
-    --protected-name front.example --protected-upstream 127.0.0.1:8080 \
-    --passthru-name passthru.example
+    --protected-name front.example.com --protected-upstream 127.0.0.1:8080 \
+    --passthru-name passthru.example.com
 ```
 
 It writes the root, the relay, the rendered configuration and both units, checks
@@ -84,7 +84,7 @@ every datagram that is not a poke leaves for that tuple from that same socket.
 name this front serves, and a reload command:
 
 ```
-poke-listener.py --listen 0.0.0.0:8443 --name passthru.example \
+poke-listener.py --listen 0.0.0.0:8443 --name passthru.example.com \
     --out /etc/front-door/upstreams.map --udp-port 8443 --udp-only \
     --http-listen 127.0.0.1:8448 --lease 300 --reload "nginx -s reload"
 ```
@@ -117,7 +117,7 @@ certificate that carries what its identity may reach:
 
 ```
 printf '%s\n' "$password" | python3 mint-client.py \
-    --store /tmp/dslp/dp.tsv --name alice --allow passthru.example \
+    --store /tmp/dslp/dp.tsv --name alice --allow passthru.example.com \
     --ca-dir /etc/front-door/ca --out-dir /etc/front-door/clients
 ```
 

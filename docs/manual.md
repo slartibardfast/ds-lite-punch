@@ -18,8 +18,8 @@ is the second), and the client half is written against it.
 
 | Value | Stands for |
 |---|---|
-| `front.example` | the protected name: TLS ends at the front, and a client certificate is demanded |
-| `passthru.example` | the passthrough name: it rides untouched to the held port, where the service's own certificate answers |
+| `front.example.com` | the protected name: TLS ends at the front, and a client certificate is demanded |
+| `passthru.example.com` | the passthrough name: it rides untouched to the held port, where the service's own certificate answers |
 | `192.0.2.10` | the front's public address |
 | `8443` | the public port both names answer on |
 | `203.0.113.7:59278` | the line's tuple, which the carrier assigned and can move |
@@ -58,7 +58,7 @@ One authority signs everything: the front's leaf, the daemon's identity, and
 every client's. On the line, as root:
 
 ```sh
-sh deploy/front-door/mint.sh --protected-name front.example --passthru-name passthru.example
+sh deploy/front-door/mint.sh --protected-name front.example.com --passthru-name passthru.example.com
 ```
 
 The command mints into `/etc/ds-lite-punch-tls` the authority and the two leaves
@@ -73,7 +73,7 @@ Five keys in `/etc/ds-lite-punch.env`:
 |---|---|
 | `POKE` | `192.0.2.10:8443`, the front's public port |
 | `FRONT_ENDPOINT` | `192.0.2.10:8443`; setting it turns the control channel on |
-| `FRONT_NAME` | `front.example`, the name the front's certificate answers on |
+| `FRONT_NAME` | `front.example.com`, the name the front's certificate answers on |
 | `CLIENT_IDENTITY` | the daemon identity's certificate and key, as two PEM paths joined with a colon |
 | `FRONT_ANCHOR` | the authority's certificate, as a PEM path |
 
@@ -92,8 +92,8 @@ files mint.sh printed into `/etc/front-door/certs`, and install:
 
 ```sh
 sh deploy/front-door/install.sh --public-port 8443 \
-    --protected-name front.example --protected-upstream 127.0.0.1:8080 \
-    --passthru-name passthru.example
+    --protected-name front.example.com --protected-upstream 127.0.0.1:8080 \
+    --passthru-name passthru.example.com
 ```
 
 The installer writes the front's root, its relay, the rendered configuration
@@ -115,7 +115,7 @@ with a client identity minted below, read both sides:
 ```sh
 cat /run/ds-lite-punch/tuple
 curl --cacert ca.crt --cert alice.crt --key alice.key \
-    https://front.example:8443/table
+    https://front.example.com:8443/table
 ```
 
 The table's answer carries the tuple the front sees for the line, and every
@@ -146,7 +146,7 @@ router wants `python3` and `openssl` installed):
 
 ```sh
 printf '%s\n' "$password" | python3 deploy/front-door/mint-client.py \
-    --store /run/ds-lite-punch/dp.tsv --name alice --allow front.example \
+    --store /run/ds-lite-punch/dp.tsv --name alice --allow front.example.com \
     --ca-dir /etc/ds-lite-punch-tls --out-dir /etc/ds-lite-punch-tls/clients
 ```
 
@@ -182,7 +182,7 @@ missing, ask before you improvise.
 The protected name, in a browser, is the household's published page:
 
 ```text
-https://front.example:8443/
+https://front.example.com:8443/
 ```
 
 The browser offers your certificate automatically after the import. The same
@@ -198,7 +198,7 @@ One command covers both, and it is the deterministic form an agent runs:
 
 ```sh
 curl --cacert ca.crt --cert alice.crt --key alice.key \
-    https://front.example:8443/table
+    https://front.example.com:8443/table
 ```
 
 | What you see | What it means |
