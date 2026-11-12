@@ -87,7 +87,7 @@ async fn connection_round(
     sock.set_reuseaddr(true)?;
     sock.bind(std::net::SocketAddr::V4(SocketAddrV4::new(bind_ip, 0)))?;
     let local_port = sock.local_addr()?.port();
-    crate::nft::add_pin(bind_ip, local_port, r).map_err(|e| {
+    crate::nft::add_pin(bind_ip, local_port, bind_ip, r).map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("connection fold pin: {e}"))
     })?;
     let attempt = async move {
@@ -125,7 +125,7 @@ async fn poke_round(bind_ip: Ipv4Addr, r: u16, dest: SocketAddrV4) -> io::Result
     sock.set_reuseaddr(true)?;
     sock.bind(std::net::SocketAddr::V4(SocketAddrV4::new(bind_ip, 0)))?;
     let local_port = sock.local_addr()?.port();
-    crate::nft::add_pin(bind_ip, local_port, r)
+    crate::nft::add_pin(bind_ip, local_port, bind_ip, r)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("poke fold pin: {e}")))?;
     let result = async {
         let mut conn = sock.connect(std::net::SocketAddr::V4(dest)).await?;

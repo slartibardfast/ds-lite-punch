@@ -1026,7 +1026,7 @@ async fn main() {
             engine::DEFAULT_GRACE_TICKS,
             servers,
             publisher.clone(),
-            Arc::new(engine::NftPins),
+            Arc::new(engine::NftPins(bind_ip)),
         );
         // a named device's flows are held; without --keepalive they are only reported
         engine.allow = cfg.allow.clone();

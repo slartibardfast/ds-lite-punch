@@ -7,9 +7,6 @@ use std::process::{Command, Stdio};
 
 use crate::publish::emiteln;
 
-/// The NAT address every pinned console flow egresses as, the hub-LAN address the relay sockets bind.
-pub const NAT_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 21);
-
 fn run(args: &[&str]) -> io::Result<()> {
     let status = Command::new("nft").args(args).status()?;
     if status.success() {
@@ -680,13 +677,16 @@ pub fn parse_carrier_probe(text: &str) -> u64 {
 }
 
 /// The element a pin installs: this flow's traffic leaves as the NAT address with the slot's port.
-pub fn pin_element(client: Ipv4Addr, client_port: u16, r: u16) -> String {
-    format!("{} . {} : {} . {}", client, client_port, NAT_ADDR, r)
+/// The fold presents the flow as the relay's own bind address and the slot's
+/// port: production binds the hub-LAN address, so there it egresses as the
+/// hub; anywhere else it egresses as whatever the deployment actually bound.
+pub fn pin_element(client: Ipv4Addr, client_port: u16, nat_addr: Ipv4Addr, r: u16) -> String {
+    format!("{} . {} : {} . {}", client, client_port, nat_addr, r)
 }
 
-/// Pin a console flow as (client_ip, client_port) -> (NAT_ADDR, R) in snat_map.
-pub fn add_pin(client: Ipv4Addr, client_port: u16, r: u16) -> io::Result<()> {
-    let elem = pin_element(client, client_port, r);
+/// Pin a flow as (client_ip, client_port) -> (nat_addr, R) in snat_map.
+pub fn add_pin(client: Ipv4Addr, client_port: u16, nat_addr: Ipv4Addr, r: u16) -> io::Result<()> {
+    let elem = pin_element(client, client_port, nat_addr, r);
     match run(&[
         "add", "element", "ip", "dslp", "snat_map",
         &format!("{{ {} }}", elem),
@@ -738,11 +738,6 @@ pub fn remove_ruleset() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nat_addr_is_hub_lan() {
-        assert_eq!(NAT_ADDR, Ipv4Addr::new(192, 168, 0, 21));
-    }
 
     #[test]
     fn a_slots_accept_is_a_set_element_never_a_rule_handle() {
@@ -840,7 +835,8 @@ mod tests {
             "192.168.21.50 . 3074"
         );
         assert_eq!(
-            format!("{} . {} : {} . {}", client, 3074, NAT_ADDR, 30740),
+            format!("{} . {} : {} . {}", client, 3074,
+                    Ipv4Addr::new(192, 168, 0, 21), 30740),
             "192.168.21.50 . 3074 : 192.168.0.21 . 30740"
         );
     }
@@ -1062,7 +1058,8 @@ mod tests {
     #[test]
     fn a_pin_sends_a_flow_out_as_the_slots_own_tuple() {
         // the fold a console's flow uses, and the one a TCP holder's STUN link uses
-        let elem = pin_element(Ipv4Addr::new(192, 168, 21, 12), 40002, 40000);
+        let elem = pin_element(Ipv4Addr::new(192, 168, 21, 12), 40002,
+                               Ipv4Addr::new(192, 168, 0, 21), 40000);
         assert_eq!(elem, "192.168.21.12 . 40002 : 192.168.0.21 . 40000");
     }
 

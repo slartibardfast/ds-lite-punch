@@ -28,6 +28,25 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
             sh -c 'cargo test --release --locked'
 
+  # The carrier environment's scenario rows, per profile, against the daemon this commit built (plan/0016#the-harness). The whole exchange runs unprivileged in network namespaces, so an ordinary runner serves.
+  carrier-harness:
+    runs-on: ubuntu-latest
+    # A full run is about ten minutes; a hang fails visibly instead of holding the lane.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the environment's data-plane tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables tcpdump
+      - name: Build the daemon in the pinned toolchain
+        run: |
+          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN" \
+            sh -c 'cargo build --release --locked --target x86_64-unknown-linux-musl'
+          test -s "$ARTIFACT"
+      - name: Run the harness across the three profiles
+        run: python3 deploy/env/envctl.py harness
+
   release-build:
     runs-on: ubuntu-latest
     steps:

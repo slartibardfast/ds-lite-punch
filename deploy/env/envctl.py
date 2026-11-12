@@ -868,6 +868,12 @@ def cmd_drift_check():
 HARNESS_PROFILES = ("vm-dslite", "rfc-bcp", "symmetric")
 HARNESS_STRANGER_CROSSES = {"vm-dslite": False, "rfc-bcp": True,
                             "symmetric": False}
+# The passthrough's egress is nginx's own socket, and a carrier that filters
+# on the peer's port admits only the poke's own; under address-and-port
+# dependent filtering the faithful carrier refuses it, and the row asserts
+# that refusal rather than pretending the front could work.
+HARNESS_PASSTHROUGH_SERVES = {"vm-dslite": True, "rfc-bcp": True,
+                              "symmetric": False}
 HARNESS_LEASE = 8
 HARNESS_LEASE_STOP = HARNESS_LEASE + 3
 STRANGER_ADDR = "10.9.0.12"
@@ -882,25 +888,35 @@ def mint_service_cert():
     run("service", "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
         "-subj", "/CN=service.env", "-keyout", str(tls_dir / "service.key"),
         "-out", str(tls_dir / "service.crt"))
+    run("service", "openssl", "x509", "-in", str(tls_dir / "service.crt"),
+        "-outform", "der", "-out", str(tls_dir / "service.der"))
 
 
 def tls_served_certificate(server_name):
     """The DER hash of the certificate a TLS client sees on the public
-    port for the given SNI, asked from the internet actor."""
+    port for the given SNI, asked from the internet actor; an empty hash
+    means the handshake never completed."""
     script = (
-        "import socket, ssl, hashlib\n"
+        "import socket, ssl, hashlib, traceback\n"
         "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
         "ctx.check_hostname = False\n"
         "ctx.verify_mode = ssl.CERT_NONE\n"
-        "raw = socket.create_connection((%r, %d), timeout=8)\n"
-        "s = ctx.wrap_socket(raw, server_hostname=%r)\n"
-        "print(hashlib.sha256(s.getpeercert(binary_form=True)).hexdigest())\n"
-        "s.close()\n"
+        "try:\n"
+        "    raw = socket.create_connection((%r, %d), timeout=8)\n"
+        "    s = ctx.wrap_socket(raw, server_hostname=%r)\n"
+        "    print(hashlib.sha256(s.getpeercert(binary_form=True)).hexdigest())\n"
+        "except Exception:\n"
+        "    traceback.print_exc()\n"
     ) % (FRONT_PUB, FRONT_PORT, server_name)
     with netns("internet"):
         proc = subprocess.run([sys.executable, "-c", script],
                               capture_output=True, text=True, timeout=15)
-    return proc.stdout.strip()
+    out = proc.stdout.strip()
+    if not out:
+        print("--- the passthrough handshake failed ---")
+        print(proc.stderr.strip()[-400:])
+        return ""
+    return out
 
 
 def tls_client_probe(server_name, with_identity):
@@ -964,7 +980,7 @@ def pcp_grant_tcp(int_port, sug_ext_port, lifetime=3600):
     shared-port path (call/0025): one MAP request from the service actor to
     the daemon's LAN listener, answered with the assigned external port."""
     script = (
-        "import socket, struct, sys\n"
+        "import socket, struct, sys, time\n"
         "nonce = bytes(range(12))\n"
         "ip = socket.inet_aton(%r)\n"
         "client_ip = b'\\x00' * 10 + b'\\xff\\xff' + ip\n"
@@ -972,23 +988,38 @@ def pcp_grant_tcp(int_port, sug_ext_port, lifetime=3600):
         "op = (nonce + struct.pack('!B', 6) + b'\\x00' * 3\n"
         "      + struct.pack('!HH', %d, %d) + b'\\x00' * 16)\n"
         "sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
-        "sock.settimeout(5)\n"
+        "sock.settimeout(8)\n"
         "sock.bind((%r, 0))\n"
-        "sock.sendto(hdr + op, (%r, 5351))\n"
-        "resp, _ = sock.recvfrom(256)\n"
-        "code = resp[3]\n"
-        "ext_port = struct.unpack('!H', resp[30:32])[0]\n"
+        "code, ext_port = 21, 0\n"
+        "for attempt in range(4):\n"
+        "    sock.sendto(hdr + op, (%r, 5351))\n"
+        "    try:\n"
+        "        resp, _ = sock.recvfrom(256)\n"
+        "    except socket.timeout:\n"
+        "        time.sleep(3)\n"
+        "        continue\n"
+        "    code = resp[3]\n"
+        "    ext_port = struct.unpack('!H', resp[30:32])[0]\n"
+        "    if code == 0:\n"
+        "        break\n"
+        "    # the facade answers discovery-pending before the slot's own\n"
+        "    # STUN round publishes, so a non-zero code is retried, not fatal\n"
+        "    time.sleep(3)\n"
         "print(code, ext_port)\n"
     ) % ("192.168.77.2", lifetime, int_port, sug_ext_port,
          "192.168.77.2", "192.168.77.1")
     with netns("service"):
         proc = subprocess.run([sys.executable, "-c", script],
-                              capture_output=True, text=True, timeout=15)
+                              capture_output=True, text=True, timeout=90)
+    detail = (proc.stdout.strip() or proc.stderr.strip()) or "(no answer)"
     try:
-        code, ext_port = proc.stdout.split()
-        return int(code) == 0 and int(ext_port) == sug_ext_port
+        code, ext_port = detail.split()
+        granted = int(code) == 0
     except ValueError:
-        return False
+        granted = False
+    # The granted port is the carrier's to assign: the suggestion is a
+    # request, and the answer names whatever the line actually gave.
+    return granted, detail
 
 
 def harness_profile(profile, nginx_bin, module):
@@ -1021,18 +1052,27 @@ def harness_profile(profile, nginx_bin, module):
     run("b4", "nft", "add", "chain", "inet", "fw4", "input",
         "{ type filter hook input priority filter; policy accept; }")
     run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    # Where the daemon's folded TCP dials go: taps on each wire between the
+    # daemon and the front, so a blackholed connect names its wire.
+    tcpdump = shutil.which("tcpdump") or "/usr/bin/tcpdump"
+    record_service("tap-b4", exec_in("b4", [
+        "/usr/bin/timeout", "120", tcpdump, "-i", "eth1", "-n", "-l",
+        "-Z", "root", "tcp"], ENV_ROOT / "tap-b4.log"))
+    record_service("tap-front", exec_in("front", [
+        "/usr/bin/timeout", "120", tcpdump, "-i", "pub0", "-n", "-l",
+        "-Z", "root", "tcp"], ENV_ROOT / "tap-front.log"))
     start_b4(pcp=True)
 
     # Row: the service grants its own TCP mapping over PCP, the production
     # shared-port path. The granted slot is what puts the service's TLS
     # port behind the passthrough name.
     time.sleep(2)
-    ok_pcp = pcp_grant_tcp(40001, 40000)
+    ok_pcp, grant_detail = pcp_grant_tcp(40001, 40000)
     print("%s harness[%s]: the service granted a TCP mapping over PCP" % (
         "PASS" if ok_pcp else "FAIL", profile))
     if not ok_pcp:
         failures.append("the PCP grant")
-        print("--- the daemon's log tail ---")
+        print("--- the PCP answer: %s | the daemon's log tail ---" % grant_detail)
         print(B4_LOG.read_text(errors="replace")[-400:] if B4_LOG.exists() else "(absent)")
 
     # Row: the mapping holds. The relay's own map is the authoritative poke
@@ -1120,10 +1160,13 @@ def harness_profile(profile, nginx_bin, module):
 
     served_hash = tls_served_certificate(PASSTHRU_NAME)
     own_hash = hashlib.sha256(
-        (ENV_ROOT / "service-tls" / "service.crt").read_bytes()).hexdigest()
-    ok_pass = served_hash == own_hash
-    print("%s harness[%s]: the passthrough name served the service's own certificate" % (
-        "PASS" if ok_pass else "FAIL", profile))
+        (ENV_ROOT / "service-tls" / "service.der").read_bytes()).hexdigest()
+    served = served_hash == own_hash
+    expected = HARNESS_PASSTHROUGH_SERVES[profile]
+    ok_pass = served == expected
+    print("%s harness[%s]: the passthrough name %s the service's own certificate (the profile admits it: %s)" % (
+        "PASS" if ok_pass else "FAIL", profile,
+        "served" if served else "could not serve", expected))
     if not ok_pass:
         failures.append("the passthrough certificate")
 
@@ -1159,11 +1202,13 @@ def harness_profile(profile, nginx_bin, module):
         map_text = map_path.read_text() if map_path.exists() else ""
         relay_text = relay_log.read_text(errors="replace") if relay_log.exists() else ""
         withdrawn_map = map_text
-        withdrawn = "lease expired" in relay_text and not withdrawn_map.strip()
+        # The lease withdraws the poke's own entry; a pushed view persists on
+        # its own expiry, so the withdrawal shows as the poke line leaving.
+        withdrawn = "lease expired" in relay_text and "# poke" not in withdrawn_map
         os.kill(b4_pid, 18)  # SIGCONT
         time.sleep(5)
         map_text = map_path.read_text() if map_path.exists() else ""
-        refilled = "10.9.0.1:" in map_text
+        refilled = "# poke" in map_text
         ok_lease = withdrawn and refilled
     print("%s harness[%s]: the lease expired while the daemon held its breath and the poke refilled it" % (
         "PASS" if ok_lease else "FAIL", profile))
@@ -1175,19 +1220,31 @@ def harness_profile(profile, nginx_bin, module):
     return failures
 
 
-def cmd_harness():
+def cmd_harness(only=None):
     nginx_bin, module = provision_nginx()
     enter_own_namespaces()
+    profiles = (only,) if only else HARNESS_PROFILES
     failed = {}
-    for profile in HARNESS_PROFILES:
+    for profile in profiles:
         rows = harness_profile(profile, nginx_bin, module)
         if rows:
             failed[profile] = rows
     for profile, rows in failed.items():
         print("%s: %s" % (profile, ", ".join(rows)))
+    code = 1 if failed else 0
     if failed:
-        raise SystemExit("harness: failed rows in %s" % ", ".join(failed))
-    print("harness: every scenario row green across the three profiles")
+        print("harness: failed rows in %s" % ", ".join(
+            "%s: %s" % (p, ", ".join(r)) for p, r in failed.items()))
+    else:
+        print("harness: every scenario row green across the three profiles")
+    # The run deliberately orphans its holders and services (the standing
+    # environment serves the tasks that follow), and the interpreter's
+    # shutdown has been seen to sleep past its own final print with that
+    # many live forks; the verdict is already on the log, so the controller
+    # exits by syscall rather than risk a CI lane hanging after it.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 # The per-profile expectations: what each profile SHOULD deliver, per the
@@ -1322,11 +1379,17 @@ def main():
     ap.add_argument("command", choices=["up", "down", "verify",
                                         "verify-policy", "deploy-front",
                                         "up-b4", "drift-check", "harness"])
+    ap.add_argument("profile", nargs="?", default=None,
+                    help="with harness: one profile instead of all three")
     args = ap.parse_args()
-    {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
-     "verify-policy": cmd_verify_policy, "deploy-front": cmd_deploy_front,
-     "up-b4": cmd_up_b4, "drift-check": cmd_drift_check,
-     "harness": cmd_harness}[args.command]()
+    commands = {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
+                "verify-policy": cmd_verify_policy,
+                "deploy-front": cmd_deploy_front, "up-b4": cmd_up_b4,
+                "drift-check": cmd_drift_check, "harness": cmd_harness}
+    if args.command == "harness":
+        commands[args.command](args.profile)
+    else:
+        commands[args.command]()
 
 
 if __name__ == "__main__":

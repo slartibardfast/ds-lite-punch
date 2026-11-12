@@ -65,16 +65,17 @@ pub trait PinOps: Send + Sync {
     fn unaccept(&self, r: u16);
 }
 
-pub struct NftPins;
+/// The pins fold to the relay's own bind address, which the constructor carries.
+pub struct NftPins(pub Ipv4Addr);
 
 impl PinOps for NftPins {
     /// Installs only the shadow's self-pin; the device's own pin is a separate call.
     fn add(&self, _host: Ipv4Addr, _host_port: u16, r: u16) -> std::io::Result<()> {
-        nft::add_pin(nft::NAT_ADDR, r, r)
+        nft::add_pin(self.0, r, self.0, r)
     }
     /// Removes a self-pin only, guarded by the NAT address; a device-key element is not ours to take away.
     fn del(&self, host: Ipv4Addr, host_port: u16) {
-        if host == nft::NAT_ADDR {
+        if host == self.0 {
             let _ = nft::del_pin(host, host_port);
         }
     }
