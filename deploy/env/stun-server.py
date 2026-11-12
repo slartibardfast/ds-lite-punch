@@ -10,11 +10,22 @@ given. Run it in the internet actor:
 import argparse
 import socket
 import struct
+import threading
 import zlib
 
 MAGIC = 0x2112A442
 HEADER = 20
 FINGERPRINT_XOR = 0x5354554E
+
+
+def recv_exactly(conn, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
 
 
 def attr(atype, value):
@@ -44,6 +55,35 @@ def answer(msg, peer):
     return bytes(out)
 
 
+def tcp_serve(bind, port):
+    """The same responder over TCP: a binding request arrives as one
+    message, and the answer goes back before the connection closes. The
+    daemon's TCP slot learns its tuple from this link."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((bind, port))
+    srv.listen(8)
+    while True:
+        conn, peer = srv.accept()
+        try:
+            hdr = recv_exactly(conn, HEADER)
+            if hdr is None:
+                continue
+            mtype, mlen, cookie = struct.unpack("!HHI", hdr[:8])
+            if mtype != 0x0001 or cookie != MAGIC:
+                continue
+            body = recv_exactly(conn, mlen) if mlen else b""
+            if body is None:
+                continue
+            out = answer(hdr + body, peer)
+            if out is not None:
+                conn.sendall(out)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bind", default="0.0.0.0")
@@ -52,7 +92,10 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.bind, args.port))
-    print("stun responder on %s:%d" % (args.bind, args.port), flush=True)
+    print("stun responder on %s:%d, udp and tcp" % (args.bind, args.port),
+          flush=True)
+    threading.Thread(target=tcp_serve, args=(args.bind, args.port),
+                     daemon=True).start()
     while True:
         msg, peer = sock.recvfrom(65535)
         out = answer(msg, peer)

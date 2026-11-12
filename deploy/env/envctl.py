@@ -14,6 +14,7 @@ actor, and the probes run in the actors they probe.
     python3 deploy/env/envctl.py deploy-front   deploy the front by its own pipeline and probe it
     python3 deploy/env/envctl.py up-b4          the front, the daemon and the service, probing the exchange
     python3 deploy/env/envctl.py drift-check    hash the deployed front against a fresh pipeline render
+    python3 deploy/env/envctl.py harness        the nginx feature's scenario rows across the three profiles
 
 setns into a child namespace requires capability over the current namespace's
 owner as well, which is why the controller moves itself into its own network
@@ -28,6 +29,7 @@ tunnel does in production; the service hangs off the daemon's LAN.
 import argparse
 import contextlib
 import ctypes
+import hashlib
 import os
 import pathlib
 import re
@@ -71,8 +73,12 @@ FRONT_PORT = 8443
 PROTECTED_NAME = "protected.env"
 PASSTHRU_NAME = "passthru.env"
 PROTECTED_UPSTREAM = "127.0.0.1:8080"
-B4_BIN = HERE.parent.parent / "target" / "x86_64-unknown-linux-musl" / \
-    "release" / "ds-lite-punch"
+B4_BIN_CANDIDATES = (
+    HERE.parent.parent / "target" / "x86_64-unknown-linux-musl" / \
+        "release" / "ds-lite-punch",
+    HERE.parent.parent / "target" / "release" / "ds-lite-punch",
+)
+B4_BIN = B4_BIN_CANDIDATES[0]
 B4_BIND = "10.9.2.2:40000"
 SERVICE_TARGET = "192.168.77.2:40001"
 B4_GATEWAY = "10.9.2.1"
@@ -260,17 +266,18 @@ def pair(name_a, iface_a, cidr_a, name_b, iface_b, cidr_b):
         subprocess.run(["ip", "link", "set", iface_b, "up"], check=True)
 
 
-def start_policy(profile, tcp_lane=""):
+def start_policy(profile, tcp_lanes=()):
     pid = os.fork()
     if pid == 0:
+        argv = [sys.executable, str(HERE / "carrier-policy.py"),
+                "--profile", str(HERE / "profiles" / (profile + ".conf")),
+                "--inside", "in0", "--public", "pub0",
+                "--inside-ip", B4_WAN_IP, "--public-ip", CARRIER_PUB,
+                "--log", "/tmp/carrier-policy-" + profile + ".log"]
+        for lane in tcp_lanes:
+            argv += ["--tcp-lane", lane]
         with netns("carrier"):
-            os.execv(sys.executable, [sys.executable,
-                     str(HERE / "carrier-policy.py"),
-                     "--profile", str(HERE / "profiles" / (profile + ".conf")),
-                     "--inside", "in0", "--public", "pub0",
-                     "--inside-ip", B4_WAN_IP, "--public-ip", CARRIER_PUB,
-                     "--log", "/tmp/carrier-policy-" + profile + ".log",
-                     "--tcp-lane", tcp_lane])
+            os.execv(sys.executable, argv)
     POLICIES.append(pid)
     # A run killed mid-verify leaves its policy plane running in a namespace
     # no state file names; recording it here is what lets a later down stop
@@ -526,7 +533,7 @@ def probe_failure(name, answer):
         print("--- access log: no request ever reached the https block ---")
 
 
-def deploy_front(nginx_bin, module):
+def deploy_front(nginx_bin, module, lease="300"):
     """The pipeline's three steps inside the front namespace, over a fresh
     root and a fresh authority: the identity the previous run minted must
     not vouch for this one's probes, and mint.sh refuses to sign over an
@@ -549,7 +556,7 @@ def deploy_front(nginx_bin, module):
         "--public-port", str(FRONT_PORT),
         "--protected-name", PROTECTED_NAME,
         "--protected-upstream", PROTECTED_UPSTREAM,
-        "--passthru-name", PASSTHRU_NAME, "--lease", "300",
+        "--passthru-name", PASSTHRU_NAME, "--lease", lease,
         "--nginx", nginx_bin, "--module", module, "--user", "root")
     print("PASS front-deployment: install.sh rendered the configuration and both units inside the front namespace")
     start_front_units()
@@ -598,10 +605,13 @@ def record_service(name, pid):
         fh.write("%s %d\n" % (name, pid))
 
 
-def start_service_echo():
-    record_service("service", exec_in("service", [
-        sys.executable, str(HERE / "service-echo.py"),
-        "--bind", "192.168.77.2", "--port", "40001"]))
+def start_service_echo(tls=False):
+    argv = [sys.executable, str(HERE / "service-echo.py"),
+            "--bind", "192.168.77.2", "--port", "40001"]
+    if tls:
+        argv += ["--tls-cert", str(ENV_ROOT / "service-tls" / "service.crt"),
+                 "--tls-key", str(ENV_ROOT / "service-tls" / "service.key")]
+    record_service("service", exec_in("service", argv))
 
 
 def start_stun():
@@ -610,13 +620,14 @@ def start_stun():
         "--bind", INTERNET_PUB, "--port", "3478"]))
 
 
-def start_b4():
-    if not B4_BIN.exists():
+def start_b4(pcp=False):
+    binary = next((c for c in B4_BIN_CANDIDATES if c.exists()), None)
+    if binary is None:
         raise SystemExit(
             "envctl: the daemon binary is missing at %s; build it with "
             "cargo build --release --target x86_64-unknown-linux-musl"
-            % B4_BIN)
-    argv = [str(B4_BIN),
+            % B4_BIN_CANDIDATES[0])
+    argv = [str(binary),
             "--bind", B4_BIND,
             "--target", SERVICE_TARGET,
             "--stun", STUN_ENDPOINT,
@@ -632,8 +643,14 @@ def start_b4():
             "--client-identity", "%s:%s" % (FRONT_TLS / "client.crt",
                                             FRONT_TLS / "client.key"),
             "--front-anchor", str(FRONT_TLS / "ca.crt"),
-            "--state-dir", str(ENV_ROOT / "b4-state"),
-            "--no-upnp"]
+            "--state-dir", str(ENV_ROOT / "b4-state")]
+    if pcp:
+        # The shared port: PCP on the LAN address, with the facade its
+        # grant machinery needs. A granted TCP mapping is how the service
+        # puts its own TLS port behind the passthrough name.
+        argv += ["--pcp", "--lan-ip", "192.168.77.1"]
+    else:
+        argv += ["--no-upnp"]
     record_service("b4", exec_in("b4", argv, B4_LOG))
 
 
@@ -666,11 +683,13 @@ def cmd_up_b4():
     deploy_front(nginx_bin, module)
     log = pathlib.Path("/tmp/carrier-policy-vm-dslite.log")
     log.unlink(missing_ok=True)
-    # The TCP lane opens the spoke the daemon's TLS push rides, so the lane
-    # rule exists before its first packet can lose the nat race.
-    start_policy("vm-dslite", tcp_lane="%s:%d" % (FRONT_PUB, FRONT_PORT))
+    # The TCP lanes open the spokes the daemon's TLS push and its TCP STUN
+    # link ride, so their rules exist before any packet can lose the nat
+    # race.
+    start_policy("vm-dslite", tcp_lanes=("%s:%d" % (FRONT_PUB, FRONT_PORT),
+                                         "%s:%d" % (INTERNET_PUB, 3478)))
     time.sleep(2)
-    start_service_echo()
+    start_service_echo(tls=True)
     start_stun()
     # The daemon's lease records live at the fixed path /tmp/dslp, and a
     # lease restored from another run's shape fails the current slot range
@@ -839,6 +858,338 @@ def cmd_drift_check():
     print("drift-check: the deployed front is the record's own")
 
 
+# The harness: the nginx feature's scenario rows, per carrier profile, in one
+# command. Every row drives the real stack — the daemon dials with production
+# flags, the front is deployed by its pipeline, the service answers with its
+# own certificate — and the rows that depend on the carrier's behaviour assert
+# per profile: the stranger crosses under endpoint-independent filtering and
+# is refused under address-dependent and port-and-address dependent.
+
+HARNESS_PROFILES = ("vm-dslite", "rfc-bcp", "symmetric")
+HARNESS_STRANGER_CROSSES = {"vm-dslite": False, "rfc-bcp": True,
+                            "symmetric": False}
+HARNESS_LEASE = 8
+HARNESS_LEASE_STOP = HARNESS_LEASE + 3
+STRANGER_ADDR = "10.9.0.12"
+
+
+def mint_service_cert():
+    """The service's own identity: a self-signed certificate whose presence
+    at the client proves the passthrough front never terminated anything."""
+    tls_dir = ENV_ROOT / "service-tls"
+    shutil.rmtree(tls_dir, ignore_errors=True)
+    tls_dir.mkdir(parents=True)
+    run("service", "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-subj", "/CN=service.env", "-keyout", str(tls_dir / "service.key"),
+        "-out", str(tls_dir / "service.crt"))
+
+
+def tls_served_certificate(server_name):
+    """The DER hash of the certificate a TLS client sees on the public
+    port for the given SNI, asked from the internet actor."""
+    script = (
+        "import socket, ssl, hashlib\n"
+        "ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
+        "ctx.check_hostname = False\n"
+        "ctx.verify_mode = ssl.CERT_NONE\n"
+        "raw = socket.create_connection((%r, %d), timeout=8)\n"
+        "s = ctx.wrap_socket(raw, server_hostname=%r)\n"
+        "print(hashlib.sha256(s.getpeercert(binary_form=True)).hexdigest())\n"
+        "s.close()\n"
+    ) % (FRONT_PUB, FRONT_PORT, server_name)
+    with netns("internet"):
+        proc = subprocess.run([sys.executable, "-c", script],
+                              capture_output=True, text=True, timeout=15)
+    return proc.stdout.strip()
+
+
+def tls_client_probe(server_name, with_identity):
+    """One TLS client attempt against the public port; returns the output
+    and whether the server answered with HTTP 200."""
+    argv = ["openssl", "s_client", "-connect",
+            "%s:%d" % (FRONT_PUB, FRONT_PORT), "-servername", server_name]
+    if with_identity:
+        argv += ["-CAfile", str(FRONT_TLS / "ca.crt"),
+                 "-cert", str(FRONT_TLS / "client.crt"),
+                 "-key", str(FRONT_TLS / "client.key"), "-ign_eof"]
+    request = b"GET /table HTTP/1.0\r\nHost: " + server_name.encode() + \
+        b"\r\n\r\n"
+    with netns("internet"):
+        proc = subprocess.run(argv, input=request, capture_output=True,
+                              timeout=15)
+    out = proc.stdout.decode(errors="replace")
+    return out, "200 OK" in out
+
+
+def manual_poke(source_port):
+    """One poke from the internet actor's own port, which the relay's table
+    learns and the daemon's next keepalive overwrites."""
+    with netns("internet"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((INTERNET_PUB, source_port))
+        sock.sendto(b"dslp-poke", (FRONT_PUB, FRONT_PORT))
+        sock.close()
+
+
+def stranger_probe(ext):
+    """One datagram from the stranger's never-poked address to the poke
+    flow's tuple; returns whether an answer came back."""
+    payload = b"dslp-stranger"
+    with netns("internet"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(4)
+            sock.bind((STRANGER_ADDR, 0))
+            sock.sendto(payload, (CARRIER_PUB, ext))
+            data, _ = sock.recvfrom(2048)
+            return data == payload
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+
+def relay_state_pid(name):
+    if not SERVICES_STATE.exists():
+        return None
+    for line in SERVICES_STATE.read_text().splitlines():
+        who, _, pid = line.partition(" ")
+        if who == name:
+            return int(pid)
+    return None
+
+
+def pcp_grant_tcp(int_port, sug_ext_port, lifetime=3600):
+    """The service grants its own TCP mapping over PCP, the production
+    shared-port path (call/0025): one MAP request from the service actor to
+    the daemon's LAN listener, answered with the assigned external port."""
+    script = (
+        "import socket, struct, sys\n"
+        "nonce = bytes(range(12))\n"
+        "ip = socket.inet_aton(%r)\n"
+        "client_ip = b'\\x00' * 10 + b'\\xff\\xff' + ip\n"
+        "hdr = struct.pack('!BBHI', 2, 1, 0, %d) + client_ip\n"
+        "op = (nonce + struct.pack('!B', 6) + b'\\x00' * 3\n"
+        "      + struct.pack('!HH', %d, %d) + b'\\x00' * 16)\n"
+        "sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "sock.settimeout(5)\n"
+        "sock.bind((%r, 0))\n"
+        "sock.sendto(hdr + op, (%r, 5351))\n"
+        "resp, _ = sock.recvfrom(256)\n"
+        "code = resp[3]\n"
+        "ext_port = struct.unpack('!H', resp[30:32])[0]\n"
+        "print(code, ext_port)\n"
+    ) % ("192.168.77.2", lifetime, int_port, sug_ext_port,
+         "192.168.77.2", "192.168.77.1")
+    with netns("service"):
+        proc = subprocess.run([sys.executable, "-c", script],
+                              capture_output=True, text=True, timeout=15)
+    try:
+        code, ext_port = proc.stdout.split()
+        return int(code) == 0 and int(ext_port) == sug_ext_port
+    except ValueError:
+        return False
+
+
+def harness_profile(profile, nginx_bin, module):
+    """One profile's scenario rows; returns the failed row names."""
+    failures = []
+    cmd_down()
+    cmd_up()
+    run("internet", "ip", "addr", "add", STRANGER_ADDR + "/24", "dev", "pub0")
+    deploy_front(nginx_bin, module, lease=str(HARNESS_LEASE))
+    mint_service_cert()
+    # The profile's own log is unlinked before the policy plane starts, so
+    # the poll reads the file this run's plane writes and never an orphaned
+    # name.
+    log = pathlib.Path("/tmp/carrier-policy-" + profile + ".log")
+    log.unlink(missing_ok=True)
+    start_policy(profile, tcp_lanes=("%s:%d" % (FRONT_PUB, FRONT_PORT),
+                                     "%s:%d" % (INTERNET_PUB, 3478)))
+    time.sleep(2)
+    start_service_echo(tls=True)
+    start_stun()
+    # The daemon's lease and state records are per-run: /tmp/dslp is the
+    # fixed lease path a foreign shape would fail at startup, and the state
+    # directory's stale tuples would publish a tuple this run never learned.
+    shutil.rmtree("/tmp/dslp", ignore_errors=True)
+    shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
+    # The router's platform facts the daemon keys on: fw4 exists with an
+    # input chain for its accept sets, and the kernel forwards, because the
+    # preserved-source datapath is kernel-routed to the target.
+    run("b4", "nft", "add", "table", "inet", "fw4")
+    run("b4", "nft", "add", "chain", "inet", "fw4", "input",
+        "{ type filter hook input priority filter; policy accept; }")
+    run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    start_b4(pcp=True)
+
+    # Row: the service grants its own TCP mapping over PCP, the production
+    # shared-port path. The granted slot is what puts the service's TLS
+    # port behind the passthrough name.
+    time.sleep(2)
+    ok_pcp = pcp_grant_tcp(40001, 40000)
+    print("%s harness[%s]: the service granted a TCP mapping over PCP" % (
+        "PASS" if ok_pcp else "FAIL", profile))
+    if not ok_pcp:
+        failures.append("the PCP grant")
+        print("--- the daemon's log tail ---")
+        print(B4_LOG.read_text(errors="replace")[-400:] if B4_LOG.exists() else "(absent)")
+
+    # Row: the mapping holds. The relay's own map is the authoritative poke
+    # view on every profile: endpoint-independent carriers reuse the STUN
+    # flow's allocation for the poke, per-destination carriers allocate a
+    # new one, and the map names whichever tuple the line gave the poke.
+    map_path = FRONT_ROOT / "upstreams.map"
+    relay_log = FRONT_ROOT / "logs" / "relay.log"
+    deadline = time.time() + 15
+    poke_ext = 0
+    while time.time() < deadline:
+        map_text = map_path.read_text() if map_path.exists() else ""
+        match = re.search(r"8443 10\.9\.0\.1:(\d+);", map_text)
+        if match:
+            poke_ext = int(match.group(1))
+            break
+        time.sleep(0.5)
+    ok_map = poke_ext > 0
+    print("%s harness[%s]: the daemon's writes hold a carrier mapping (the poke tuple %s)" % (
+        "PASS" if ok_map else "FAIL", profile,
+        "10.9.0.1:%d" % poke_ext if poke_ext else "absent"))
+    if not ok_map:
+        failures.append("the carrier mapping")
+
+    # Row: the datagram leg closes, in the production shape.
+    ok_slot = slot_roundtrip()
+    print("%s harness[%s]: a client datagram crossed the slot and the service's answer returned" % (
+        "PASS" if ok_slot else "FAIL", profile))
+    if not ok_slot:
+        failures.append("the datagram leg")
+
+    # Row: the relay follows the poke. A poke from another source is named
+    # in the relay's own log, and the daemon's next keepalive writes the
+    # map back to its tuple.
+    map_path = FRONT_ROOT / "upstreams.map"
+    relay_log = FRONT_ROOT / "logs" / "relay.log"
+    manual_poke(55555)
+    time.sleep(1.5)
+    relay_text = relay_log.read_text(errors="replace") if relay_log.exists() else ""
+    followed = "udp poke from 10.9.0.10:55555" in relay_text
+    time.sleep(5)
+    map_text = map_path.read_text() if map_path.exists() else ""
+    restored = "10.9.0.1:" in map_text
+    ok_follows = followed and restored
+    print("%s harness[%s]: the relay follows a new poke and then the daemon's" % (
+        "PASS" if ok_follows else "FAIL", profile))
+    if not ok_follows:
+        failures.append("the relay's poke")
+        print("--- the relay saw the poke: %s | the map read: %s" % (
+            followed, map_text.strip().replace("\n", " | ")))
+
+    # Row: the stranger, per the profile's filtering behaviour.
+    crossed = stranger_probe(poke_ext)
+    expected = HARNESS_STRANGER_CROSSES[profile]
+    ok_stranger = crossed == expected
+    print("%s harness[%s]: the stranger's datagram %s (the profile admits it: %s)" % (
+        "PASS" if ok_stranger else "FAIL", profile,
+        "crossed" if crossed else "was refused", expected))
+    if not ok_stranger:
+        failures.append("the stranger")
+
+    # Rows: the push and the names. The passthrough name waits for the
+    # push to carry the daemon's TCP tuple, on the 60 second report
+    # interval, so this block polls up to 90 seconds once.
+    relay_log = FRONT_ROOT / "logs" / "relay.log"
+    deadline = time.time() + 90
+    tcp_named = False
+    while time.time() < deadline:
+        text = relay_log.read_text(errors="replace") if relay_log.exists() else ""
+        if "the push carried:" in text:
+            map_text = map_path.read_text() if map_path.exists() else ""
+            if "passthru.env " in map_text:
+                tcp_named = True
+                break
+        time.sleep(3)
+    ok_push = tcp_named
+    print("%s harness[%s]: the push named the daemon's TCP tuple to the front" % (
+        "PASS" if ok_push else "FAIL", profile))
+    if not ok_push:
+        failures.append("the push")
+        print("--- the relay log saw ---")
+        print(relay_log.read_text(errors="replace")[-400:] if relay_log.exists() else "(absent)")
+        print("--- the daemon's log tail ---")
+        print(B4_LOG.read_text(errors="replace")[-400:] if B4_LOG.exists() else "(absent)")
+
+    served_hash = tls_served_certificate(PASSTHRU_NAME)
+    own_hash = hashlib.sha256(
+        (ENV_ROOT / "service-tls" / "service.crt").read_bytes()).hexdigest()
+    ok_pass = served_hash == own_hash
+    print("%s harness[%s]: the passthrough name served the service's own certificate" % (
+        "PASS" if ok_pass else "FAIL", profile))
+    if not ok_pass:
+        failures.append("the passthrough certificate")
+
+    _, protected_serves = tls_client_probe(PROTECTED_NAME, True)
+    ok_serves = protected_serves
+    print("%s harness[%s]: the protected name served with the daemon's identity" % (
+        "PASS" if ok_serves else "FAIL", profile))
+    if not ok_serves:
+        failures.append("the protected name")
+
+    refusal_out, refusal_200 = tls_client_probe(PROTECTED_NAME, False)
+    ok_refusal = not refusal_200
+    print("%s harness[%s]: the protected name refused the identityless client" % (
+        "PASS" if ok_refusal else "FAIL", profile))
+    if not ok_refusal:
+        failures.append("the protected refusal")
+
+    dark_out, dark_200 = tls_client_probe("unpublished.env", False)
+    ok_dark = not dark_200
+    print("%s harness[%s]: an unpublished name reached nothing" % (
+        "PASS" if ok_dark else "FAIL", profile))
+    if not ok_dark:
+        failures.append("the unpublished name")
+
+    # Row: the lease expires. The daemon is paused past the lease, the
+    # relay withdraws its entry, and the daemon's keepalive refills it.
+    b4_pid = relay_state_pid("b4")
+    ok_lease = b4_pid is not None
+    withdrawn_map = "(no daemon pid)"
+    if ok_lease:
+        os.kill(b4_pid, 19)  # SIGSTOP: the keepalives hold their breath
+        time.sleep(HARNESS_LEASE_STOP)
+        map_text = map_path.read_text() if map_path.exists() else ""
+        relay_text = relay_log.read_text(errors="replace") if relay_log.exists() else ""
+        withdrawn_map = map_text
+        withdrawn = "lease expired" in relay_text and not withdrawn_map.strip()
+        os.kill(b4_pid, 18)  # SIGCONT
+        time.sleep(5)
+        map_text = map_path.read_text() if map_path.exists() else ""
+        refilled = "10.9.0.1:" in map_text
+        ok_lease = withdrawn and refilled
+    print("%s harness[%s]: the lease expired while the daemon held its breath and the poke refilled it" % (
+        "PASS" if ok_lease else "FAIL", profile))
+    if not ok_lease:
+        failures.append("the lease")
+        print("--- at the withdraw the map read: %r" % withdrawn_map.strip())
+        print("--- after the refill the map reads: %r" % (
+            map_text.strip() if map_path.exists() else "(absent)"))
+    return failures
+
+
+def cmd_harness():
+    nginx_bin, module = provision_nginx()
+    enter_own_namespaces()
+    failed = {}
+    for profile in HARNESS_PROFILES:
+        rows = harness_profile(profile, nginx_bin, module)
+        if rows:
+            failed[profile] = rows
+    for profile, rows in failed.items():
+        print("%s: %s" % (profile, ", ".join(rows)))
+    if failed:
+        raise SystemExit("harness: failed rows in %s" % ", ".join(failed))
+    print("harness: every scenario row green across the three profiles")
+
+
 # The per-profile expectations: what each profile SHOULD deliver, per the
 # research note. A profile row that fails is a policy defect, not a test
 # defect, until the profile is corrected in the record.
@@ -970,11 +1321,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["up", "down", "verify",
                                         "verify-policy", "deploy-front",
-                                        "up-b4", "drift-check"])
+                                        "up-b4", "drift-check", "harness"])
     args = ap.parse_args()
     {"up": cmd_up, "down": cmd_down, "verify": cmd_verify,
      "verify-policy": cmd_verify_policy, "deploy-front": cmd_deploy_front,
-     "up-b4": cmd_up_b4, "drift-check": cmd_drift_check}[args.command]()
+     "up-b4": cmd_up_b4, "drift-check": cmd_drift_check,
+     "harness": cmd_harness}[args.command]()
 
 
 if __name__ == "__main__":

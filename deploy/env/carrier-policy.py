@@ -292,10 +292,11 @@ def main():
     ap.add_argument("--inside-ip", default="10.9.2.2")
     ap.add_argument("--public-ip", default="10.9.0.1")
     ap.add_argument("--log", default="/tmp/carrier-policy.log")
-    ap.add_argument("--tcp-lane", default="",
+    ap.add_argument("--tcp-lane", action="append", default=[],
                     help="IP:PORT of a destination whose TCP flows get a "
                          "pre-programmed, port-preserving mapping, opened "
-                         "before any flow can lose its first packet")
+                         "before any flow can lose its first packet; "
+                         "repeatable")
     ap.add_argument("--runtime", type=int, default=86400,
                     help="seconds the policy plane serves before exiting")
     global ARGS, INSIDE, PUB, INSIDE_IP, PUB_IP
@@ -306,11 +307,12 @@ def main():
     subprocess.run(["sysctl", "-q", "-w", "net.ipv4.ip_forward=1"],
                    capture_output=True)
     setup_plane()
-    if ARGS.tcp_lane:
-        # The spoke's TCP lane, opened before any flow exists: a rule that
+    for lane in ARGS.tcp_lane:
+        # The spoke's TCP lanes, opened before any flow exists: a rule that
         # was never absent cannot lose its first packet to the nat race, and
-        # the daemon's TLS push rides it with a port-preserving translation.
-        host, _, port = ARGS.tcp_lane.rpartition(":")
+        # the daemon's TLS push and its TCP STUN link ride them with a
+        # port-preserving translation.
+        host, _, port = lane.rpartition(":")
         nft(["add", "rule", "ip", "carrier", "postrouting",
              "iifname", '"%s"' % INSIDE, "ip", "daddr", host,
              "tcp", "dport", port, "counter", "snat", "ip", "to", PUB_IP])
