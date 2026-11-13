@@ -21,6 +21,6 @@ against the standing exchange.
 
 On the deployed router the sampler's `--log` is the daemon's own event log
 (the init script writes it beside the lease records) and `--iface` is the
-line-facing interface. The external monitor runs wherever the vantage is —
+line-facing interface. The external monitor runs wherever the vantage is:
 the household's second wire, a VPS, or any host that can reach the published
 name.
