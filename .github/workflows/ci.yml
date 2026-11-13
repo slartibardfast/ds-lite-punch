@@ -35,6 +35,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+      - name: Allow unprivileged user namespaces
+        # The environment re-execs itself inside a userns, and the 24.04 runner image ships apparmor_restrict_unprivileged_userns=1, which denies the setgroups and id-map writes that entry needs; passwordless sudo lifts it for the job.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install the environment's data-plane tools
         run: |
           sudo apt-get update -qq
