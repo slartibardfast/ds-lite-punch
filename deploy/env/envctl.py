@@ -671,6 +671,8 @@ def cmd_up_b4():
     start_policy("vm-dslite", tcp_lanes=("%s:%d" % (FRONT_PUB, FRONT_PORT),
                                          "%s:%d" % (INTERNET_PUB, 3478)))
     time.sleep(2)
+    # The echo's TLS identity is minted per run: on a clean environment the files are absent and the echo dies before answering the slot row.
+    mint_service_cert()
     start_service_echo(tls=True)
     start_stun()
     # The daemon's lease records live at the fixed path /tmp/dslp, and a lease restored from another run's shape fails the current slot range at startup; the state directory carries a run's learned tuples the same way, and a stale one would publish a tuple this run never learned. The environment's daemon state is per-run.
