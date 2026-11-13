@@ -2,7 +2,7 @@
 """The carrier environment's control plane.
 
 One process owns a user namespace and a network namespace, and orchestrates the
-five actors (carrier, front, b4, service, internet), each living in its own
+five actors (carrier, front, household-bridge, service, internet), each living in its own
 child network namespace. Everything the harness needs runs from inside: the
 topology stands up unprivileged, the carrier's policy plane runs in the carrier
 actor, and the probes run in the actors they probe.
@@ -48,11 +48,16 @@ CLONE_NEWNS = 0x00020000
 CLONE_NEWUSER = 0x10000000
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
-ACTORS = ("carrier", "front", "b4", "service", "internet")
+ACTORS = ("carrier", "front", "household-bridge", "service", "internet")
+
+def tag_of(name):
+    # The transient plumbing name carries the actor's index, because the kernel caps an ifname at fifteen characters and the actor's own name stays free to be its content name.
+    return "a%d" % ACTORS.index(name)
+
 ADDRESSES = {
     "carrier": {"pub0": "10.9.0.1/24", "in0": "10.9.2.1/24"},
     "front": {"pub0": "10.9.0.11/24", "mgmt0": "10.9.3.1/30"},
-    "b4": {"eth1": "10.9.2.2/24", "mgmt0": "10.9.3.2/30",
+    "household-bridge": {"eth1": "10.9.2.2/24", "mgmt0": "10.9.3.2/30",
            "lan0": "192.168.77.1/24"},
     "service": {"eth0": "192.168.77.2/24"},
     "internet": {"pub0": "10.9.0.10/24"},
@@ -211,11 +216,11 @@ def cmd_up():
     attach("front", "pub0", ADDRESSES["front"]["pub0"])
     attach("internet", "pub0", ADDRESSES["internet"]["pub0"])
     pair("carrier", "in0", ADDRESSES["carrier"]["in0"],
-         "b4", "eth1", ADDRESSES["b4"]["eth1"])
-    run("b4", "ip", "route", "replace", "default", "via", "10.9.2.1")
+         "household-bridge", "eth1", ADDRESSES["household-bridge"]["eth1"])
+    run("household-bridge", "ip", "route", "replace", "default", "via", "10.9.2.1")
     pair("front", "mgmt0", ADDRESSES["front"]["mgmt0"],
-         "b4", "mgmt0", ADDRESSES["b4"]["mgmt0"])
-    pair("b4", "lan0", ADDRESSES["b4"]["lan0"],
+         "household-bridge", "mgmt0", ADDRESSES["household-bridge"]["mgmt0"])
+    pair("household-bridge", "lan0", ADDRESSES["household-bridge"]["lan0"],
          "service", "eth0", ADDRESSES["service"]["eth0"])
     run("service", "ip", "route", "replace", "default", "via", "192.168.77.1")
     with open(STATE, "w") as fh:
@@ -225,22 +230,23 @@ def cmd_up():
 
 
 def attach(name, iface, cidr):
+    tag = "e-" + tag_of(name)
     with netns("internet"):
-        sh("internet", "ip", "link", "add", "e-" + name, "type", "veth",
-           "peer", "name", "e-" + name + "-p")
-        sh("internet", "ip", "link", "set", "e-" + name + "-p", "master",
+        sh("internet", "ip", "link", "add", tag, "type", "veth",
+           "peer", "name", tag + "-p")
+        sh("internet", "ip", "link", "set", tag + "-p", "master",
            "env-pub0")
-        sh("internet", "ip", "link", "set", "e-" + name, "netns",
+        sh("internet", "ip", "link", "set", tag, "netns",
            str(HOLDERS[name]))
     with netns(name):
-        sh(name, "ip", "link", "set", "e-" + name, "name", iface)
+        sh(name, "ip", "link", "set", tag, "name", iface)
         sh(name, "ip", "addr", "add", cidr, "dev", iface)
         sh(name, "ip", "link", "set", iface, "up")
-    sh("internet", "ip", "link", "set", "e-" + name + "-p", "up")
+    sh("internet", "ip", "link", "set", tag + "-p", "up")
 
 
 def pair(name_a, iface_a, cidr_a, name_b, iface_b, cidr_b):
-    tag = "p-" + name_a + "-" + name_b
+    tag = "p-" + tag_of(name_a) + "-" + tag_of(name_b)
     with netns("internet"):
         subprocess.run(["ip", "link", "add", tag, "type", "veth",
                         "peer", "name", tag + "-x"], check=True)
@@ -313,7 +319,7 @@ def kill_policy(pid):
 
 
 def poke_from_b4(dest_ip, dest_port):
-    with netns("b4"):
+    with netns("household-bridge"):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((B4_WAN_IP, B4_PORT))
@@ -322,14 +328,14 @@ def poke_from_b4(dest_ip, dest_port):
 
 
 def cross_from(ns, ip, port, dest_ip, dest_port, payload=b"probe"):
-    """Sends one datagram from inside an actor and returns what the b4's
+    """Sends one datagram from inside an actor and returns what the bridge's
     listener received."""
     pathlib.Path("/tmp/b4-rx.txt").unlink(missing_ok=True)
     ready_read, ready_write = os.pipe()
     listener = os.fork()
     if listener == 0:
         os.close(ready_read)
-        with netns("b4"):
+        with netns("household-bridge"):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             # Reuse: the previous crossing's listener socket may linger while the kernel clears it, and this bind must not fail on that.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -629,7 +635,7 @@ def start_b4(pcp=False):
         argv += ["--pcp", "--lan-ip", "192.168.77.1"]
     else:
         argv += ["--no-upnp"]
-    record_service("b4", exec_in("b4", argv, B4_LOG))
+    record_service("household-bridge", exec_in("household-bridge", argv, B4_LOG))
 
 
 def slot_roundtrip():
@@ -671,13 +677,13 @@ def cmd_up_b4():
     shutil.rmtree("/tmp/dslp", ignore_errors=True)
     shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
     # The router's platform facts the daemon keys on: fw4 exists with an input chain for its accept sets, and the kernel forwards, because the preserved-source datapath is kernel-routed to the target.
-    run("b4", "nft", "add", "table", "inet", "fw4")
-    run("b4", "nft", "add", "chain", "inet", "fw4", "input",
+    run("household-bridge", "nft", "add", "table", "inet", "fw4")
+    run("household-bridge", "nft", "add", "chain", "inet", "fw4", "input",
         "{ type filter hook input priority filter; policy accept; }")
-    run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    run("household-bridge", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
     # Where the daemon's push SYN goes: two taps, one on each wire between the daemon and the front, so a blackholed connect names its wire.
     tcpdump = shutil.which("tcpdump") or "/usr/bin/tcpdump"
-    record_service("tap-b4", exec_in("b4", [
+    record_service("tap-b4", exec_in("household-bridge", [
         "/usr/bin/timeout", "70", tcpdump, "-i", "eth1", "-n", "-l",
         "-Z", "root", "tcp", "port", str(FRONT_PORT)],
         ENV_ROOT / "tap-b4.log"))
@@ -993,13 +999,13 @@ def harness_profile(profile, nginx_bin, module):
     shutil.rmtree("/tmp/dslp", ignore_errors=True)
     shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
     # The router's platform facts the daemon keys on: fw4 exists with an input chain for its accept sets, and the kernel forwards, because the preserved-source datapath is kernel-routed to the target.
-    run("b4", "nft", "add", "table", "inet", "fw4")
-    run("b4", "nft", "add", "chain", "inet", "fw4", "input",
+    run("household-bridge", "nft", "add", "table", "inet", "fw4")
+    run("household-bridge", "nft", "add", "chain", "inet", "fw4", "input",
         "{ type filter hook input priority filter; policy accept; }")
-    run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    run("household-bridge", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
     # Where the daemon's folded TCP dials go: taps on each wire between the daemon and the front, so a blackholed connect names its wire.
     tcpdump = shutil.which("tcpdump") or "/usr/bin/tcpdump"
-    record_service("tap-b4", exec_in("b4", [
+    record_service("tap-b4", exec_in("household-bridge", [
         "/usr/bin/timeout", "120", tcpdump, "-i", "eth1", "-n", "-l",
         "-Z", "root", "tcp"], ENV_ROOT / "tap-b4.log"))
     record_service("tap-front", exec_in("front", [
@@ -1127,7 +1133,7 @@ def harness_profile(profile, nginx_bin, module):
         failures.append("the unpublished name")
 
     # Row: the lease expires. The daemon is paused past the lease, the relay withdraws its entry, and the daemon's keepalive refills it.
-    b4_pid = relay_state_pid("b4")
+    b4_pid = relay_state_pid("household-bridge")
     ok_lease = b4_pid is not None
     withdrawn_map = "(no daemon pid)"
     if ok_lease:
@@ -1157,7 +1163,7 @@ def cmd_monitors():
     """The exchange standing, with the repository's two monitors run against
     it once each: the external monitor asks the published path from the
     internet actor, and the router-side sampler reads the daemon's log and
-    the line's counters from the b4 actor."""
+    the line's counters from the household-bridge actor."""
     nginx_bin, module = provision_nginx()
     enter_own_namespaces()
     cmd_down()
@@ -1171,10 +1177,10 @@ def cmd_monitors():
     start_stun()
     shutil.rmtree("/tmp/dslp", ignore_errors=True)
     shutil.rmtree(ENV_ROOT / "b4-state", ignore_errors=True)
-    run("b4", "nft", "add", "table", "inet", "fw4")
-    run("b4", "nft", "add", "chain", "inet", "fw4", "input",
+    run("household-bridge", "nft", "add", "table", "inet", "fw4")
+    run("household-bridge", "nft", "add", "chain", "inet", "fw4", "input",
         "{ type filter hook input priority filter; policy accept; }")
-    run("b4", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+    run("household-bridge", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
     start_b4(pcp=True)
     time.sleep(2)
     pcp_grant_tcp(40001, 40000)
@@ -1206,7 +1212,7 @@ def cmd_monitors():
     print("\n".join(ext.stdout.strip().splitlines()[-4:]) or ext.stderr.strip()[-200:])
     if not ok_ext:
         failures.append("the external monitor")
-    with netns("b4"):
+    with netns("household-bridge"):
         sampler = subprocess.run(
             [sys.executable, str(HERE.parent / "monitor" /
                                  "router-sampler.py"), "--once",
@@ -1296,7 +1302,7 @@ def cmd_verify_policy():
             "PASS" if ok_cross else "FAIL", profile))
         cap = os.fork()
         if cap == 0:
-            with netns("b4"):
+            with netns("household-bridge"):
                 subprocess.run(["timeout", "10", "tcpdump", "-i", "eth1",
                                 "-n", "-l", "-Z", "root",
                                 "udp and port 40000"],
