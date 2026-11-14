@@ -1,0 +1,22 @@
+# The kani rung's declaration for this component.
+#
+# The tree carries its own proof harnesses (40 `#[kani::proof]` functions across
+# the eight modules listed below), and `kani.yml` compiles the crate under
+# `--cfg kani` with Kani pinned at 0.67.0, on workflow_dispatch and weekly: the
+# lane decision lives in the host repository at
+# https://github.com/slartibardfast/agentic-ds-lite-punch/blob/main/call/0050-the-kani-rung-runs-on-a-runner-and-the-trees-own-harnesses-gate.md
+# and its green runs are receipted as the phase ci lane
+# `software/ds-lite-punch/main/kani`.
+#
+# One row per module's harness set: the id labels the set, and the disposition
+# names the module the harnesses live in. A harness that stops compiling fails
+# its own step in the lane, which is the gate the declaration buys.
+
+engine-harnesses => kani:engine.rs
+mapping-harnesses => kani:mapping.rs
+obs-harnesses => kani:obs.rs
+slot-harnesses => kani:slot.rs
+stun-harnesses => kani:stun.rs
+tcpslot-harnesses => kani:tcpslot.rs
+upnp-harnesses => kani:upnp.rs
+vote-harnesses => kani:vote.rs
